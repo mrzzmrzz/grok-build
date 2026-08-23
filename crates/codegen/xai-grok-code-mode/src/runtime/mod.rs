@@ -22,7 +22,20 @@ use xai_grok_code_mode_protocol::enabled_tool_metadata;
 use crate::TaskFailureHandler;
 use crate::v8_init::ensure_v8_initialized;
 
+// Sentinel value kept byte-identical to upstream OpenAI Codex so diffs against
+// the source revision stay clean; it never leaves the isolate.
 const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
+
+/// Ceiling on the total serialized size of `store()`d session state. The map
+/// is re-injected into every fresh isolate and persisted with the session, so
+/// unbounded growth degrades every later `exec` call in the conversation.
+pub(super) const MAX_STORED_STATE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Serialized footprint of one stored entry, as counted against
+/// [`MAX_STORED_STATE_BYTES`].
+pub(super) fn stored_entry_bytes(key: &str, value: &JsonValue) -> usize {
+    key.len() + value.to_string().len()
+}
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
@@ -149,6 +162,8 @@ pub(super) struct RuntimeState {
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
     stored_value_writes: HashMap<String, JsonValue>,
+    /// Running total of [`stored_entry_bytes`] across `stored_values`.
+    stored_bytes: usize,
     enabled_tools: Vec<EnabledToolMetadata>,
     next_tool_call_id: u64,
     next_timeout_id: u64,
@@ -185,12 +200,18 @@ fn run_runtime(
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
+    let stored_bytes = config
+        .stored_values
+        .iter()
+        .map(|(key, value)| stored_entry_bytes(key, value))
+        .sum();
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
         stored_value_writes: HashMap::new(),
+        stored_bytes,
         enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         next_timeout_id: 1,

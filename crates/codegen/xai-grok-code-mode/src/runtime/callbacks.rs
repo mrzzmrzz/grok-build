@@ -208,9 +208,31 @@ pub(super) fn store_callback(
             return;
         }
     };
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.stored_values.insert(key.clone(), serialized.clone());
-        state.stored_value_writes.insert(key, serialized);
+    let over_limit = if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
+        let new_bytes = super::stored_entry_bytes(&key, &serialized);
+        let replaced_bytes = state
+            .stored_values
+            .get(&key)
+            .map(|old| super::stored_entry_bytes(&key, old))
+            .unwrap_or(0);
+        let projected = state.stored_bytes.saturating_sub(replaced_bytes) + new_bytes;
+        if projected > super::MAX_STORED_STATE_BYTES {
+            Some(format!(
+                "Unable to store {key:?}: total stored session state would be {projected} bytes, \
+                 over the {} byte limit. Overwrite large keys with null to free space.",
+                super::MAX_STORED_STATE_BYTES
+            ))
+        } else {
+            state.stored_bytes = projected;
+            state.stored_values.insert(key.clone(), serialized.clone());
+            state.stored_value_writes.insert(key, serialized);
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(message) = over_limit {
+        throw_type_error(scope, &message);
     }
 }
 

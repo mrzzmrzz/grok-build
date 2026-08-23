@@ -963,3 +963,80 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
         })
     );
 }
+
+#[tokio::test]
+async fn stored_state_over_the_cap_throws_and_is_not_persisted() {
+    let session = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &session,
+        ExecuteRequest {
+            source: r#"store("big", "x".repeat(9 * 1024 * 1024));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let RuntimeResponse::Result { error_text, .. } = response else {
+        panic!("expected a runtime result");
+    };
+    let error_text = error_text.expect("storing over the cap must throw");
+    assert!(
+        error_text.contains("Overwrite large keys with null to free space"),
+        "error must explain how to recover: {error_text}"
+    );
+
+    let probe = execute(
+        &session,
+        ExecuteRequest {
+            source: r#"text(String(load("big") === undefined));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = probe
+    else {
+        panic!("expected a runtime result");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(
+        content_items,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "true".to_string(),
+        }],
+        "a rejected store must not leave the value behind"
+    );
+}
+
+#[tokio::test]
+async fn overwriting_stored_keys_frees_capacity() {
+    let session = InProcessCodeModeSession::new();
+
+    for source in [
+        // Two 5 MiB writes to the same key fit only if replacement frees the
+        // first write's footprint.
+        r#"store("k", "x".repeat(5 * 1024 * 1024));"#,
+        r#"store("k", "x".repeat(5 * 1024 * 1024));"#,
+        // Nulling the key must free almost all of its footprint.
+        r#"store("k", null); store("k2", "y".repeat(7 * 1024 * 1024));"#,
+    ] {
+        let response = execute(
+            &session,
+            ExecuteRequest {
+                source: source.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+        )
+        .await;
+        let RuntimeResponse::Result { error_text, .. } = response else {
+            panic!("expected a runtime result");
+        };
+        assert_eq!(error_text, None, "store must succeed for: {source}");
+    }
+}
