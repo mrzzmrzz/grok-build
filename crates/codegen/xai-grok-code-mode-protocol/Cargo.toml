@@ -1,0 +1,23 @@
+[package]
+name = "xai-grok-code-mode-protocol"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Protocol and tool-description types for the Grok Build embedded JavaScript code-mode runtime."
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
