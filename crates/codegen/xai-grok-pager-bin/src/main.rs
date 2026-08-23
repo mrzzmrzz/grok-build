@@ -58,7 +58,7 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             Command::Inspect { .. }
             | Command::Doctor(_)
             | Command::Leader(_)
-            | Command::Logout
+            | Command::Logout { .. }
             | Command::Mcp(_)
             | Command::Plugin(_)
             | Command::Memory(_)
@@ -2187,19 +2187,45 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Login {
                 legacy: _,
                 oauth,
+                codex,
                 device_auth,
                 devbox,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
+                if codex {
+                    let account = xai_grok_shell::codex_auth::run_cli_login(device_auth).await?;
+                    let label = account
+                        .email
+                        .as_deref()
+                        .or(account.account_id.as_deref())
+                        .unwrap_or("ChatGPT account");
+                    println!("Connected OpenAI Codex as {label}.");
+                    println!();
+                    xai_grok_shell::instrumentation::finalize_and_exit(0);
+                }
                 let config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox).await?;
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout => {
+            Command::Logout { codex, all } => {
                 init_tracing_simple("cli");
+                if codex || all {
+                    let removed = xai_grok_shell::codex_auth::run_cli_logout().await?;
+                    println!(
+                        "{}",
+                        if removed {
+                            "Signed out of OpenAI Codex."
+                        } else {
+                            "OpenAI Codex was not signed in."
+                        }
+                    );
+                    if codex {
+                        xai_grok_shell::instrumentation::finalize_and_exit(0);
+                    }
+                }
                 let config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 xai_grok_shell::auth::run_cli_logout(&config)?;
