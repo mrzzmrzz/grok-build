@@ -697,6 +697,26 @@ impl acp::Agent for MvpAgent {
                     }
                 };
                 let Some(auth) = resolved else {
+                    // A Codex model with a Codex OAuth credential needs no
+                    // xAI login; accept the cached_token method so the
+                    // session can start (its bearer is mounted per-turn by
+                    // the Codex resolver, never from xAI auth state).
+                    let models = self.models_manager.models();
+                    let current_id = self.models_manager.current_model_id();
+                    if crate::agent::config::codex_only_start_allowed(
+                        crate::agent::config::find_model_by_id(&models, current_id.0.as_ref()),
+                        crate::codex_auth::is_logged_in(),
+                    ) {
+                        xai_grok_telemetry::unified_log::info(
+                            "auth cached_token: codex-only session allowed without xAI auth",
+                            None,
+                            Some(serde_json::json!({ "model": current_id.0.as_ref() })),
+                        );
+                        self.set_auth_method(arguments.method_id.clone());
+                        self.ensure_telemetry_client();
+                        emit_login_span(true, "cached_token", None, None);
+                        return Ok(self.auth_response_with_meta());
+                    }
                     let message = if self.auth_manager.is_expired() {
                         "Session expired, re-authentication required"
                     } else {

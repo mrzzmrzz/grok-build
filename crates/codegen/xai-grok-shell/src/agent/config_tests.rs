@@ -1198,6 +1198,11 @@ fn default_models_dual_endpoint_routing() {
         if entry.api_base_url.is_none() {
             continue;
         }
+        // Codex models route to the Codex inference endpoint and never
+        // consume the xAI session token (covered by the codex tests below).
+        if entry.info.provider() == xai_grok_sampling_types::ModelProvider::Codex {
+            continue;
+        }
         let session_creds = resolve_credentials(&entry, Some("tok"));
         assert_eq!(
             session_creds.base_url,
@@ -7538,4 +7543,150 @@ fn a_status_line_the_parser_could_not_read_in_full_reaches_grok_inspect() {
         1
     );
     assert_eq!(cfg.ui.theme.as_deref(), Some("kanagawa"));
+}
+// =============================================================================
+// Codex provider vertical slice
+// =============================================================================
+fn codex_model_entry(api_key: Option<&str>, base_url: &str) -> ModelEntry {
+    let mut entry = test_model_entry("gpt-test", base_url, api_key, None, None);
+    entry.info.model_family = Some("codex".to_string());
+    entry.info.api_backend = ApiBackend::Responses;
+    entry
+}
+#[test]
+fn model_family_maps_to_provider_explicitly() {
+    use xai_grok_sampling_types::ModelProvider;
+    assert_eq!(model_provider_from_family(None), ModelProvider::Xai);
+    assert_eq!(model_provider_from_family(Some("xai")), ModelProvider::Xai);
+    assert_eq!(
+        model_provider_from_family(Some("codex")),
+        ModelProvider::Codex
+    );
+    // Unknown families warn and stay on xAI (legacy-compatible).
+    assert_eq!(
+        model_provider_from_family(Some("acme")),
+        ModelProvider::Xai
+    );
+}
+/// A Codex model without an explicit key must never pick up xAI credential
+/// sources: not the session token, not XAI_API_KEY.
+#[test]
+#[serial]
+fn codex_model_ignores_xai_credential_sources() {
+    let _env = EnvGuard::set("XAI_API_KEY", "xai-env-key");
+    let entry = codex_model_entry(None, "https://cli-chat-proxy.grok.com/v1");
+    let creds = resolve_credentials(&entry, Some("xai-session-jwt"));
+    assert_eq!(creds.api_key, None);
+    assert_eq!(
+        creds.base_url,
+        crate::codex_auth::CODEX_INFERENCE_BASE_URL,
+        "codex OAuth routes to the Codex inference endpoint"
+    );
+}
+#[test]
+#[serial]
+fn codex_inference_base_url_env_override_applies() {
+    let _env = EnvGuard::set("GROK_CODEX_INFERENCE_BASE_URL", "http://127.0.0.1:9/codex");
+    let entry = codex_model_entry(None, "https://cli-chat-proxy.grok.com/v1");
+    let creds = resolve_credentials(&entry, None);
+    assert_eq!(creds.base_url, "http://127.0.0.1:9/codex");
+}
+/// An explicit model api_key wins over Codex OAuth: the key and the
+/// configured base_url are used verbatim and no OAuth identity anchor is
+/// planted (so no Codex bearer resolver mounts later).
+#[test]
+#[serial]
+fn codex_explicit_api_key_wins_over_oauth() {
+    let entry = codex_model_entry(Some("sk-byok"), "https://byok.example/v1");
+    let creds = resolve_credentials(&entry, Some("xai-session-jwt"));
+    assert_eq!(creds.api_key.as_deref(), Some("sk-byok"));
+    assert_eq!(creds.base_url, "https://byok.example/v1");
+    let cfg = resolve_sampling(&entry, None);
+    assert_eq!(
+        cfg.provider_profile,
+        xai_grok_sampling_types::ProviderProfile::CODEX
+    );
+    assert_eq!(
+        cfg.extra_headers.get("originator").map(String::as_str),
+        Some(crate::codex_auth::CODEX_ORIGINATOR)
+    );
+    assert!(
+        !crate::codex_auth::has_oauth_identity_anchor(&cfg.extra_headers),
+        "explicit-key codex configs must not carry an OAuth identity anchor"
+    );
+}
+/// xAI models never consult Codex auth state: no originator header, no
+/// Codex identity anchor, xAI provider profile.
+#[test]
+#[serial]
+fn xai_model_gets_no_codex_wire_identity() {
+    let entry = test_model_entry(
+        "grok-test",
+        "https://cli-chat-proxy.grok.com/v1",
+        None,
+        None,
+        None,
+    );
+    let cfg = resolve_sampling(&entry, Some("xai-session-jwt"));
+    assert_eq!(
+        cfg.provider_profile,
+        xai_grok_sampling_types::ProviderProfile::XAI
+    );
+    assert!(!cfg.extra_headers.contains_key("originator"));
+    assert!(
+        !crate::codex_auth::has_oauth_identity_anchor(&cfg.extra_headers),
+        "xAI configs must not carry Codex identity anchors"
+    );
+    assert!(
+        cfg.extra_headers
+            .keys()
+            .all(|k| !k.to_ascii_lowercase().starts_with("x-grok-build-codex")),
+    );
+}
+/// Provider × backend legality fails closed: a codex-family model declared
+/// on a non-Responses backend is rejected from the catalog, not degraded.
+#[test]
+#[serial]
+fn codex_model_on_non_responses_backend_is_rejected() {
+    // Distinct slugs: a same-slug sibling with a Responses backend would
+    // legitimately donate its backend before the legality check runs.
+    let mut bad = codex_model_entry(None, "https://cli-chat-proxy.grok.com/v1");
+    bad.info.model = "gpt-bad".to_string();
+    bad.info.api_backend = ApiBackend::ChatCompletions;
+    let mut ok = codex_model_entry(None, "https://cli-chat-proxy.grok.com/v1");
+    ok.info.model = "gpt-ok".to_string();
+    let mut prefetched = IndexMap::new();
+    prefetched.insert("bad-codex".to_string(), bad);
+    prefetched.insert("ok-codex".to_string(), ok);
+    let (_, models) = resolve_models_from_toml("", Some(prefetched));
+    assert!(models.get("bad-codex").is_none());
+    assert!(models.get("ok-codex").is_some());
+}
+/// The bundled fallback catalog carries the Codex entry with a conservative
+/// capability surface and it is not the default model.
+#[test]
+fn default_catalog_contains_conservative_codex_entry() {
+    let endpoints = EndpointsConfig::default();
+    let models = default_model_entries(&endpoints);
+    let codex = models.get("gpt-5.6-sol").expect("codex fallback entry");
+    assert_eq!(
+        codex.info.provider(),
+        xai_grok_sampling_types::ModelProvider::Codex
+    );
+    assert_eq!(codex.info.api_backend, ApiBackend::Responses);
+    assert!(codex.info.compactions_remaining.is_none());
+    assert!(codex.info.compaction_at_tokens.is_none());
+    assert!(!codex.info.supports_backend_search);
+    assert_ne!(crate::models::default_model(), "gpt-5.6-sol");
+}
+/// Codex-only startup gate: requires both a Codex-selected model and a
+/// Codex login; anything else keeps the xAI login flow.
+#[test]
+fn codex_only_start_allowed_requires_codex_model_and_login() {
+    let codex = codex_model_entry(None, "https://cli-chat-proxy.grok.com/v1");
+    let xai = test_model_entry("grok-test", "https://x/v1", None, None, None);
+    assert!(codex_only_start_allowed(Some(&codex), true));
+    assert!(!codex_only_start_allowed(Some(&codex), false));
+    assert!(!codex_only_start_allowed(Some(&xai), true));
+    assert!(!codex_only_start_allowed(None, true));
 }

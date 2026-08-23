@@ -397,6 +397,14 @@ pub fn auth_file_path() -> PathBuf {
     crate::util::grok_home::grok_home().join(CODEX_AUTH_FILE_NAME)
 }
 
+/// Inference endpoint for Codex model requests, with the test/dev override.
+pub(crate) fn inference_base_url() -> String {
+    std::env::var("GROK_CODEX_INFERENCE_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| CODEX_INFERENCE_BASE_URL.to_owned())
+}
+
 pub fn load_credentials() -> io::Result<Option<CodexCredentials>> {
     load_credentials_at(&auth_file_path())
 }
@@ -1271,6 +1279,12 @@ fn header_value_case_insensitive<'a>(
         .map(|(_, value)| value.as_str())
 }
 
+/// Whether `headers` carry the internal OAuth identity anchor, i.e. the
+/// session was configured for Codex OAuth (as opposed to an explicit API key).
+pub(crate) fn has_oauth_identity_anchor(headers: &IndexMap<String, String>) -> bool {
+    identity_anchor(headers).is_some()
+}
+
 fn identity_anchor(headers: &IndexMap<String, String>) -> Option<CodexAuthIdentity> {
     (header_value_case_insensitive(headers, CODEX_AUTH_ANCHOR_HEADER) == Some("1")).then(|| {
         CodexAuthIdentity {
@@ -1314,18 +1328,32 @@ impl CodexBearerResolver {
         }
     }
 
-    fn resolve_credentials(&self, credentials: CodexCredentials) -> Option<String> {
+    /// Fail closed when the on-disk account identity no longer matches the
+    /// identity this session was configured with.
+    fn checked(&self, credentials: CodexCredentials) -> Option<CodexCredentials> {
         let expected = self.expected_identity.as_ref()?;
-        if &credentials.identity() != expected {
-            return None;
-        }
-        Some(credentials.access_token)
+        (&credentials.identity() == expected).then_some(credentials)
+    }
+
+    fn resolve_credentials(&self, credentials: CodexCredentials) -> Option<String> {
+        self.checked(credentials).map(|c| c.access_token)
     }
 }
 
 impl xai_grok_sampler::BearerResolver for CodexBearerResolver {
     fn current_bearer(&self) -> Option<String> {
         self.resolve_credentials(load_credentials().ok().flatten()?)
+    }
+
+    /// Bearer + account id + FedRAMP flag from one credential read, so the
+    /// account headers can never pair with a token from a different rotation.
+    fn resolve_auth(&self) -> Option<xai_grok_sampler::ResolvedBearerAuth> {
+        let credentials = self.checked(load_credentials().ok().flatten()?)?;
+        Some(xai_grok_sampler::ResolvedBearerAuth {
+            bearer: credentials.access_token,
+            account_id: credentials.account_id,
+            fedramp: credentials.account_is_fedramp,
+        })
     }
 }
 
@@ -1520,6 +1548,42 @@ mod tests {
                 .is_none(),
             "a live relogin must not cross the session's account boundary"
         );
+    }
+
+    /// Anchor headers written by `set_oauth_identity_anchor` round-trip into
+    /// a resolver whose `resolve_auth` returns the same-source account
+    /// snapshot, and are recognized by `has_oauth_identity_anchor`. `None`
+    /// credentials only strip (explicit-key configs carry no anchor).
+    #[test]
+    fn identity_anchor_round_trips_into_resolver_headers() {
+        let credentials = CodexCredentials {
+            access_token: "token-a".to_owned(),
+            account_id: Some("account-a".to_owned()),
+            chatgpt_user_id: Some("user-a".to_owned()),
+            email: None,
+            plan_type: Some("enterprise".to_owned()),
+            is_workspace_account: true,
+            account_is_fedramp: true,
+        };
+        let mut headers = IndexMap::new();
+        headers.insert("ChatGPT-Account-ID".to_owned(), "spoofed".to_owned());
+        set_oauth_identity_anchor(&mut headers, Some(&credentials));
+        assert!(has_oauth_identity_anchor(&headers));
+        assert!(
+            !headers.keys().any(|k| k.eq_ignore_ascii_case("chatgpt-account-id")),
+            "model-supplied reserved auth headers are stripped"
+        );
+        let resolver = CodexBearerResolver::from_headers(&headers);
+        assert!(
+            resolver.resolve_credentials(credentials.clone()).is_some(),
+            "resolver rebuilt from anchor headers accepts the same identity"
+        );
+
+        let mut stripped = IndexMap::new();
+        stripped.insert("X-OpenAI-Fedramp".to_owned(), "true".to_owned());
+        set_oauth_identity_anchor(&mut stripped, None);
+        assert!(stripped.is_empty());
+        assert!(!has_oauth_identity_anchor(&stripped));
     }
 
     #[test]

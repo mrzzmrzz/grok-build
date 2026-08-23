@@ -5,7 +5,7 @@
 //! cache is account-scoped and a completed request is checked again before it
 //! is published, so a logout or account switch cannot expose stale metadata.
 
-use crate::codex_auth::{self, CODEX_INFERENCE_BASE_URL, CODEX_ORIGINATOR, CodexCredentials};
+use crate::codex_auth::{self, CODEX_ORIGINATOR, CodexCredentials};
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -592,10 +592,7 @@ impl CodexModelsRequestError {
 }
 
 fn codex_inference_base_url() -> String {
-    std::env::var("GROK_CODEX_INFERENCE_BASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| CODEX_INFERENCE_BASE_URL.to_owned())
+    codex_auth::inference_base_url()
 }
 
 fn convert_model(wire: CodexWireModel) -> Option<CodexCatalogModel> {

@@ -432,10 +432,14 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
+        // Provider comes from catalog model_family via the memoized facts;
+        // a Codex model must never mount the xAI session-token resolver.
+        let is_codex = model_facts.model_provider
+            == xai_grok_sampling_types::ModelProvider::Codex;
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
-        let use_bearer_resolver = gate.active();
+        let use_bearer_resolver = gate.active() && !is_codex;
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
@@ -483,7 +487,7 @@ impl SessionActor {
             &cfg.api_backend,
             &cfg.base_url,
         );
-        SamplingConfig {
+        let mut config = SamplingConfig {
             api_key,
             base_url: cfg.base_url,
             model: cfg.model,
@@ -491,6 +495,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            provider_profile: xai_grok_sampling_types::ProviderProfile::XAI,
             auth_scheme,
             extra_headers,
             extra_response_includes,
@@ -527,7 +532,23 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+        };
+        if is_codex {
+            config.provider_profile = xai_grok_sampling_types::ProviderProfile::CODEX;
+            // xAI identity never rides a Codex request.
+            config.user_id = None;
+            // OAuth sessions carry the internal identity anchor placed by
+            // sampling_config_for_model; it selects the Codex bearer
+            // resolver pinned to that account. An explicit-key Codex model
+            // has no anchor and keeps its static api_key.
+            if crate::codex_auth::has_oauth_identity_anchor(&config.extra_headers) {
+                config.api_key = None;
+                config.bearer_resolver = Some(std::sync::Arc::new(
+                    crate::codex_auth::CodexBearerResolver::from_headers(&config.extra_headers),
+                ));
+            }
         }
+        config
     }
     /// Install auto-mode permission classifier with a live LLM side-query
     /// (laziness-classifier pattern: `prepare_chat_completion` +

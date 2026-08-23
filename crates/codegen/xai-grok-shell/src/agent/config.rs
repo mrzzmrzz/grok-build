@@ -15,8 +15,8 @@ use std::sync::Arc;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
-    CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
-    REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
+    CompactionAtTokens, CompactionsRemaining, ModelProvider, ProviderProfile,
+    REASONING_EFFORT_META_KEY, REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
 use xai_grok_tools::types::compat::{
@@ -3664,6 +3664,22 @@ pub(crate) fn resolve_model_list(
     for entry in resolved.values_mut() {
         entry.info.derive_reasoning_effort_fields();
     }
+    // Provider × backend legality (fail closed): a model whose provider
+    // profile does not support its api_backend is rejected here rather than
+    // silently degraded to another wire shape (Codex only speaks Responses).
+    resolved.retain(|key, entry| {
+        let profile = ProviderProfile::for_provider(entry.info.provider());
+        let supported = profile.supports_backend(&entry.info.api_backend);
+        if !supported {
+            tracing::warn!(
+                model_key = %key,
+                model_family = ?entry.info.model_family,
+                api_backend = ?entry.info.api_backend,
+                "model rejected: provider does not support this api_backend"
+            );
+        }
+        supported
+    });
     resolved
 }
 /// Layer 6 of [`resolve_model_list`]: fold the global `[models].extra_headers`
@@ -3732,6 +3748,12 @@ pub(crate) fn default_model_entries(endpoints: &EndpointsConfig) -> IndexMap<Str
         .into_iter()
         .map(|(key, entry)| (key, ModelEntry::from_config_entry(&entry)))
         .collect()
+}
+/// Whether a session may start without xAI auth: the selected model is a
+/// Codex model (by `model_family`) and a Codex OAuth credential exists.
+/// Everything else keeps requiring the xAI login flow.
+pub(crate) fn codex_only_start_allowed(entry: Option<&ModelEntry>, codex_logged_in: bool) -> bool {
+    codex_logged_in && entry.is_some_and(|e| e.info().provider() == ModelProvider::Codex)
 }
 /// Resolve a model against the available model map.
 /// Checks the map key (id) first, then falls back to a slug scan.
@@ -4252,7 +4274,28 @@ pub struct ModelInfo {
     #[serde(default)]
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
+/// The single `model_family` → [`ModelProvider`] mapping. `None` and `"xai"`
+/// are xAI (configs written before the field existed); unknown families warn
+/// and stay on xAI. Provider identity is never inferred from a model slug,
+/// URL, or backend.
+pub(crate) fn model_provider_from_family(model_family: Option<&str>) -> ModelProvider {
+    match model_family {
+        None | Some("xai") => ModelProvider::Xai,
+        Some("codex") => ModelProvider::Codex,
+        Some(other) => {
+            tracing::warn!(
+                model_family = %other,
+                "unknown model_family; treating the model as an xAI model"
+            );
+            ModelProvider::Xai
+        }
+    }
+}
 impl ModelInfo {
+    /// Provider identity for transport policy, from `model_family` only.
+    pub(crate) fn provider(&self) -> ModelProvider {
+        model_provider_from_family(self.model_family.as_deref())
+    }
     /// Minimal fallback descriptor for an unknown model slug.
     /// Used when a configured model ID isn't found in presets or remote models.
     pub fn fallback(slug: &str) -> Self {
@@ -4834,6 +4877,27 @@ pub(crate) fn resolve_credentials(
     session_key: Option<&str>,
 ) -> ResolvedCredentials {
     let info = model.info();
+    // Codex models never touch xAI credential sources (session token,
+    // auth-provider tokens, XAI_API_KEY). An explicit model api_key/env_key
+    // wins and targets the configured base_url; otherwise the session layer
+    // attaches the Codex OAuth bearer resolver against the Codex endpoint.
+    if info.provider() == ModelProvider::Codex {
+        let (api_key, base_url) = match model.own_credential() {
+            Some(key) => (Some(key), info.base_url.clone()),
+            None => (None, crate::codex_auth::inference_base_url()),
+        };
+        tracing::debug!(
+            model = %info.model,
+            has_own_key = api_key.is_some(),
+            "resolved credentials (codex)"
+        );
+        return ResolvedCredentials {
+            api_key,
+            base_url,
+            auth_type: xai_chat_state::AuthType::ApiKey,
+            auth_scheme: info.auth_scheme,
+        };
+    }
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
@@ -4956,6 +5020,9 @@ pub(crate) fn try_resolve_model_credentials(
 pub(crate) struct ModelAuthFacts {
     pub byok: ModelByok,
     pub auth_scheme: AuthScheme,
+    /// Provider identity from catalog `model_family`; `Xai` when the config
+    /// is unavailable or the model is absent (existing behavior).
+    pub model_provider: ModelProvider,
 }
 /// Resolve `model_id` to its auth facts and auth-provider reference from one
 /// effective-config load; both ride the same memo (see
@@ -4971,6 +5038,7 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             ModelAuthFacts {
                 byok: ModelByok::Unknown,
                 auth_scheme: AuthScheme::default(),
+                model_provider: ModelProvider::Xai,
             },
             None,
         );
@@ -4981,6 +5049,10 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
             auth_scheme: match lookup {
                 ModelLookup::Loaded(Some(e)) => e.info().auth_scheme,
                 _ => AuthScheme::default(),
+            },
+            model_provider: match &lookup {
+                ModelLookup::Loaded(Some(e)) => e.info().provider(),
+                _ => ModelProvider::Xai,
             },
         };
         let provider = match lookup {
@@ -5138,7 +5210,12 @@ pub(crate) fn stamp_session_local_sampler_fields(
 ) {
     cfg.client_identifier = client_identifier;
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
-    if crate::util::is_xai_api_bearer_url(&cfg.base_url) {
+    // Never copy a non-xAI session's resolver (e.g. the Codex OAuth bearer)
+    // onto an xAI aux endpoint: the aux request would carry the wrong
+    // provider's credential.
+    if crate::util::is_xai_api_bearer_url(&cfg.base_url)
+        && active_session_config.provider_profile.provider == ModelProvider::Xai
+    {
         cfg.bearer_resolver = active_session_config.bearer_resolver.clone();
     }
     cfg.max_retries = max_retries;
@@ -5216,12 +5293,40 @@ pub(crate) fn sampling_config_for_model(
     let max_completion_tokens = info.max_completion_tokens;
     let temperature = info.temperature;
     let top_p = info.top_p;
+    let provider = info.provider();
+    let provider_profile = ProviderProfile::for_provider(provider);
     let mut extra_headers = info.extra_headers.clone();
-    inject_url_derived_headers(
-        &mut extra_headers,
-        alpha_test_key.as_deref(),
-        &credentials.base_url,
-    );
+    match provider {
+        ModelProvider::Xai => {
+            inject_url_derived_headers(
+                &mut extra_headers,
+                alpha_test_key.as_deref(),
+                &credentials.base_url,
+            );
+        }
+        ModelProvider::Codex => {
+            // Codex wire identity: `originator` instead of any x-grok-*
+            // header (the sampler additionally strips x-grok-* for this
+            // profile). OAuth sessions also carry the internal identity
+            // anchor so the per-request bearer resolver fails closed on an
+            // account change; an explicit API key carries no anchor and no
+            // OAuth resolver. Both paths strip model-supplied overrides of
+            // the reserved Codex auth headers.
+            extra_headers.insert(
+                "originator".to_owned(),
+                crate::codex_auth::CODEX_ORIGINATOR.to_owned(),
+            );
+            let oauth_credentials = if credentials.api_key.is_none() {
+                crate::codex_auth::load_credentials().ok().flatten()
+            } else {
+                None
+            };
+            crate::codex_auth::set_oauth_identity_anchor(
+                &mut extra_headers,
+                oauth_credentials.as_ref(),
+            );
+        }
+    }
     let api_backend = info.api_backend.clone();
     let extra_response_includes = response_include_extensions(
         info.supports_backend_search,
@@ -5236,6 +5341,7 @@ pub(crate) fn sampling_config_for_model(
         temperature,
         top_p,
         api_backend,
+        provider_profile,
         auth_scheme: credentials.auth_scheme,
         extra_headers,
         extra_response_includes,

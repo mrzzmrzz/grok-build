@@ -721,6 +721,12 @@ async fn read_parent_sampling_config(
             let auth_scheme = crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
                 .map(|r| r.auth_scheme)
                 .unwrap_or_default();
+            // Same catalog-driven provider identity as the parent turn path.
+            let is_codex =
+                crate::agent::config::resolve_model_auth_facts_and_provider(&cfg.model)
+                    .0
+                    .model_provider
+                    == xai_grok_sampling_types::ModelProvider::Codex;
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
             let catalog_model_id = parent_catalog_model_id(ctx, &cfg.model);
@@ -732,7 +738,7 @@ async fn read_parent_sampling_config(
                 &cfg.api_backend,
                 &cfg.base_url,
             );
-            let inherited = xai_grok_sampler::SamplerConfig {
+            let mut inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
                 base_url: cfg.base_url,
                 model: cfg.model.clone(),
@@ -757,7 +763,7 @@ async fn read_parent_sampling_config(
                 user_id: ctx.sampling_config.user_id.clone(),
                 origin_client: ctx.sampling_config.origin_client.clone(),
                 attribution_callback: ctx.attribution_callback.clone(),
-                bearer_resolver: if strip_guard {
+                bearer_resolver: if strip_guard || is_codex {
                     None
                 } else {
                     inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
@@ -771,7 +777,20 @@ async fn read_parent_sampling_config(
                     .model_compaction_at_tokens(catalog_model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
+                ..Default::default()
             };
+            if is_codex {
+                inherited.provider_profile = xai_grok_sampling_types::ProviderProfile::CODEX;
+                inherited.user_id = None;
+                if crate::codex_auth::has_oauth_identity_anchor(&inherited.extra_headers) {
+                    inherited.api_key = None;
+                    inherited.bearer_resolver = Some(std::sync::Arc::new(
+                        crate::codex_auth::CodexBearerResolver::from_headers(
+                            &inherited.extra_headers,
+                        ),
+                    ));
+                }
+            }
             let model_id = ctx.model_id.clone();
             let global_model_id = ctx.models_manager.current_model_id();
             xai_grok_telemetry::unified_log::debug(
@@ -867,7 +886,18 @@ fn resolve_model_override_to_config(
         ctx.sampling_config.deployment_id.clone(),
         ctx.sampling_config.user_id.clone(),
     );
-    config.bearer_resolver = if !ctx.would_strip_fallback_key(config.api_key.as_deref())
+    config.bearer_resolver = if config.provider_profile.provider
+        == xai_grok_sampling_types::ModelProvider::Codex
+    {
+        // Codex pin: OAuth sessions mount the Codex resolver via the identity
+        // anchor sampling_config_for_model placed; explicit-key pins keep the
+        // static key. The xAI session-token resolver never applies.
+        crate::codex_auth::has_oauth_identity_anchor(&config.extra_headers).then(|| {
+            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_headers(
+                &config.extra_headers,
+            )) as xai_grok_sampler::SharedBearerResolver
+        })
+    } else if !ctx.would_strip_fallback_key(config.api_key.as_deref())
         && resolved_auth_type == xai_chat_state::AuthType::SessionToken
     {
         session_bearer_resolver(

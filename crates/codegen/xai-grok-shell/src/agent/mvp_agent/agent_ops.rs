@@ -2029,6 +2029,11 @@ impl MvpAgent {
         let preferred = self.cfg.borrow().grok_com_config.preferred_method;
         let prefers_oidc = preferred == Some(PreferredAuthMethod::Oidc);
         let is_session_based_auth = self.is_session_based_auth();
+        // The xAI session-token overrides below must never rebind a Codex
+        // model to xAI auth: its bearer comes from the Codex OAuth resolver
+        // (or an explicit model key), resolved in resolve_credentials.
+        let is_codex = model.info().provider()
+            == xai_grok_sampling_types::ModelProvider::Codex;
         let session = match preferred {
             Some(PreferredAuthMethod::ApiKey) => None,
             _ if is_session_based_auth => self.auth_manager.current_or_expired(),
@@ -2039,7 +2044,7 @@ impl MvpAgent {
             model,
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if prefers_oidc && !model.has_own_credentials()
+        if prefers_oidc && !is_codex && !model.has_own_credentials()
             && credentials.auth_type == xai_chat_state::AuthType::ApiKey
         {
             credentials.api_key = None;
@@ -2050,7 +2055,8 @@ impl MvpAgent {
             self.cfg.borrow().grok_com_config.api_key_auth_disabled(),
             session.as_ref().map(|a| a.key.as_str()),
         );
-        if !has_session_key && credentials.auth_type == xai_chat_state::AuthType::ApiKey
+        if !is_codex && !has_session_key
+            && credentials.auth_type == xai_chat_state::AuthType::ApiKey
             && !model.has_own_credentials() && is_session_based_auth
         {
             tracing::info!(
@@ -2064,12 +2070,14 @@ impl MvpAgent {
             );
             credentials.auth_type = xai_chat_state::AuthType::SessionToken;
         }
-        if should_warn_missing_session(MissingSessionCtx {
-            has_session_key,
-            has_own_credentials: model.has_own_credentials(),
-            is_session_based_auth,
-            preferred,
-        }) {
+        if !is_codex
+            && should_warn_missing_session(MissingSessionCtx {
+                has_session_key,
+                has_own_credentials: model.has_own_credentials(),
+                is_session_based_auth,
+                preferred,
+            })
+        {
             tracing::warn!(
                 model = model.info().model.as_str(),
                 is_expired = self.auth_manager.is_expired(),
