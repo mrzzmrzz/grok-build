@@ -71,18 +71,6 @@ const ROW_HEIGHT: u16 = 3;
 /// Per-group-header visual height (label row + 1-cell breathing gap).
 const GROUP_HEADER_HEIGHT: u16 = 2;
 
-/// Promo upgrade CTA for the dashboard header, resolved through the shared
-/// slot gate by the producer (`app_view`).
-#[derive(Clone, Copy)]
-pub struct HeaderUpgradeCta<'a> {
-    /// The `[label]` button text.
-    pub label: &'a str,
-    /// Non-dismissible promo → the `Ctrl+O` override applies.
-    pub pinned: bool,
-    /// The promo's trimmed `cta.caption` accessor value; pinned-gated at paint.
-    pub caption: Option<&'a str>,
-}
-
 /// Render the dashboard. Mirrors `agent_view::draw` — returns the
 /// cursor position to place after the frame is committed.
 ///
@@ -113,13 +101,7 @@ pub fn render_dashboard(
     // empty body reads "Loading sessions…" instead of the "no agents
     // yet" hint so a fresh open doesn't flash an empty-looking screen.
     dashboard_sessions_loading: bool,
-    // Promo upgrade CTA to paint in the header after the location label
-    // (`None` = no CTA); field meanings live on [`HeaderUpgradeCta`].
-    upgrade_cta: Option<HeaderUpgradeCta<'_>>,
 ) -> Option<(u16, u16)> {
-    // Cache whether a pinned (non-dismissible) promo CTA is live so the key
-    // handler can steal Ctrl+O for it; the dispatch re-resolves the gate.
-    state.pinned_upgrade_cta_live = upgrade_cta.is_some_and(|cta| cta.pinned);
     // Re-anchor selection BEFORE we build the rows so that the
     // visible set drives selection clamping.
     let theme = Theme::current();
@@ -292,7 +274,7 @@ pub fn render_dashboard(
     }
 
     // Header.
-    render_header(buf, layout.header, &theme, &rows, state, upgrade_cta);
+    render_header(buf, layout.header, &theme, &rows, state);
 
     // Body: key off visible rows (local agents + roster), not the local map alone.
     if rows.is_empty() {
@@ -705,7 +687,6 @@ fn render_header(
     theme: &Theme,
     rows: &[DashboardRow],
     state: &mut DashboardState,
-    upgrade_cta: Option<HeaderUpgradeCta<'_>>,
 ) {
     use ratatui::text::{Line, Span};
 
@@ -717,7 +698,6 @@ fn render_header(
     // survives the per-frame rect reset.
     state.new_agent_button_hit.set(None);
     state.location_hit.set(None);
-    state.upgrade_cta_hit.set(None);
 
     if area.area() == 0 {
         return;
@@ -908,15 +888,7 @@ fn render_header(
         .min()
         .map(|min_x| min_x.saturating_sub(3).saturating_sub(area.x))
         .unwrap_or(chip_area.width) as usize;
-    // Reserve the upgrade CTA (lead space + `[label]` + pinned-only `cta.caption`)
-    // so the location label truncates first (reservation-first); the shared
-    // painter then clamps to the space left, so it can't overpaint chips.
-    // Caption gates on pinned only: the Ctrl+O CTA chord is handled before the peek-permission key handler, so it opens the CTA (not YOLO) even while a peek prompt is pending.
-    let upgrade_caption = upgrade_cta.and_then(|cta| cta.pinned.then_some(cta.caption).flatten());
-    let upgrade_reserve = upgrade_cta.map_or(0usize, |cta| {
-        1 + crate::views::announcements::upgrade_cta_reserve(cta.label, upgrade_caption) as usize
-    });
-    let label_budget = full_label_budget.saturating_sub(upgrade_reserve);
+    let label_budget = full_label_budget;
     let mut location = crate::views::welcome::location_line_at(theme, &state.cwd);
     // 1-cell left inset, matching the old ` Agents` label.
     location
@@ -947,33 +919,6 @@ fn render_header(
             width: hit_w,
             height: 1,
         }));
-    }
-
-    // Upgrade CTA painted right after the location label (free-tier upsell),
-    // clamped to the space left before the chips — a lead space then the shared
-    // clamping button painter. Pointer click → Dashboard, Ctrl+O → Keyboard.
-    if let Some(HeaderUpgradeCta { label, .. }) = upgrade_cta {
-        let avail = full_label_budget.saturating_sub(location_w as usize);
-        if avail > 1 {
-            let cta_x = area.x + location_w;
-            buf.set_span(
-                cta_x,
-                area.y,
-                &Span::styled(" ", Style::default().bg(theme.bg_base)),
-                1,
-            );
-            let painted = crate::views::announcements::render_cta_button(
-                buf,
-                theme,
-                cta_x + 1,
-                area.y,
-                (avail - 1) as u16,
-                label,
-                upgrade_caption,
-                state.upgrade_cta_hit.hovered,
-            );
-            state.upgrade_cta_hit.set(painted);
-        }
     }
 }
 

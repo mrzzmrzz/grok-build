@@ -149,8 +149,6 @@ pub struct WelcomeRenderResult {
     pub announcement_truncated: bool,
     /// Hit-test rect for the full announcement block (click anywhere to toggle).
     pub announcement_rect: Option<Rect>,
-    /// Hit-test rect for the promo upgrade CTA `[label]` button (click → open).
-    pub upgrade_cta_rect: Option<Rect>,
     pub privacy_banner_opt_in_rect: Option<Rect>,
     pub privacy_banner_opt_out_rect: Option<Rect>,
     pub privacy_banner_terms_rect: Option<Rect>,
@@ -210,8 +208,6 @@ struct WelcomeLayoutInput<'a> {
     announcement: Option<&'a xai_grok_announcements::RemoteAnnouncement>,
     /// Whether a long announcement is expanded inline (vs. collapsed to 2 lines).
     expanded: bool,
-    /// Whether the info slot reserves a promo upgrade CTA (spacer + button).
-    has_upgrade_cta: bool,
     /// Rows reserved for the prompt box. `None` keeps the default; the blocking screens that paint
     /// no prompt pass 0 to give the rows back to their message.
     prompt_height: Option<u16>,
@@ -280,7 +276,6 @@ impl WelcomeLayout {
             prompt_compact,
             announcement,
             expanded,
-            has_upgrade_cta,
             prompt_height,
         } = input;
         let zero = Rect::default();
@@ -309,7 +304,6 @@ impl WelcomeLayout {
                 changelog_height,
                 announcement,
                 expanded,
-                has_upgrade_cta,
             );
         }
 
@@ -321,7 +315,7 @@ impl WelcomeLayout {
                     .width
                     .saturating_sub(prompt::prompt_inset(prompt_compact) * 2);
                 let width = stacked_info_width(avail, content_area.height, MENU_MIN_WIDTH);
-                hero_box::announcement_desired_rows(ann, width, expanded, has_upgrade_cta).min(
+                hero_box::announcement_desired_rows(ann, width, expanded).min(
                     stacked_info_budget(
                         content_area,
                         error_height,
@@ -678,10 +672,6 @@ pub struct WelcomeRenderParams<'a> {
     /// Whether a long managed-config announcement is expanded inline (vs the
     /// default 2-line collapsed view with a trailing `…`).
     pub welcome_announcement_expanded: bool,
-    /// Promo upgrade CTA `[label]` to paint below the hero announcement: `Some`
-    /// drives both the reserved row height and the `[label]` button. `None` = no
-    /// CTA on the welcome screen.
-    pub upgrade_cta: Option<&'a str>,
     /// Non-blocking welcome privacy banner above the prompt.
     pub privacy_banner: bool,
     /// Chat-mode workspace picker selection (`local-workspace` feature).
@@ -1650,7 +1640,6 @@ fn stacked_info_budget(
 
 /// Render the announcement in the stacked info slot, centered to the menu width.
 /// Returns `(block_rect, truncated)`: the clickable block and the overflow flag.
-#[allow(clippy::too_many_arguments)]
 fn render_announcement_section(
     area: Rect,
     buf: &mut Buffer,
@@ -1660,8 +1649,7 @@ fn render_announcement_section(
     content_height: u16,
     expanded: bool,
     mouse_pos: Option<(u16, u16)>,
-    upgrade_cta: Option<&str>,
-) -> (Option<Rect>, bool, Option<Rect>) {
+) -> (Option<Rect>, bool) {
     // Same width the height pre-pass reserved for (see `stacked_info_width`).
     let menu_width = stacked_info_width(area.width, content_height, min_width_hint);
     let [_, centered, _] = Layout::horizontal([
@@ -1673,21 +1661,12 @@ fn render_announcement_section(
     .areas(area);
 
     if centered.width < 20 || centered.height == 0 {
-        return (None, false, None);
+        return (None, false);
     }
 
-    // Mirror the hero: reserve the CTA rows at the bottom, draw the text into
-    // what's left, then place the `[label]` button right after the drawn text.
-    let (text_area, truncated, cta_rect) = hero_box::render_announcement_with_upgrade_cta(
-        buf,
-        theme,
-        centered,
-        announcement,
-        expanded,
-        mouse_pos,
-        upgrade_cta,
-    );
-    (Some(text_area), truncated, cta_rect)
+    let truncated =
+        hero_box::render_announcement_block(buf, theme, centered, announcement, expanded, mouse_pos);
+    (Some(centered), truncated)
 }
 
 /// Render the normal welcome screen (Done state -- already authenticated).
@@ -1849,7 +1828,6 @@ fn render_welcome_done(
         prompt_compact: p.compact,
         announcement: p.announcement,
         expanded: p.welcome_announcement_expanded,
-        has_upgrade_cta: p.upgrade_cta.is_some(),
         prompt_height: None,
     });
 
@@ -1860,7 +1838,6 @@ fn render_welcome_done(
     let mut changelog_cta_rect: Option<Rect> = None;
     let mut announcement_truncated = false;
     let mut announcement_rect: Option<Rect> = None;
-    let mut upgrade_cta_rect: Option<Rect> = None;
 
     #[cfg(feature = "local-workspace")]
     let mut workspace_mode_rects = WorkspaceModeHitRects::default();
@@ -1908,7 +1885,6 @@ fn render_welcome_done(
             p.welcome_announcement_expanded,
             p.changelog_bullets,
             p.changelog_has_full_notes,
-            p.upgrade_cta,
             #[cfg(feature = "local-workspace")]
             show_workspace_picker.then_some((
                 p.workspace_mode,
@@ -1919,7 +1895,6 @@ fn render_welcome_done(
         changelog_cta_rect = rects.changelog_cta_rect;
         announcement_truncated = rects.announcement_truncated;
         announcement_rect = rects.announcement_rect;
-        upgrade_cta_rect = rects.upgrade_cta_rect;
         #[cfg(feature = "local-workspace")]
         {
             workspace_mode_rects = rects.workspace_mode_rects;
@@ -1973,7 +1948,7 @@ fn render_welcome_done(
     if layout.changelog.height > 0 {
         let info_area = inset_horizontal(layout.changelog, prompt::prompt_inset(p.compact));
         if let Some(ann) = p.announcement {
-            let (block, truncated, cta_rect) = render_announcement_section(
+            let (block, truncated) = render_announcement_section(
                 info_area,
                 buf,
                 theme,
@@ -1982,11 +1957,9 @@ fn render_welcome_done(
                 content_area.height,
                 p.welcome_announcement_expanded,
                 p.mouse_pos,
-                p.upgrade_cta,
             );
             announcement_rect = block;
             announcement_truncated = truncated;
-            upgrade_cta_rect = cta_rect;
         } else {
             changelog_cta_rect = render_changelog_section(
                 info_area,
@@ -2279,7 +2252,6 @@ fn render_welcome_done(
         changelog_cta_rect,
         announcement_truncated,
         announcement_rect,
-        upgrade_cta_rect,
         privacy_banner_opt_in_rect,
         privacy_banner_opt_out_rect,
         privacy_banner_terms_rect,
@@ -2927,7 +2899,6 @@ mod tests {
             changelog_bullets: &[],
             changelog_has_full_notes: false,
             welcome_announcement_expanded: false,
-            upgrade_cta: None,
             privacy_banner: false,
             #[cfg(feature = "local-workspace")]
             workspace_mode: WelcomeWorkspaceMode::Sandbox,

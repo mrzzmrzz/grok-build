@@ -111,7 +111,7 @@ Envelope 建议（#2）：保持前缀嗅探兼容，新格式 `custom_tool_call
 2. **prompt cache 命中率 = 推理性能**：`prompt_cache_key` 稳定性、turn-state 复用、session affinity header 直接决定 Codex 端 KV cache 命中与延迟/成本。把"同一 session 内 key 稳定、retry/continuation 不换 key"升格为性能验收项（mock server 断言）。
 3. **credential 内存 snapshot**：`Arc` 不可变快照 + 过期检查，请求热路径零文件 IO；仅过期/401 走磁盘 + single-flight refresh，防止并发 refresh 风暴。
 4. **catalog stale-while-revalidate**：启动直接用缓存渲染，live 刷新在后台完成后热更新；冷启动路径零网络等待（5 秒超时只约束后台刷新）。`load_fresh_or_fetch` 现有逻辑接近此语义，接线时保持。
-5. **V8 isolate 惰性创建 + 空闲回收**：首次进入 Code Mode 才建 isolate；评估 deno_core snapshot 缩短启动；空闲超时销毁约束内存。
+5. **V8 平台惰性初始化 + 会话状态上限**：上游设计是每个 exec cell 用 fresh isolate 并重注入序列化的 stored_values（persistent 的是会话状态而非 isolate），isolate 常驻与 snapshot 预热不适用；应做的是首次进入 Code Mode 才初始化 V8 平台（建议默认 jitless），并给 stored_values 加大小上限/淘汰策略防止长会话无界增长。
 6. **流式路径零克隆**：durable output 改造时历史项用 `Arc`/`Bytes` 引用；retry 重放不整段 re-serialize conversation（`ToolResultItem.content` 已是 `Arc<str>`，保持这个纪律）。
 
 ### 5.3 工程护栏自动化

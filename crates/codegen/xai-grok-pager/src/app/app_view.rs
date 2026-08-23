@@ -910,9 +910,6 @@ pub struct AppView {
     /// The disk write is a spawned task, so a settings refresh that lands first would otherwise
     /// re-arm a notice the user has already accepted.
     pub consent_answered: Option<(String, i32)>,
-    /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
-    /// (click → `AnnouncementsOpenCta(Welcome)`).
-    pub welcome_upgrade_cta_rect: Option<ratatui::layout::Rect>,
     pub welcome_privacy_banner_opt_in_rect: Option<ratatui::layout::Rect>,
     pub welcome_privacy_banner_opt_out_rect: Option<ratatui::layout::Rect>,
     pub welcome_privacy_banner_terms_rect: Option<ratatui::layout::Rect>,
@@ -927,8 +924,6 @@ pub struct AppView {
     pub welcome_toast: Option<(String, std::time::Instant)>,
     /// Sticky hover flag for the privacy banner buttons (redraw on enter/leave).
     pub welcome_on_privacy_banner: bool,
-    /// Sticky hover flag for the welcome upgrade CTA (redraw on enter/leave).
-    pub welcome_on_upgrade_cta: bool,
     /// Hit-test rect for the clickable changelog info block (opens release notes).
     pub welcome_changelog_cta_rect: Option<ratatui::layout::Rect>,
     /// Show the raw auth URL with mouse capture disabled for manual copy.
@@ -1174,12 +1169,6 @@ pub struct AppView {
     /// `None` (default) fetches usage from the backend.
     pub usage_billing_redirect_url: Option<String>,
     pub access_gate_shown_logged: bool,
-    /// (hide-key, surface) pairs whose `AnnouncementCtaShown` impression was
-    /// already logged — once per pager process, cleared on logout. Keyed by
-    /// `announcement_hide_key` (stable even for id-less items, unlike the
-    /// event's `id`).
-    pub announcement_cta_impressions_logged:
-        std::collections::BTreeSet<(String, xai_grok_telemetry::events::AnnouncementCtaSurface)>,
     /// Access gate from `grok_build_access_gate`. `Some` = blocked.
     pub gate: Option<xai_grok_shell::auth::GateInfo>,
     /// User-friendly subscription tier name (e.g. "SuperGrok", "Free").
@@ -1563,7 +1552,6 @@ impl AppView {
             welcome_consent_link_rects: Vec::new(),
             welcome_consent_hover_link: None,
             consent_answered: None,
-            welcome_upgrade_cta_rect: None,
             welcome_privacy_banner_opt_in_rect: None,
             welcome_privacy_banner_opt_out_rect: None,
             welcome_privacy_banner_terms_rect: None,
@@ -1574,7 +1562,6 @@ impl AppView {
             welcome_on_workspace_mode: false,
             welcome_toast: None,
             welcome_on_privacy_banner: false,
-            welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
             auth_show_raw_url: false,
             native_select_hold: false,
@@ -1668,7 +1655,6 @@ impl AppView {
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
-            announcement_cta_impressions_logged: Default::default(),
             gate: None,
             subscription_tier: None,
             paywall_check_started: None,
@@ -2586,11 +2572,6 @@ impl AppView {
         }
         let zdr_blocked = self.is_zdr_blocked();
         let has_access = self.has_access();
-        let welcome_pinned_upgrade_cta = crate::views::announcements::promo_cta(
-            &self.active_announcements,
-            &self.hidden_announcement_ids,
-        )
-        .is_some_and(|(owner, _, _)| !crate::views::announcements::is_dismissible(owner));
         let has_foreign_resume = self.foreign_resume_hint().is_some();
         let sp_loading = crate::views::session_picker::loading_spinner_active(
             self.session_picker_entries.as_deref(),
@@ -2634,14 +2615,11 @@ impl AppView {
                     auth_fallback_rect: self.welcome_auth_fallback_rect.as_ref(),
                     refresh_rect: self.welcome_refresh_rect.as_ref(),
                     gate_url_rect: self.welcome_gate_url_rect.as_ref(),
-                    upgrade_cta_rect: self.welcome_upgrade_cta_rect.as_ref(),
                     privacy_banner_opt_in_rect: self.welcome_privacy_banner_opt_in_rect.as_ref(),
                     privacy_banner_opt_out_rect: self.welcome_privacy_banner_opt_out_rect.as_ref(),
                     privacy_banner_terms_rect: self.welcome_privacy_banner_terms_rect.as_ref(),
                     privacy_banner_policy_rect: self.welcome_privacy_banner_policy_rect.as_ref(),
                     on_privacy_banner: &mut self.welcome_on_privacy_banner,
-                    on_upgrade_cta: &mut self.welcome_on_upgrade_cta,
-                    upgrade_cta_keyboard: welcome_pinned_upgrade_cta,
                     changelog_cta_rect: self.welcome_changelog_cta_rect.as_ref(),
                     on_changelog_cta: &mut self.welcome_on_changelog_cta,
                     announcement_truncated: self.welcome_announcement.truncated,
@@ -3250,9 +3228,6 @@ struct WelcomeInputCtx<'a> {
     auth_fallback_rect: Option<&'a ratatui::layout::Rect>,
     refresh_rect: Option<&'a ratatui::layout::Rect>,
     gate_url_rect: Option<&'a ratatui::layout::Rect>,
-    /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
-    /// (click → open the promo url).
-    upgrade_cta_rect: Option<&'a ratatui::layout::Rect>,
     privacy_banner_opt_in_rect: Option<&'a ratatui::layout::Rect>,
     privacy_banner_opt_out_rect: Option<&'a ratatui::layout::Rect>,
     privacy_banner_terms_rect: Option<&'a ratatui::layout::Rect>,
@@ -3260,12 +3235,6 @@ struct WelcomeInputCtx<'a> {
     /// Sticky hover flag for the privacy banner buttons (redraw on
     /// enter/leave/crossing so they brighten/dim).
     on_privacy_banner: &'a mut bool,
-    /// Sticky hover flag for the upgrade CTA (redraw on enter/leave so the
-    /// button brightens/dims).
-    on_upgrade_cta: &'a mut bool,
-    /// A pinned (non-dismissible) promo CTA is live, so `Ctrl+O` opens it
-    /// (the welcome screen has no YOLO toggle to preserve).
-    upgrade_cta_keyboard: bool,
     /// Hit-test rect for the clickable changelog info block (opens release notes).
     changelog_cta_rect: Option<&'a ratatui::layout::Rect>,
     /// Sticky hover flag for the changelog block (redraw on enter/leave).
@@ -3831,11 +3800,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             return InputOutcome::Action(Action::NewSession);
         }
         if matches!(ctx.auth_state, AuthState::Done) {
-            if ctx.upgrade_cta_keyboard && key!('o', CONTROL).matches(key) {
-                return InputOutcome::Action(Action::AnnouncementsOpenCta(
-                    xai_grok_telemetry::events::AnnouncementCtaSurface::Keyboard,
-                ));
-            }
             if key!('w', CONTROL).matches(key) && ctx.cwd_has_git_ancestor {
                 return InputOutcome::Action(Action::OpenNewWorktreeDialog);
             }
@@ -4050,13 +4014,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 {
                     return InputOutcome::Action(Action::OpenSupergrokUrl);
                 }
-                if let Some(rect) = ctx.upgrade_cta_rect
-                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                {
-                    return InputOutcome::Action(Action::AnnouncementsOpenCta(
-                        xai_grok_telemetry::events::AnnouncementCtaSurface::Welcome,
-                    ));
-                }
                 if let Some(rect) = ctx.privacy_banner_opt_in_rect
                     && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                 {
@@ -4152,11 +4109,6 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                 let over_cta = ctx.changelog_cta_rect.is_some_and(|r| r.contains(pos));
                 if over_cta != *ctx.on_changelog_cta {
                     *ctx.on_changelog_cta = over_cta;
-                    return InputOutcome::Changed;
-                }
-                let over_upgrade = ctx.upgrade_cta_rect.is_some_and(|r| r.contains(pos));
-                if over_upgrade != *ctx.on_upgrade_cta {
-                    *ctx.on_upgrade_cta = over_upgrade;
                     return InputOutcome::Changed;
                 }
                 #[cfg(feature = "local-workspace")]
@@ -4652,19 +4604,19 @@ impl AppView {
                             Some(eff) => format!("{model_name_base} ({eff})"),
                             None => model_name_base,
                         };
-                        let hero_cta = crate::views::announcements::promo_cta(
-                            &self.active_announcements,
-                            &self.hidden_announcement_ids,
-                        );
-                        let hero_announcement = hero_cta
-                            .map(|(owner, _, _)| owner)
-                            .or_else(|| {
-                                crate::views::announcements::first_session_announcement(
-                                    &self.active_announcements,
-                                    &self.hidden_announcement_ids,
-                                )
-                            })
-                            .or(self.announcement.as_ref());
+                        // Welcome hero announcement: the live critical session
+                        // banner selection, else the stored random pick — which
+                        // the shared critical-only predicate re-filters
+                        // (belt-and-braces with the selection-stage gate) so a
+                        // non-critical announcement can never render here.
+                        let hero_announcement =
+                            crate::views::announcements::first_session_announcement(
+                                &self.active_announcements,
+                                &self.hidden_announcement_ids,
+                            )
+                            .or(self.announcement.as_ref().filter(|a| {
+                                crate::views::announcements::is_displayable_announcement(a)
+                            }));
                         let welcome_params = crate::views::welcome::WelcomeRenderParams {
                             prompt_focus: if self.welcome_prompt_focused {
                                 WelcomePromptFocus::Focused
@@ -4727,7 +4679,6 @@ impl AppView {
                             changelog_bullets: &self.changelog_bullets,
                             changelog_has_full_notes: self.changelog_markdown.is_some(),
                             welcome_announcement_expanded: self.welcome_announcement.expanded,
-                            upgrade_cta: hero_cta.map(|(_owner, label, _)| label),
                             privacy_banner,
                             #[cfg(feature = "local-workspace")]
                             workspace_mode: self.welcome_workspace_mode,
@@ -4756,7 +4707,6 @@ impl AppView {
                             self.welcome_consent_hover_link = None;
                         }
                         record_consent_paint(&mut self.consent_state, result.consent_legibility);
-                        self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
                         self.welcome_privacy_banner_opt_in_rect = result.privacy_banner_opt_in_rect;
                         self.welcome_privacy_banner_opt_out_rect =
                             result.privacy_banner_opt_out_rect;
@@ -5060,17 +5010,6 @@ impl AppView {
                                 } else {
                                     &self.dashboard_local_sessions
                                 };
-                            let dash_upgrade_cta = crate::views::announcements::promo_cta(
-                                &self.active_announcements,
-                                &self.hidden_announcement_ids,
-                            )
-                            .map(
-                                |(owner, label, _)| crate::views::dashboard::HeaderUpgradeCta {
-                                    label,
-                                    pinned: !crate::views::announcements::is_dismissible(owner),
-                                    caption: crate::views::announcements::usable_cta_caption(owner),
-                                },
-                            );
                             let dash_cursor = crate::views::dashboard::render_dashboard(
                                 f.buffer_mut(),
                                 view_area,
@@ -5080,7 +5019,6 @@ impl AppView {
                                 pending_hint,
                                 dashboard_roster,
                                 self.dashboard_sessions_loading,
-                                dash_upgrade_cta,
                             );
                             let (popup_cursor, popup_post_flush, drawn_popup_agent) =
                                 if let Some(agent_id) = dashboard.attached_agent {
@@ -5169,72 +5107,7 @@ impl AppView {
         if let Some(started) = fps_frame_started {
             self.fps_hud.record(started.elapsed());
         }
-        self.log_announcement_cta_impressions();
         self.maybe_evict_offscreen_caches();
-    }
-    /// Log [`xai_grok_telemetry::events::AnnouncementCtaShown`] for each
-    /// surface whose CTA button is painted this frame (armed hit rect, not
-    /// covered by a frame occluder — the click/OSC 8 truth the impression
-    /// pairs with), once per (announcement, surface) per pager process
-    /// (cleared on logout). The owner resolves through the same slot gate as
-    /// the click dispatch, so a critical preempting the slot or a hidden
-    /// promo emits nothing.
-    pub(crate) fn log_announcement_cta_impressions(&mut self) {
-        use xai_grok_telemetry::events::AnnouncementCtaSurface;
-        let (banner, welcome, header, dashboard) = match self.active_view {
-            ActiveView::Welcome => (false, self.welcome_upgrade_cta_rect.is_some(), false, false),
-            ActiveView::Agent(agent_id) => match self.agents.get(&agent_id) {
-                Some(a) => {
-                    let cta_rect = a.hit_announcement_cta.rect;
-                    let header_rect = a.hit_upgrade_cta.rect;
-                    (
-                        cta_rect.is_some_and(|r| !a.rect_occluded(r)),
-                        false,
-                        header_rect.is_some_and(|r| !a.rect_occluded(r)),
-                        false,
-                    )
-                }
-                None => return,
-            },
-            ActiveView::AgentDashboard => (
-                false,
-                false,
-                false,
-                self.dashboard
-                    .as_ref()
-                    .is_some_and(|d| d.upgrade_cta_hit.rect.is_some()),
-            ),
-        };
-        if !(banner || welcome || header || dashboard) {
-            return;
-        }
-        let Some((owner, _label, _url)) = crate::views::announcements::promo_cta(
-            &self.active_announcements,
-            &self.hidden_announcement_ids,
-        ) else {
-            return;
-        };
-        let key = xai_grok_announcements::announcement_hide_key(owner);
-        let id = owner.id.clone();
-        let surfaces = [
-            (AnnouncementCtaSurface::Banner, banner),
-            (AnnouncementCtaSurface::Welcome, welcome),
-            (AnnouncementCtaSurface::Header, header),
-            (AnnouncementCtaSurface::Dashboard, dashboard),
-        ];
-        for (surface, _) in surfaces.into_iter().filter(|(_, painted)| *painted) {
-            if self
-                .announcement_cta_impressions_logged
-                .insert((key.clone(), surface))
-            {
-                xai_grok_telemetry::session_ctx::log_event(
-                    xai_grok_telemetry::events::AnnouncementCtaShown {
-                        id: id.clone(),
-                        source: surface,
-                    },
-                );
-            }
-        }
     }
     /// Interval between off-screen render-cache eviction sweeps.
     const CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(5);

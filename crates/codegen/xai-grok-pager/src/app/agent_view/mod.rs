@@ -1211,15 +1211,9 @@ pub struct AgentView {
     pub(crate) watching_cue_toast_shown: bool,
     /// `[hide]` button on the announcement banner (click == `/announcements hide`).
     pub hit_announcement_hide: HitArea,
-    /// `[label]` CTA button on the promo banner row (click opens its link).
-    pub hit_announcement_cta: HitArea,
     /// Privacy upsell banner state: slot ownership + click targets
     /// (packaged like [`Self::plugin_cta`]).
     pub privacy_banner: PrivacyBannerState,
-    /// `[label]` upgrade CTA appended after the cwd path in the status bar
-    /// (click opens its link; nulled under dropdowns / occluders like the
-    /// banner CTA).
-    pub hit_upgrade_cta: HitArea,
     /// Stop button in the voice record indicator row (`[stop]`), far right.
     pub hit_voice_stop_button: HitArea,
     /// Scrollbar track for the scrollback pane (for click-to-jump / drag).
@@ -1357,11 +1351,6 @@ pub struct AgentView {
     /// mode-switch, an announcement can last the session, so tips must not
     /// burn TTL/seen counts while hidden.
     pub(crate) session_banner_active: bool,
-    /// A pinned (non-dismissible) promo upgrade CTA is live this frame (set at
-    /// the start of `draw` from the same slot gate as the header CTA). When
-    /// true, `Ctrl+O` opens that CTA instead of toggling YOLO; the dispatch
-    /// re-resolves through the gate so a stale-by-one-frame value stays safe.
-    pub(crate) pinned_upgrade_cta_live: bool,
     /// Fullscreen block viewer. When `Some`, replaces the scrollback area.
     pub(crate) block_viewer: Option<BlockViewerPane>,
     /// Active scrollback search session. When `Some`, vim `/` (or `/find`) is

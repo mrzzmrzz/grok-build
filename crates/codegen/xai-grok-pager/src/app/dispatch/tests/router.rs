@@ -605,192 +605,6 @@ fn shown_banner_id(app: &AppView) -> Option<String> {
     )
     .and_then(|a| a.id.clone())
 }
-/// `AnnouncementsOpenCta(surface)` re-resolves through the slot gate and opens
-/// the promo url (observed via the `GROK_TEST_OPEN_URL_FILE` seam, from every
-/// surface); a critical owning the slot — or no usable cta — makes it a silent
-/// no-op (no open, so a stale prior-frame click can't leak the promo url).
-#[serial_test::serial(GROK_TEST_OPEN_URL_FILE)]
-#[test]
-fn announcements_open_cta_opens_promo_and_noops_under_critical() {
-    use xai_grok_telemetry::events::AnnouncementCtaSurface;
-    let url_file = std::env::temp_dir().join(format!("grok-cta-open-{}.txt", std::process::id()));
-    let _ = std::fs::remove_file(&url_file);
-    unsafe { std::env::set_var("GROK_TEST_OPEN_URL_FILE", &url_file) };
-    let opened = || std::fs::read_to_string(&url_file).unwrap_or_default();
-    let mut app = test_app_with_agent();
-    app.active_announcements = vec![promo_announcement("promo-open")];
-    for surface in [
-        AnnouncementCtaSurface::Banner,
-        AnnouncementCtaSurface::Welcome,
-        AnnouncementCtaSurface::Header,
-        AnnouncementCtaSurface::Dashboard,
-        AnnouncementCtaSurface::Keyboard,
-    ] {
-        let _ = std::fs::write(&url_file, "");
-        let effects = dispatch(Action::AnnouncementsOpenCta(surface), &mut app);
-        assert!(effects.is_empty(), "open is a side effect, not an Effect");
-        assert!(
-            opened().lines().any(|l| l == "https://x.ai/promo-open"),
-            "surface {surface:?} must open the promo url; got {:?}",
-            opened()
-        );
-    }
-    let _ = std::fs::write(&url_file, "");
-    app.active_announcements = vec![
-        critical_announcement("crit-a"),
-        promo_announcement("promo-open"),
-    ];
-    let _ = dispatch(
-        Action::AnnouncementsOpenCta(AnnouncementCtaSurface::Keyboard),
-        &mut app,
-    );
-    assert!(
-        opened().trim().is_empty(),
-        "a critical slot owner must make the open a no-op; got {:?}",
-        opened()
-    );
-    let _ = std::fs::write(&url_file, "");
-    app.active_announcements = vec![];
-    let _ = dispatch(
-        Action::AnnouncementsOpenCta(AnnouncementCtaSurface::Banner),
-        &mut app,
-    );
-    assert!(opened().trim().is_empty(), "no cta → no open");
-    unsafe { std::env::remove_var("GROK_TEST_OPEN_URL_FILE") };
-    let _ = std::fs::remove_file(&url_file);
-}
-/// `AnnouncementCtaShown` latches once per (announcement, surface): first
-/// frame with an armed CTA rect emits, later frames don't, and a NEW
-/// announcement id re-emits on the same surfaces.
-#[test]
-fn cta_impressions_latch_once_per_surface_and_reemit_for_new_id() {
-    use crate::app::app_view::ActiveView;
-    use xai_grok_telemetry::events::AnnouncementCtaSurface;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.active_view = ActiveView::Agent(id);
-    app.active_announcements = vec![promo_announcement("promo-a")];
-    let rect = Some(ratatui::layout::Rect::new(0, 0, 4, 1));
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.hit_announcement_cta.set(rect);
-        agent.hit_upgrade_cta.set(rect);
-    }
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert_eq!(logged.len(), 2);
-    assert!(logged.contains(&("promo-a".to_string(), AnnouncementCtaSurface::Banner)));
-    assert!(logged.contains(&("promo-a".to_string(), AnnouncementCtaSurface::Header)));
-    app.log_announcement_cta_impressions();
-    assert_eq!(app.announcement_cta_impressions_logged.len(), 2);
-    app.active_announcements = vec![promo_announcement("promo-b")];
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert_eq!(logged.len(), 4);
-    assert!(logged.contains(&("promo-b".to_string(), AnnouncementCtaSurface::Banner)));
-    assert!(logged.contains(&("promo-b".to_string(), AnnouncementCtaSurface::Header)));
-}
-/// No impression without a painted button under a promo slot owner: a
-/// critical preempting the slot, a hidden promo, and cleared (unpainted)
-/// rects all emit nothing — the same gate the click dispatch resolves.
-#[test]
-fn cta_impressions_respect_slot_gate_and_paint() {
-    use crate::app::app_view::ActiveView;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.active_view = ActiveView::Agent(id);
-    let rect = Some(ratatui::layout::Rect::new(0, 0, 4, 1));
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.hit_announcement_cta.set(rect);
-        agent.hit_upgrade_cta.set(rect);
-    }
-    app.active_announcements = vec![critical_announcement("crit"), promo_announcement("p")];
-    app.log_announcement_cta_impressions();
-    assert!(app.announcement_cta_impressions_logged.is_empty());
-    app.active_announcements = vec![promo_announcement("p")];
-    app.hidden_announcement_ids = ["p".to_string()].into_iter().collect();
-    app.log_announcement_cta_impressions();
-    assert!(app.announcement_cta_impressions_logged.is_empty());
-    app.hidden_announcement_ids.clear();
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.hit_announcement_cta.clear();
-        agent.hit_upgrade_cta.clear();
-    }
-    app.log_announcement_cta_impressions();
-    assert!(app.announcement_cta_impressions_logged.is_empty());
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.active_subagent = Some("child-sid".into());
-        agent.hit_announcement_cta.clear();
-        agent.hit_upgrade_cta.clear();
-    }
-    app.active_announcements = vec![promo_announcement("p2")];
-    app.log_announcement_cta_impressions();
-    assert!(app.announcement_cta_impressions_logged.is_empty());
-}
-/// Frame occluders (the goal-detail class) leave rects armed and block clicks
-/// at dispatch time — impressions mirror the OSC 8 drop-whole rule: an
-/// occluded CTA is not counted until an overlay-free frame shows it clean.
-#[test]
-fn cta_impressions_suppressed_while_rect_occluded() {
-    use crate::app::app_view::ActiveView;
-    use xai_grok_telemetry::events::AnnouncementCtaSurface;
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    app.active_view = ActiveView::Agent(id);
-    app.active_announcements = vec![promo_announcement("p")];
-    let rect = ratatui::layout::Rect::new(0, 0, 4, 1);
-    let overlay = ratatui::layout::Rect::new(0, 0, 80, 1);
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.hit_announcement_cta.set(Some(rect));
-        agent.hit_upgrade_cta.set(Some(rect));
-        agent.frame_occluder_rects.push(overlay);
-    }
-    app.log_announcement_cta_impressions();
-    assert!(app.announcement_cta_impressions_logged.is_empty());
-    {
-        let agent = app.agents.get_mut(&id).unwrap();
-        agent.frame_occluder_rects.clear();
-    }
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert_eq!(logged.len(), 2);
-    assert!(logged.contains(&("p".to_string(), AnnouncementCtaSurface::Banner)));
-    assert!(logged.contains(&("p".to_string(), AnnouncementCtaSurface::Header)));
-    app.log_announcement_cta_impressions();
-    assert_eq!(app.announcement_cta_impressions_logged.len(), 2);
-}
-/// The welcome hero and dashboard surfaces latch from their own armed rects
-/// (only the active view's rects are consulted).
-#[test]
-fn cta_impressions_cover_welcome_and_dashboard_surfaces() {
-    use crate::app::app_view::ActiveView;
-    use crate::views::dashboard::state::DashboardState;
-    use xai_grok_telemetry::events::AnnouncementCtaSurface;
-    let mut app = test_app();
-    app.active_announcements = vec![promo_announcement("p")];
-    let rect = Some(ratatui::layout::Rect::new(0, 0, 4, 1));
-    app.active_view = ActiveView::Welcome;
-    app.welcome_upgrade_cta_rect = rect;
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert!(logged.contains(&("p".to_string(), AnnouncementCtaSurface::Welcome)));
-    app.active_view = ActiveView::AgentDashboard;
-    let mut dash = DashboardState::new();
-    dash.upgrade_cta_hit.set(rect);
-    app.dashboard = Some(dash);
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert!(logged.contains(&("p".to_string(), AnnouncementCtaSurface::Dashboard)));
-    app.active_announcements = vec![promo_announcement("q")];
-    app.log_announcement_cta_impressions();
-    let logged = &app.announcement_cta_impressions_logged;
-    assert!(!logged.contains(&("q".to_string(), AnnouncementCtaSurface::Welcome)));
-    assert_eq!(logged.len(), 3);
-}
 #[test]
 fn dispatch_send_prompt_announcements_via_registry() {
     let mut app = test_app_with_agent();
@@ -878,10 +692,11 @@ fn announcements_show_clears_visible_critical_ids_only() {
     let effects = dispatch(Action::AnnouncementsHide, &mut app);
     assert!(effects.is_empty(), "expected no effects, got {effects:?}");
 }
-/// Hide targets the banner-slot item: the critical while one owns the slot,
-/// then the promo the slot reveals — each per-ID with a persist effect.
+/// Hide targets the banner-slot item (the shown critical) only — a promo in
+/// the list never enters the slot, so hiding the critical closes the banner
+/// instead of revealing the promo, and a further hide is a silent no-op.
 #[test]
-fn announcements_hide_targets_slot_owner_critical_then_promo() {
+fn announcements_hide_targets_slot_owner_and_ignores_promo() {
     let mut app = test_app();
     app.active_announcements = vec![
         promo_announcement("promo-a"),
@@ -900,14 +715,10 @@ fn announcements_hide_targets_slot_owner_critical_then_promo() {
         "hide must only record the shown item"
     );
     assert_eq!(
-        shown_banner_id(&app).as_deref(),
-        Some("promo-a"),
-        "hiding the critical hands the slot to the promo"
+        shown_banner_id(&app),
+        None,
+        "a promo never takes the slot — hiding the critical closes the banner"
     );
-    let effects = dispatch(Action::AnnouncementsHide, &mut app);
-    assert_eq!(effects.len(), 1);
-    assert!(app.hidden_announcement_ids.contains("promo-a"));
-    assert_eq!(shown_banner_id(&app), None, "all hidden closes the banner");
     let effects = dispatch(Action::AnnouncementsHide, &mut app);
     assert!(effects.is_empty(), "expected no effects, got {effects:?}");
 }
@@ -919,7 +730,7 @@ fn announcements_hide_noops_for_non_dismissible_owner() {
     let mut app = test_app();
     let mut pinned = critical_announcement("pinned-crit");
     pinned.dismissible = Some(false);
-    app.active_announcements = vec![pinned, promo_announcement("promo-a")];
+    app.active_announcements = vec![pinned, critical_announcement("outage-b")];
     assert_eq!(shown_banner_id(&app).as_deref(), Some("pinned-crit"));
     let effects = dispatch(Action::AnnouncementsHide, &mut app);
     assert!(
@@ -936,29 +747,37 @@ fn announcements_hide_noops_for_non_dismissible_owner() {
         "pinned owner stays shown"
     );
     app.active_announcements.remove(0);
-    assert_eq!(shown_banner_id(&app).as_deref(), Some("promo-a"));
+    assert_eq!(shown_banner_id(&app).as_deref(), Some("outage-b"));
     let effects = dispatch(Action::AnnouncementsHide, &mut app);
     assert_eq!(effects.len(), 1);
-    assert!(app.hidden_announcement_ids.contains("promo-a"));
+    assert!(app.hidden_announcement_ids.contains("outage-b"));
     assert_eq!(shown_banner_id(&app), None);
 }
-/// Show also clears hidden promo keys (one show un-hides the whole slot).
+/// Show un-hides live criticals only: a hidden promo key is not exposed
+/// through the passive announcement controls and survives show untouched.
 #[test]
-fn announcements_show_clears_hidden_promo_ids() {
+fn announcements_show_leaves_promo_ids_hidden() {
     let mut app = test_app();
-    app.hidden_announcement_ids = ["promo-a".to_string(), "unrelated".to_string()]
-        .into_iter()
-        .collect();
-    app.active_announcements = vec![promo_announcement("promo-a")];
+    app.hidden_announcement_ids = [
+        "crit-a".to_string(),
+        "promo-a".to_string(),
+        "unrelated".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    app.active_announcements = vec![
+        critical_announcement("crit-a"),
+        promo_announcement("promo-a"),
+    ];
     assert_eq!(shown_banner_id(&app), None);
     let effects = dispatch(Action::AnnouncementsShow, &mut app);
     assert!(
         effects.iter().any(
-            |e| matches!(e, Effect::PersistAnnouncementsHidden { hidden_ids } if !hidden_ids.contains("promo-a"))
+            |e| matches!(e, Effect::PersistAnnouncementsHidden { hidden_ids } if !hidden_ids.contains("crit-a") && hidden_ids.contains("promo-a"))
         ),
-        "expected persist effect without the un-hidden promo id, got {effects:?}"
+        "expected persist effect restoring the critical but not the promo, got {effects:?}"
     );
-    assert_eq!(shown_banner_id(&app).as_deref(), Some("promo-a"));
+    assert_eq!(shown_banner_id(&app).as_deref(), Some("crit-a"));
     assert!(
         app.hidden_announcement_ids.contains("unrelated"),
         "ids not currently visible must survive show (prune owns cleanup)"

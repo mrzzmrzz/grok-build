@@ -258,18 +258,16 @@ pub fn minimal_committed_plan_id(app: &AppView) -> Option<&str> {
 
 /// Whether minimal's Ctrl+O remap opens the full-transcript pager *right now*.
 ///
-/// Minimal remaps Ctrl+O to `Action::OpenTranscriptPager` except when:
+/// Minimal remaps Ctrl+O to `Action::OpenTranscriptPager` except when Ctrl+O
+/// is bound to interject (Apple Terminal: the kitty keyboard protocol is
+/// unavailable, so Ctrl+Enter doesn't arrive and Ctrl+I aliases to Tab,
+/// leaving Ctrl+O as the only interject chord) AND an interject would actually
+/// consume the press:
 ///
-/// - Ctrl+O is bound to interject (Apple Terminal: the kitty keyboard protocol is
-///   unavailable, so Ctrl+Enter doesn't arrive and Ctrl+I aliases to Tab, leaving
-///   Ctrl+O as the only interject chord) AND an interject would actually consume
-///   the press:
-///   - editing a queued row (the interject key saves / interjects the edit), or
-///   - a turn is running with a non-empty composer, or
-///   - a turn is running with an empty composer **and** a visible queued
-///     follow-up (prompt-path force-send of the top queue row; same as full TUI)
-/// - a free-tier pinned upgrade CTA is live (`pinned_upgrade_cta_live`), so
-///   Ctrl+O reaches ToggleYolo (open CTA) instead of the transcript
+/// - editing a queued row (the interject key saves / interjects the edit), or
+/// - a turn is running with a non-empty composer, or
+/// - a turn is running with an empty composer **and** a visible queued
+///   follow-up (prompt-path force-send of the top queue row; same as full TUI)
 ///
 /// Otherwise the remap keeps the key for the transcript. When the remap yields,
 /// `minimal_key_intercept` routes to the prompt path (interject, or ToggleYolo
@@ -289,8 +287,8 @@ pub fn minimal_ctrl_o_opens_transcript(app: &AppView) -> bool {
         .registry
         .matches_id(crate::actions::ActionId::InterjectPrompt, &ctrl_o)
     {
-        // Not the interject chord: transcript unless a pinned upgrade CTA owns it.
-        return !agent.pinned_upgrade_cta_live;
+        // Not the interject chord: the transcript keeps the key.
+        return true;
     }
     // Editing a queued row: the interject key saves (idle) or interjects
     // (running) the edited text — never steal it mid-edit.
@@ -311,13 +309,10 @@ pub fn minimal_ctrl_o_opens_transcript(app: &AppView) -> bool {
             .iter()
             .any(|e| Some(e.id.as_str()) != running);
     let has_payload = !agent.prompt.text().trim().is_empty() || has_queued_follow_up;
-    if crate::actions::ActionRegistry::interjection_possible(
+    !crate::actions::ActionRegistry::interjection_possible(
         agent.session.state.is_turn_running(),
         has_payload,
-    ) {
-        return false;
-    }
-    !agent.pinned_upgrade_cta_live
+    )
 }
 
 /// `AppView::minimal_state.committed_plan_tool_call_id` (write).

@@ -83,42 +83,6 @@ impl AgentView {
             .iter()
             .any(|r| rect.intersects(*r))
     }
-    /// Append the promo banner [label] button's OSC 8 span when one should be
-    /// emitted this frame: an armed CTA rect (draw already suppressed it under
-    /// prompt dropdowns), no frame occluder covering it (same drop-whole rule
-    /// as the scrollback spans — e.g. the goal-detail overlay can reach the
-    /// banner row on short terminals), and a usable CTA target. Split from
-    /// `draw`'s emit-gated block so the guard set is unit-testable; the caller
-    /// owns the `hyperlink_route().emit_osc8` check.
-    pub(super) fn push_promo_cta_link_span(
-        &self,
-        link_spans_out: &mut Vec<xai_ratatui_inline::LinkSpan>,
-        banner_announcements: &[xai_grok_announcements::RemoteAnnouncement],
-        hidden_announcement_ids: &std::collections::BTreeSet<String>,
-    ) {
-        if let Some((_, url)) = crate::views::announcements::promo_cta_target(
-            banner_announcements,
-            hidden_announcement_ids,
-        ) {
-            self.push_cta_link_span(link_spans_out, self.hit_announcement_cta.rect, url);
-        }
-    }
-    /// OSC 8 twin for the in-session header upgrade CTA (`hit_upgrade_cta`),
-    /// sharing the same slot-gated url + occluder drop-whole rule as the banner
-    /// CTA so hyperlink-capable terminals can open the promo from the header.
-    pub(super) fn push_upgrade_cta_link_span(
-        &self,
-        link_spans_out: &mut Vec<xai_ratatui_inline::LinkSpan>,
-        banner_announcements: &[xai_grok_announcements::RemoteAnnouncement],
-        hidden_announcement_ids: &std::collections::BTreeSet<String>,
-    ) {
-        if let Some((_, url)) = crate::views::announcements::promo_cta_target(
-            banner_announcements,
-            hidden_announcement_ids,
-        ) {
-            self.push_cta_link_span(link_spans_out, self.hit_upgrade_cta.rect, url);
-        }
-    }
     /// Append the OSC 8 spans a `command` status row opened, in the screen
     /// columns the row was painted at, under the same occluder drop-whole rule
     /// as the CTA spans above.
@@ -133,28 +97,6 @@ impl AgentView {
             if !self.rect_occluded(row) {
                 link_spans_out.push(span);
             }
-        }
-    }
-    /// Emit an OSC 8 hyperlink span over a CTA button `rect` when armed (draw
-    /// already suppressed it under prompt dropdowns) and no frame occluder
-    /// covers it (same drop-whole rule as the scrollback spans — e.g. the
-    /// goal-detail overlay can reach the top/bottom rows on short terminals).
-    fn push_cta_link_span(
-        &self,
-        link_spans_out: &mut Vec<xai_ratatui_inline::LinkSpan>,
-        rect: Option<ratatui::layout::Rect>,
-        url: &str,
-    ) {
-        if let Some(rect) = rect
-            && !self.rect_occluded(rect)
-        {
-            link_spans_out.push(xai_ratatui_inline::LinkSpan {
-                row: rect.y,
-                col_start: rect.x,
-                col_end: rect.x.saturating_add(rect.width),
-                url: url.into(),
-                id: None,
-            });
         }
     }
     /// Hit-test `(col, row)` and arm [`Self::pending_link_click`] when the app
@@ -625,34 +567,6 @@ mod link_click_tests {
             InputOutcome::Action(Action::AnnouncementsHide)
         ));
     }
-    /// Clicking the promo banner's [label] CTA button dispatches the open
-    /// action (URL resolved at dispatch time); clicks outside the cached
-    /// rect (or on a collapsed banner) do not.
-    #[test]
-    fn click_on_announcement_cta_button_dispatches_open_action() {
-        let mut agent = make_agent();
-        let reg = ActionRegistry::defaults();
-        agent.hit_announcement_cta.set(Some(Rect::new(0, 1, 15, 1)));
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(3, 1)), &reg);
-        assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "[label] click must dispatch AnnouncementsOpenCta"
-        );
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(3, 2)), &reg);
-        assert!(!matches!(
-            outcome,
-            InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-        ));
-        agent.hit_announcement_cta.set(None);
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(3, 1)), &reg);
-        assert!(!matches!(
-            outcome,
-            InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-        ));
-    }
     /// Draw one 80x30 frame with `announcements` in the banner slot — shared
     /// fixture for the banner dropdown-suppression tests so `draw`'s long
     /// positional signature is spelled once.
@@ -833,62 +747,6 @@ mod link_click_tests {
         assert!(agent.privacy_banner.hit_policy.rect.is_none());
         assert!(agent.hit_announcement_hide.rect.is_some());
     }
-    /// Promo twin of the [hide] suppression test: the [label] CTA rect must
-    /// also drop under an open dropdown so a dropdown click cannot open a URL
-    /// from a button that is no longer on screen.
-    #[test]
-    fn open_prompt_dropdown_suppresses_announcement_cta_click_target() {
-        let reg = ActionRegistry::defaults();
-        let mut agent = make_agent();
-        agent.last_terminal_size = (80, 30);
-        let promo = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-1".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            cta: Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Go".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            }),
-            ..Default::default()
-        }];
-        draw_banner_frame(&mut agent, &reg, &promo, 1);
-        let rect = agent
-            .hit_announcement_cta
-            .rect
-            .expect("promo row must arm the [label] rect");
-        assert!(
-            agent.hit_announcement_hide.rect.is_some(),
-            "promo row must arm the [hide] rect too"
-        );
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
-        assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "sanity: visible [label] must dispatch"
-        );
-        let _ = agent.prompt.handle_paste("/");
-        agent.prompt.refresh_slash(&agent.session.models);
-        assert!(
-            agent.prompt.any_dropdown_open(),
-            "setup: slash dropdown must be open"
-        );
-        draw_banner_frame(&mut agent, &reg, &promo, 1);
-        assert!(
-            agent.hit_announcement_cta.rect.is_none(),
-            "open dropdown must suppress the [label] rect"
-        );
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
-        assert!(
-            !matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "click where [label] used to be must not open a URL under a dropdown"
-        );
-    }
     /// Turn-status twin of the banner suppression tests: dropdowns paint over
     /// the stop button's row, so its rect must drop while one is open — a
     /// click on dropdown chrome must never cancel the running turn.
@@ -1024,59 +882,6 @@ mod link_click_tests {
             "read-only child view must not advertise a background button"
         );
     }
-    /// Header twin: the top-header upgrade CTA rect must drop under an open
-    /// dropdown too — the only suppression consumer previously without a
-    /// dropdown pin (its occluder-class twin lives below).
-    #[test]
-    fn open_prompt_dropdown_suppresses_header_upgrade_cta_click_target() {
-        let reg = ActionRegistry::defaults();
-        let mut agent = make_agent();
-        agent.last_terminal_size = (120, 30);
-        let promo = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-pin".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            dismissible: Some(false),
-            cta: Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Upgrade Account".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            }),
-            ..Default::default()
-        }];
-        let _ = draw_frame_sized(&mut agent, &reg, &promo, 1, 120);
-        let rect = agent
-            .hit_upgrade_cta
-            .rect
-            .expect("promo must arm the header CTA rect");
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
-        assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "sanity: visible header CTA must dispatch"
-        );
-        let _ = agent.prompt.handle_paste("/");
-        agent.prompt.refresh_slash(&agent.session.models);
-        assert!(
-            agent.prompt.any_dropdown_open(),
-            "setup: slash dropdown must be open"
-        );
-        let _ = draw_frame_sized(&mut agent, &reg, &promo, 1, 120);
-        assert!(
-            agent.hit_upgrade_cta.rect.is_none(),
-            "open dropdown must suppress the header CTA rect"
-        );
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
-        assert!(
-            !matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "click where the header CTA used to be must not open under a dropdown"
-        );
-    }
     /// Second suppression layer for the turn-status row: a frame occluder
     /// (the goal-detail class — NOT a dropdown, so the rects stay armed)
     /// covering the [stop] + bg buttons must swallow both clicks at dispatch
@@ -1140,234 +945,55 @@ mod link_click_tests {
             "overlay-free [stop] click must dispatch again"
         );
     }
-    /// Subagent fullscreen takeover: the parent's banner/header chrome is not
-    /// painted, so the takeover draw must drop the armed [hide]/[label]/header
-    /// CTA rects — a stale rect would fake post-draw impressions and clicks.
+    /// Subagent fullscreen takeover: the parent's banner chrome is not
+    /// painted, so the takeover draw must drop the armed [hide] rect — a
+    /// stale rect would fake clicks after the takeover.
     #[test]
-    fn subagent_fullscreen_clears_announcement_and_header_cta_rects() {
+    fn subagent_fullscreen_clears_announcement_hide_rect() {
         let reg = ActionRegistry::defaults();
         let mut agent = make_agent();
         agent.last_terminal_size = (120, 30);
-        let promo = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-1".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            cta: Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Go".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            }),
+        let critical = [xai_grok_announcements::RemoteAnnouncement {
+            severity: Some("critical".into()),
+            title: Some("ZZCRIT".into()),
+            message: Some("outage".into()),
             ..Default::default()
         }];
-        let _ = draw_frame_sized(&mut agent, &reg, &promo, 1, 120);
-        assert!(
-            agent.hit_announcement_cta.rect.is_some(),
-            "banner CTA armed"
-        );
+        let _ = draw_frame_sized(&mut agent, &reg, &critical, 2, 120);
         assert!(agent.hit_announcement_hide.rect.is_some(), "[hide] armed");
-        assert!(agent.hit_upgrade_cta.rect.is_some(), "header CTA armed");
         agent.active_subagent = Some("child-sid".into());
-        let _ = draw_frame_sized(&mut agent, &reg, &promo, 1, 120);
-        assert!(agent.hit_announcement_cta.rect.is_none());
+        let _ = draw_frame_sized(&mut agent, &reg, &critical, 2, 120);
         assert!(agent.hit_announcement_hide.rect.is_none());
-        assert!(agent.hit_upgrade_cta.rect.is_none());
-    }
-    /// In-session header upgrade CTA: a promo owning the slot arms
-    /// `hit_upgrade_cta` (clickable → `AnnouncementsOpenCta(Header)`), and the
-    /// draw caches `pinned_upgrade_cta_live` so the `Ctrl+O` arm can override
-    /// YOLO — but ONLY for a pinned (non-dismissible) promo.
-    #[test]
-    fn header_upgrade_cta_rect_and_ctrl_o_override() {
-        use crate::actions::ActionId;
-        use xai_grok_telemetry::events::AnnouncementCtaSurface;
-        let reg = ActionRegistry::defaults();
-        let cta = || {
-            Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Upgrade Account".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            })
-        };
-        let mut agent = make_agent();
-        agent.last_terminal_size = (120, 30);
-        let pinned = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-pin".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            dismissible: Some(false),
-            cta: cta(),
-            ..Default::default()
-        }];
-        let buf = draw_frame_sized(&mut agent, &reg, &pinned, 1, 120);
-        assert!(
-            agent.pinned_upgrade_cta_live,
-            "pinned promo lights the Ctrl+O override"
-        );
-        let rect = agent
-            .hit_upgrade_cta
-            .rect
-            .expect("pinned promo must arm the header CTA rect");
-        let header_row: String = (0..120)
-            .filter_map(|x| buf.cell((x, rect.y)).map(|c| c.symbol().to_string()))
-            .collect();
-        assert!(
-            header_row.contains("[Upgrade Account]"),
-            "row={header_row:?}"
-        );
-        assert!(
-            !header_row.contains("Ctrl+O"),
-            "top-header button must stay bare; row={header_row:?}"
-        );
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(rect.x + 1, rect.y)), &reg);
-        assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(AnnouncementCtaSurface::Header))
-            ),
-            "header CTA click opens with the Header surface"
-        );
-        assert!(
-            matches!(
-                agent.handle_agent_action(ActionId::ToggleYolo),
-                InputOutcome::Action(Action::AnnouncementsOpenCta(
-                    AnnouncementCtaSurface::Keyboard
-                ))
-            ),
-            "Ctrl+O opens the pinned CTA (Keyboard surface) instead of YOLO"
-        );
-        let mut agent = make_agent();
-        agent.last_terminal_size = (120, 30);
-        let dismissible = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-dis".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            cta: cta(),
-            ..Default::default()
-        }];
-        draw_frame_sized(&mut agent, &reg, &dismissible, 1, 120);
-        assert!(
-            !agent.pinned_upgrade_cta_live,
-            "dismissible promo must not steal Ctrl+O"
-        );
-        assert!(
-            agent.hit_upgrade_cta.rect.is_some(),
-            "dismissible promo still shows the clickable header CTA"
-        );
-        assert!(
-            matches!(
-                agent.handle_agent_action(ActionId::ToggleYolo),
-                InputOutcome::Action(Action::SetYoloMode(_))
-            ),
-            "Ctrl+O keeps toggling YOLO for a dismissible promo"
-        );
-        let mut agent = make_agent();
-        agent.last_terminal_size = (120, 30);
-        draw_frame_sized(&mut agent, &reg, &[], 0, 120);
-        assert!(
-            agent.hit_upgrade_cta.rect.is_none(),
-            "no promo → no header CTA"
-        );
-        assert!(!agent.pinned_upgrade_cta_live);
-        assert!(matches!(
-            agent.handle_agent_action(ActionId::ToggleYolo),
-            InputOutcome::Action(Action::SetYoloMode(_))
-        ));
-    }
-    /// A non-dismissible promo draws with the CTA armed but NO [hide] click
-    /// target (`BannerHits.hide` is None, so the mouse hide path is dead).
-    #[test]
-    fn non_dismissible_promo_arms_cta_but_no_hide_rect() {
-        let reg = ActionRegistry::defaults();
-        let mut agent = make_agent();
-        agent.last_terminal_size = (80, 30);
-        let promo = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-pin".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            dismissible: Some(false),
-            cta: Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Go".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            }),
-            ..Default::default()
-        }];
-        draw_banner_frame(&mut agent, &reg, &promo, 1);
-        assert!(
-            agent.hit_announcement_cta.rect.is_some(),
-            "pinned promo keeps its CTA clickable"
-        );
-        assert!(
-            agent.hit_announcement_hide.rect.is_none(),
-            "pinned promo must arm no [hide] target"
-        );
     }
     /// Second suppression layer: a frame occluder (the goal-detail overlay
     /// class — registered in `frame_occluder_rects`, NOT a dropdown, so the
-    /// banner rects stay armed) covering the banner row must swallow both
-    /// button clicks (`pos_occluded` guard) AND drop the promo OSC 8 span
-    /// whole; the next overlay-free frame re-enables all three. The span half
-    /// pins `push_promo_cta_link_span` directly — `draw` only calls it behind
-    /// the process-global `hyperlink_route().emit_osc8` gate, which is
-    /// brand-dependent and unforceable per-test.
+    /// banner rect stays armed) covering the banner rows must swallow the
+    /// [hide] click (`pos_occluded` guard); the next overlay-free frame
+    /// re-enables it.
     #[test]
-    fn frame_occluder_over_banner_swallows_clicks_and_drops_cta_link_span() {
+    fn frame_occluder_over_banner_swallows_hide_click() {
         let reg = ActionRegistry::defaults();
         let mut agent = make_agent();
         agent.last_terminal_size = (80, 30);
-        let promo = [xai_grok_announcements::RemoteAnnouncement {
-            id: Some("promo-1".into()),
-            severity: Some("promo".into()),
-            message: Some("ZZPROMO".into()),
-            cta: Some(xai_grok_announcements::AnnouncementCta {
-                label: Some("Go".into()),
-                url: Some("https://x.ai/promo".into()),
-                caption: None,
-            }),
+        let critical = [xai_grok_announcements::RemoteAnnouncement {
+            severity: Some("critical".into()),
+            title: Some("ZZCRIT".into()),
+            message: Some("outage".into()),
             ..Default::default()
         }];
-        let no_hidden = std::collections::BTreeSet::new();
-        draw_banner_frame(&mut agent, &reg, &promo, 1);
-        let cta = agent.hit_announcement_cta.rect.expect("cta rect armed");
+        draw_banner_frame(&mut agent, &reg, &critical, 2);
         let hide = agent.hit_announcement_hide.rect.expect("hide rect armed");
         assert!(
             agent.frame_occluder_rects.is_empty(),
             "setup: overlay-free frame must accumulate no occluders"
         );
-        agent.frame_occluder_rects.push(Rect::new(0, cta.y, 80, 1));
-        let mut spans = Vec::new();
-        agent.push_promo_cta_link_span(&mut spans, &promo, &no_hidden);
-        assert!(spans.is_empty(), "occluded [label] must emit no OSC 8 span");
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(cta.x + 1, cta.y)), &reg);
-        assert!(
-            !matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "occluded [label] click must not open a URL"
-        );
+        agent.frame_occluder_rects.push(Rect::new(0, hide.y, 80, 1));
         let outcome = agent.handle_input(&Event::Mouse(mouse_down(hide.x + 1, hide.y)), &reg);
         assert!(
             !matches!(outcome, InputOutcome::Action(Action::AnnouncementsHide)),
             "occluded [hide] click must not hide-and-persist"
         );
-        draw_banner_frame(&mut agent, &reg, &promo, 1);
-        agent.push_promo_cta_link_span(&mut spans, &promo, &no_hidden);
-        assert_eq!(spans.len(), 1, "overlay-free frame must emit the span");
-        assert_eq!(
-            (spans[0].row, spans[0].col_start, spans[0].col_end),
-            (cta.y, cta.x, cta.x + cta.width),
-            "span must cover exactly the [label] button cells"
-        );
-        assert_eq!(&*spans[0].url, "https://x.ai/promo");
-        let outcome = agent.handle_input(&Event::Mouse(mouse_down(cta.x + 1, cta.y)), &reg);
-        assert!(
-            matches!(
-                outcome,
-                InputOutcome::Action(Action::AnnouncementsOpenCta(_))
-            ),
-            "overlay-free [label] click must dispatch"
-        );
+        draw_banner_frame(&mut agent, &reg, &critical, 2);
         let outcome = agent.handle_input(&Event::Mouse(mouse_down(hide.x + 1, hide.y)), &reg);
         assert!(
             matches!(outcome, InputOutcome::Action(Action::AnnouncementsHide)),

@@ -446,10 +446,6 @@ pub enum Action {
     AnnouncementsHide,
     /// Show the announcements banner.
     AnnouncementsShow,
-    /// Open the promo CTA link (url resolved from current state at dispatch
-    /// time, mirroring how `AnnouncementsHide` resolves its target). The
-    /// payload records which surface activated it, for telemetry.
-    AnnouncementsOpenCta(xai_grok_telemetry::events::AnnouncementCtaSurface),
     /// Cycle session mode (Shift+Tab): Normal → Plan → Auto → Always-Approve →
     /// Normal (Auto skipped when the feature gate is off).
     /// Plan mode sends a signal to the shell; always-approve is local.

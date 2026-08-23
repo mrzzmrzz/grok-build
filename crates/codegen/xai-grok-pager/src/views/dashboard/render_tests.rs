@@ -135,7 +135,6 @@ fn render_dashboard_shows_roster_when_local_agents_empty() {
         None,
         &roster,
         false,
-        None,
     );
 
     let content = buf_to_text(&buf);
@@ -186,7 +185,6 @@ fn render_dashboard_hover_shows_delete_x_only_for_settled_rows() {
             None,
             &roster,
             false,
-            None,
         );
         buf_to_text(&buf)
     };
@@ -356,7 +354,7 @@ fn dashboard_visual_preview() {
     let layout = super::super::layout::compute_layout(area, false);
     // Manually paint each region so we don't need a live AgentView.
     buf.set_style(area, Style::default().bg(theme.bg_base));
-    render_header(&mut buf, layout.header, &theme, &rows, &mut state, None);
+    render_header(&mut buf, layout.header, &theme, &rows, &mut state);
     render_rows(&mut buf, layout.list, &theme, &rows, &mut state);
     let _ = render_dispatch(&mut buf, layout.dispatch, &theme, &mut state, None);
     let registry = crate::actions::ActionRegistry::defaults();
@@ -624,7 +622,7 @@ fn header_new_agent_button_focused_is_green() {
     let mut focused = DashboardState::new();
     focused.focus_new_agent_button();
     let mut buf = Buffer::empty(area);
-    render_header(&mut buf, area, &theme, &rows, &mut focused, None);
+    render_header(&mut buf, area, &theme, &rows, &mut focused);
     let rect = focused
         .new_agent_button_hit
         .rect
@@ -642,7 +640,7 @@ fn header_new_agent_button_focused_is_green() {
         crate::app::agent::AgentId(0),
     ));
     let mut buf2 = Buffer::empty(area);
-    render_header(&mut buf2, area, &theme, &rows, &mut unfocused, None);
+    render_header(&mut buf2, area, &theme, &rows, &mut unfocused);
     let rect2 = unfocused
         .new_agent_button_hit
         .rect
@@ -676,7 +674,7 @@ fn header_new_agent_button_hover_brightens_text() {
 
     // First render populates the button's hit rect.
     let mut buf = Buffer::empty(area);
-    render_header(&mut buf, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf, area, &theme, &rows, &mut state);
     let rect = state.new_agent_button_hit.rect.expect("button must render");
 
     // Moving the mouse over the button flips hover on.
@@ -688,7 +686,7 @@ fn header_new_agent_button_hover_brightens_text() {
     // Re-render with hover active → text_primary fg, background
     // unchanged (still bg_base — no fill on hover).
     let mut buf2 = Buffer::empty(area);
-    render_header(&mut buf2, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf2, area, &theme, &rows, &mut state);
     let cell = &buf2[(rect.x, rect.y)];
     assert_eq!(
         cell.fg, theme.text_primary,
@@ -708,7 +706,7 @@ fn header_new_agent_button_hover_brightens_text() {
         "moving the mouse off the button must flip hover off",
     );
     let mut buf3 = Buffer::empty(area);
-    render_header(&mut buf3, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf3, area, &theme, &rows, &mut state);
     let cell3 = &buf3[(rect.x, rect.y)];
     assert_eq!(
         cell3.bg, theme.bg_base,
@@ -740,7 +738,7 @@ fn header_location_renders_from_staged_cwd() {
     state.cwd = std::path::PathBuf::from("/grok-staged-cwd-marker");
 
     let mut buf = Buffer::empty(area);
-    render_header(&mut buf, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf, area, &theme, &rows, &mut state);
 
     let top_row: String = (0..area.width)
         .map(|x| buf[(x, 0)].symbol().to_string())
@@ -764,7 +762,7 @@ fn header_button_label_reflects_worktree_mode() {
     let mut off = DashboardState::new();
     off.cwd_has_git_ancestor = true;
     let mut buf = Buffer::empty(area);
-    render_header(&mut buf, area, &theme, &rows, &mut off, None);
+    render_header(&mut buf, area, &theme, &rows, &mut off);
     let text = buf_to_text(&buf);
     assert!(
         text.contains("[+ New Agent]") && !text.contains("Worktree"),
@@ -776,7 +774,7 @@ fn header_button_label_reflects_worktree_mode() {
     armed.cwd_has_git_ancestor = true;
     armed.dispatch_worktree = true;
     let mut buf2 = Buffer::empty(area);
-    render_header(&mut buf2, area, &theme, &rows, &mut armed, None);
+    render_header(&mut buf2, area, &theme, &rows, &mut armed);
     let text2 = buf_to_text(&buf2);
     assert!(
         text2.contains("[+ New Worktree]"),
@@ -788,7 +786,7 @@ fn header_button_label_reflects_worktree_mode() {
     armed_no_git.cwd_has_git_ancestor = false;
     armed_no_git.dispatch_worktree = true;
     let mut buf3 = Buffer::empty(area);
-    render_header(&mut buf3, area, &theme, &rows, &mut armed_no_git, None);
+    render_header(&mut buf3, area, &theme, &rows, &mut armed_no_git);
     let text3 = buf_to_text(&buf3);
     assert!(
         text3.contains("[+ New Agent]") && !text3.contains("Worktree"),
@@ -3092,7 +3090,6 @@ fn render_dashboard_paints_full_area_background() {
         None,
         &[],
         false,
-        None,
     );
 
     // Sample cells across the area; none should retain the seed
@@ -3161,7 +3158,7 @@ fn render_header_paints_label_and_state_chips() {
         header_test_row(3, RowState::Working, "c"),
         header_test_row(4, RowState::Idle, "d"),
     ];
-    render_header(&mut buf, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf, area, &theme, &rows, &mut state);
     let content = buf_to_text(&buf);
     let basename = cwd_basename();
     assert!(
@@ -3198,7 +3195,7 @@ fn render_header_sets_location_click_target() {
     let area = Rect::new(0, 0, 120, 1);
     let mut buf = Buffer::empty(area);
     let mut state = DashboardState::new();
-    render_header(&mut buf, area, &theme, &[], &mut state, None);
+    render_header(&mut buf, area, &theme, &[], &mut state);
     assert!(
         state.location_hit.rect.is_some(),
         "render_header must record a click target for the location label",
@@ -3214,7 +3211,7 @@ fn render_header_hover_underlines_only_text() {
     let mut buf = Buffer::empty(area);
     let mut state = DashboardState::new();
     state.location_hit.hovered = true;
-    render_header(&mut buf, area, &theme, &[], &mut state, None);
+    render_header(&mut buf, area, &theme, &[], &mut state);
 
     // Leading inset (x=0) is a space → must NOT be underlined.
     let inset = buf.cell((0, 0)).expect("inset cell");
@@ -3516,7 +3513,6 @@ fn render_header_suppresses_zero_count_chips() {
         &theme,
         &rows,
         &mut state,
-        None,
     );
     let content = buf_to_text(&buf);
     assert!(
@@ -3548,7 +3544,6 @@ fn render_header_has_no_inactive_chip() {
         &theme,
         &rows,
         &mut state,
-        None,
     );
     let content = buf_to_text(&buf);
     assert!(
@@ -3575,7 +3570,7 @@ fn render_header_shows_location_label() {
 
     // 0 agents — the location still shows.
     let mut buf = Buffer::empty(area);
-    render_header(&mut buf, area, &theme, &[], &mut state, None);
+    render_header(&mut buf, area, &theme, &[], &mut state);
     let c = buf_to_text(&buf);
     assert!(
         c.contains(&basename),
@@ -3585,7 +3580,7 @@ fn render_header_shows_location_label() {
     // 1 agent.
     let mut buf = Buffer::empty(area);
     let rows = vec![header_test_row(1, RowState::Idle, "x")];
-    render_header(&mut buf, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf, area, &theme, &rows, &mut state);
     let c = buf_to_text(&buf);
     assert!(
         c.contains(&basename),
@@ -3609,7 +3604,7 @@ fn render_header_location_label_never_overlaps_chips() {
         header_test_row(2, RowState::Working, "b"),
         header_test_row(3, RowState::Idle, "c"),
     ];
-    render_header(&mut buf, area, &theme, &rows, &mut state, None);
+    render_header(&mut buf, area, &theme, &rows, &mut state);
     let content = buf_to_text(&buf);
     // Chips and button must survive the (long) location label.
     for chunk in ["1 awaiting", "1 working", "1 idle", "[+ New Agent]"] {
@@ -4663,7 +4658,6 @@ fn render_header_counts_top_level_rows_only() {
         &theme,
         &rows,
         &mut state,
-        None,
     );
     let content = buf_to_text(&buf);
     // Only the top-level parent counts: its Working chip shows.

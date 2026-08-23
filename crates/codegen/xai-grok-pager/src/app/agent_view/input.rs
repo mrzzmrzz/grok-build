@@ -1339,13 +1339,7 @@ impl AgentView {
                 InputOutcome::Unchanged
             }
             ActionId::ToggleYolo => {
-                if self.pinned_upgrade_cta_live {
-                    InputOutcome::Action(Action::AnnouncementsOpenCta(
-                        xai_grok_telemetry::events::AnnouncementCtaSurface::Keyboard,
-                    ))
-                } else {
-                    InputOutcome::Action(Action::SetYoloMode(!self.session.is_yolo()))
-                }
+                InputOutcome::Action(Action::SetYoloMode(!self.session.is_yolo()))
             }
             ActionId::SendToBackground => {
                 if !self.is_subagent_view

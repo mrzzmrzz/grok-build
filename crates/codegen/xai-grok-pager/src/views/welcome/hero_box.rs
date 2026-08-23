@@ -23,11 +23,6 @@ const H_INSET: u16 = 2;
 /// Horizontal gap (cols) between the logo and the right column inside the box.
 const LOGO_H_PAD: u16 = 3;
 
-/// Rows the promo upgrade CTA reserves in the info slot: a spacer row above the
-/// `[label]` button row. Reserved on top of the announcement text rows so the
-/// message never paints over the button.
-const UPGRADE_CTA_ROWS: u16 = 2;
-
 const HERO_SUBTITLE: &str = "Thanks for trying Grok Build, give feedback with /feedback!";
 
 use super::{PROMPT_HEIGHT, VERSION_GAP};
@@ -104,7 +99,6 @@ pub(super) fn compute_hero_box(
     changelog_height: u16,
     announcement: Option<&xai_grok_announcements::RemoteAnnouncement>,
     expanded: bool,
-    has_upgrade_cta: bool,
 ) -> WelcomeLayout {
     let zero = Rect::default();
     let tip_gap = if tip_height > 0 { 1u16 } else { 0 };
@@ -120,7 +114,7 @@ pub(super) fn compute_hero_box(
     let info_slot_width = right_width.saturating_sub(H_INSET);
     let info_height = match announcement {
         Some(ann) => clamp_info_height(
-            announcement_desired_rows(ann, info_slot_width, expanded, has_upgrade_cta),
+            announcement_desired_rows(ann, info_slot_width, expanded),
             content_area.height,
             error_height,
             menu_height,
@@ -288,8 +282,6 @@ pub(super) struct HeroBoxRects {
     pub(super) announcement_truncated: bool,
     /// Full announcement block area (clickable anywhere to toggle), if shown.
     pub(super) announcement_rect: Option<Rect>,
-    /// Promo upgrade CTA `[label]` button rect (click → open), if drawn.
-    pub(super) upgrade_cta_rect: Option<Rect>,
     #[cfg(feature = "local-workspace")]
     pub(super) workspace_mode_rects: super::WorkspaceModeHitRects,
 }
@@ -307,7 +299,6 @@ pub(super) fn render_hero_box(
     announcement_expanded: bool,
     changelog_bullets: &[String],
     changelog_has_full_notes: bool,
-    upgrade_cta: Option<&str>,
     #[cfg(feature = "local-workspace")] workspace_mode: Option<(
         super::WelcomeWorkspaceMode,
         bool,
@@ -351,21 +342,18 @@ pub(super) fn render_hero_box(
     let mut changelog_cta_rect = None;
     let mut announcement_truncated = false;
     let mut announcement_rect = None;
-    let mut upgrade_cta_rect = None;
     if layout.hero_info.height > 0 {
         if let Some(ann) = announcement {
-            let (text_area, truncated, cta_rect) = render_announcement_with_upgrade_cta(
+            let truncated = render_announcement_block(
                 buf,
                 theme,
                 layout.hero_info,
                 ann,
                 announcement_expanded,
                 mouse_pos,
-                upgrade_cta,
             );
-            announcement_rect = Some(text_area);
+            announcement_rect = Some(layout.hero_info);
             announcement_truncated = truncated;
-            upgrade_cta_rect = cta_rect;
         } else if !changelog_bullets.is_empty() {
             changelog_cta_rect = render_hero_changelog(
                 buf,
@@ -423,63 +411,9 @@ pub(super) fn render_hero_box(
         changelog_cta_rect,
         announcement_truncated,
         announcement_rect,
-        upgrade_cta_rect,
         #[cfg(feature = "local-workspace")]
         workspace_mode_rects,
     }
-}
-
-/// Draw the announcement text + (optional) upgrade CTA into `area`, reserving
-/// the CTA rows at the bottom so a long/expanded message never overpaints the
-/// button; the button is placed right after the drawn text + a spacer row.
-/// Shared by the hero box and the stacked layout. Returns `(text_area,
-/// truncated, upgrade_cta_rect)`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn render_announcement_with_upgrade_cta(
-    buf: &mut Buffer,
-    theme: &Theme,
-    area: Rect,
-    ann: &xai_grok_announcements::RemoteAnnouncement,
-    expanded: bool,
-    mouse_pos: Option<(u16, u16)>,
-    upgrade_cta: Option<&str>,
-) -> (Rect, bool, Option<Rect>) {
-    let cta_rows = if upgrade_cta.is_some() {
-        UPGRADE_CTA_ROWS
-    } else {
-        0
-    };
-    let text_area = Rect {
-        height: area.height.saturating_sub(cta_rows),
-        ..area
-    };
-    let truncated = render_announcement_block(buf, theme, text_area, ann, expanded, mouse_pos);
-    let mut cta_rect = None;
-    if let Some(label) = upgrade_cta {
-        use unicode_width::UnicodeWidthStr;
-        let text_rows =
-            announcement_text_rows(ann, text_area.width, expanded).min(text_area.height);
-        let cta_y = area.y + text_rows + 1;
-        if cta_y < area.y + area.height {
-            // Hover follows the button cells (mouse-pos driven, like the sibling
-            // info blocks); the shared painter owns the styling + truncation.
-            let btn_w =
-                UnicodeWidthStr::width(format!("[{label}]").as_str()).min(area.width as usize);
-            let hovered = mouse_pos.is_some_and(|(mx, my)| {
-                my == cta_y && mx >= area.x && (mx as usize) < area.x as usize + btn_w
-            });
-            // Pinned (non-dismissible) promo shows its dim `cta.caption`; a
-            // dismissible one stays bare. No permission prompt on the welcome
-            // screen, so no gating; the painter drops it whole if too narrow.
-            let caption = (!crate::views::announcements::is_dismissible(ann))
-                .then(|| crate::views::announcements::usable_cta_caption(ann))
-                .flatten();
-            cta_rect = crate::views::announcements::render_cta_button(
-                buf, theme, area.x, cta_y, area.width, label, caption, hovered,
-            );
-        }
-    }
-    (text_area, truncated, cta_rect)
 }
 
 /// Render the announcement (title + message) into `area`, used by both welcome
@@ -621,10 +555,10 @@ pub(super) fn wrapped_line_count(text: &str, width: u16) -> u16 {
     wrap_lines(text, width).len() as u16
 }
 
-/// Rows the announcement TEXT wants at `width`: title + message, the message
-/// capped at 2 wrapped lines unless `expanded`. Shared with the renderer so the
-/// upgrade CTA is placed right after the drawn text (reserved == drawn).
-pub(super) fn announcement_text_rows(
+/// Rows the announcement info slot wants at `width`: title + message, the
+/// message capped at 2 wrapped lines unless `expanded`. Shared by the layout
+/// height pre-pass and the renderer (reserved == drawn).
+pub(super) fn announcement_desired_rows(
     ann: &xai_grok_announcements::RemoteAnnouncement,
     width: u16,
     expanded: bool,
@@ -635,19 +569,6 @@ pub(super) fn announcement_text_rows(
         if expanded { wrapped } else { wrapped.min(2) }
     });
     title_rows + msg_rows
-}
-
-/// Rows the announcement info slot wants at `width`: the text rows plus, when a
-/// promo upgrade CTA is shown, a spacer row + the `[label]` button row
-/// (`UPGRADE_CTA_ROWS`). Shared with the renderer (reserved == drawn).
-pub(super) fn announcement_desired_rows(
-    ann: &xai_grok_announcements::RemoteAnnouncement,
-    width: u16,
-    expanded: bool,
-    has_upgrade_cta: bool,
-) -> u16 {
-    announcement_text_rows(ann, width, expanded)
-        + if has_upgrade_cta { UPGRADE_CTA_ROWS } else { 0 }
 }
 
 /// Word-wrap `text` into at most `max_lines` rows at (`x`, `y`). Overflow ends
@@ -919,107 +840,4 @@ managed devices and accounts. Report security incidents";
         assert_eq!(extract_text(&buf, 0, area.height, area.width), "");
     }
 
-    /// The upgrade CTA reserves `UPGRADE_CTA_ROWS` on top of the text rows;
-    /// `render_announcement_with_upgrade_cta` paints `[label]` below the message
-    /// — plus the dim `cta.caption` for a pinned promo that configures one; bare
-    /// for a caption-less pinned promo or a dismissible one — and returns the
-    /// button rect (button only, caption excluded).
-    #[test]
-    fn upgrade_cta_reserves_rows_and_returns_button_rect() {
-        let area = Rect::new(0, 0, 40, 8);
-        let a = ann(None, Some("Grok 4.5 is here. Upgrade now."));
-        let text_rows = announcement_text_rows(&a, area.width, false);
-        assert_eq!(
-            announcement_desired_rows(&a, area.width, false, true),
-            text_rows + UPGRADE_CTA_ROWS,
-            "a CTA reserves the spacer + button rows"
-        );
-        assert_eq!(
-            announcement_desired_rows(&a, area.width, false, false),
-            text_rows
-        );
-
-        // Pinned promo with a configured caption: button + dim caption below.
-        let mut pinned = ann(None, Some("Grok 4.5 is here. Upgrade now."));
-        pinned.dismissible = Some(false);
-        pinned.cta = Some(xai_grok_announcements::AnnouncementCta {
-            label: Some("Upgrade Account".into()),
-            url: Some("https://x.ai/grok".into()),
-            caption: Some("or use Ctrl+O".into()),
-        });
-        let mut buf = Buffer::empty(area);
-        let (text_area, _truncated, cta_rect) = render_announcement_with_upgrade_cta(
-            &mut buf,
-            &theme(),
-            area,
-            &pinned,
-            false,
-            None,
-            Some("Upgrade Account"),
-        );
-        let rect = cta_rect.expect("CTA returns a button rect");
-        assert_eq!(
-            text_area.height,
-            area.height - UPGRADE_CTA_ROWS,
-            "text area shrinks by the reserved CTA rows"
-        );
-        assert!(
-            rect.y >= text_area.y + text_rows,
-            "button sits below the text"
-        );
-        assert_eq!(rect.width, 17, "rect is the [Upgrade Account] button only");
-        let row = extract_text(&buf, area.x, rect.y, area.width);
-        assert_eq!(
-            row, "[Upgrade Account] or use Ctrl+O",
-            "pinned promo hero shows the configured caption; row={row:?}"
-        );
-
-        // Caption-less pinned promo: bare button (nothing hardcoded fills in).
-        pinned.cta.as_mut().unwrap().caption = None;
-        let mut buf = Buffer::empty(area);
-        let (_ta, _t, cta_rect) = render_announcement_with_upgrade_cta(
-            &mut buf,
-            &theme(),
-            area,
-            &pinned,
-            false,
-            None,
-            Some("Upgrade Account"),
-        );
-        let rect = cta_rect.expect("caption-less pinned promo still shows the button");
-        let row = extract_text(&buf, area.x, rect.y, area.width);
-        assert_eq!(row, "[Upgrade Account]", "absent caption stays bare");
-
-        // Dismissible promo: bare button even with a configured caption.
-        let mut dismissible = ann(None, Some("Grok 4.5 is here. Upgrade now."));
-        dismissible.cta = Some(xai_grok_announcements::AnnouncementCta {
-            label: Some("Upgrade Account".into()),
-            url: Some("https://x.ai/grok".into()),
-            caption: Some("or use Ctrl+O".into()),
-        });
-        let mut buf = Buffer::empty(area);
-        let (_ta, _t, cta_rect) = render_announcement_with_upgrade_cta(
-            &mut buf,
-            &theme(),
-            area,
-            &dismissible,
-            false,
-            None,
-            Some("Upgrade Account"),
-        );
-        let rect = cta_rect.expect("dismissible promo still shows the button");
-        let row = extract_text(&buf, area.x, rect.y, area.width);
-        assert!(row.contains("[Upgrade Account]"), "row={row:?}");
-        assert!(
-            !row.contains("Ctrl+O"),
-            "dismissible hero ignores the configured caption; row={row:?}"
-        );
-
-        // No CTA: no rect, full-height text area.
-        let mut buf = Buffer::empty(area);
-        let (text_area, _t, cta_rect) =
-            render_announcement_with_upgrade_cta(&mut buf, &theme(), area, &a, false, None, None);
-        assert!(cta_rect.is_none());
-        assert_eq!(text_area.height, area.height);
-    }
 }

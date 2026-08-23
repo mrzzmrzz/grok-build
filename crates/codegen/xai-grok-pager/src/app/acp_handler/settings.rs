@@ -485,10 +485,15 @@ pub(super) fn apply_announcements_update(
     );
     let announcements = xai_grok_announcements::filter_expired(merged);
 
+    // Selection-stage severity gate (shared predicate with the startup pick in
+    // `event_loop`): a retained current announcement must still be displayable,
+    // and the random re-pick draws from displayable (critical) notices only.
     app.announcement = match app.announcement.as_ref() {
         Some(current) => announcements
             .iter()
-            .find(|a| *a == current)
+            .find(|a| {
+                *a == current && crate::views::announcements::is_displayable_announcement(a)
+            })
             .cloned()
             .or_else(|| pick_random_announcement(&announcements)),
         None => pick_random_announcement(&announcements),
@@ -508,15 +513,23 @@ pub(super) fn apply_announcements_update(
     app.sync_session_announcement_slash_gate();
 }
 
+/// Uniform random pick over the displayable (critical-only) announcements.
+/// The severity filter runs at selection time — the same
+/// `is_displayable_announcement` predicate the startup pick uses — so a
+/// promotional announcement can never enter the pool.
 pub(super) fn pick_random_announcement(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
 ) -> Option<xai_grok_announcements::RemoteAnnouncement> {
-    if announcements.is_empty() {
+    let displayable: Vec<&xai_grok_announcements::RemoteAnnouncement> = announcements
+        .iter()
+        .filter(|a| crate::views::announcements::is_displayable_announcement(a))
+        .collect();
+    if displayable.is_empty() {
         return None;
     }
     use rand::Rng;
-    let idx = rand::rng().random_range(0..announcements.len());
-    announcements.get(idx).cloned()
+    let idx = rand::rng().random_range(0..displayable.len());
+    displayable.get(idx).map(|&a| a.clone())
 }
 
 /// Deserialization type for the `x.ai/settings/update` notification payload.

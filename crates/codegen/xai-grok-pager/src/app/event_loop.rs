@@ -1517,10 +1517,18 @@ pub(crate) async fn run(
             remote_announcements,
         );
         app.active_announcements = xai_grok_announcements::filter_expired(announcements);
-        if !app.active_announcements.is_empty() {
+        // Selection-stage severity gate: only critical notices may enter the
+        // random pool (the shared predicate keeps this in lockstep with the
+        // settings-push re-pick in `acp_handler::settings`).
+        let displayable: Vec<&xai_grok_announcements::RemoteAnnouncement> = app
+            .active_announcements
+            .iter()
+            .filter(|a| crate::views::announcements::is_displayable_announcement(a))
+            .collect();
+        if !displayable.is_empty() {
             use rand::Rng;
-            let idx = rand::rng().random_range(0..app.active_announcements.len());
-            app.announcement = app.active_announcements.get(idx).cloned();
+            let idx = rand::rng().random_range(0..displayable.len());
+            app.announcement = displayable.get(idx).map(|&a| a.clone());
         }
         app.sync_session_announcement_slash_gate();
 

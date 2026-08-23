@@ -683,12 +683,6 @@ pub struct DashboardState {
     /// `render_header` and consumed by the mouse handler to open the
     /// location picker. `None` when the header is too narrow to paint it.
     pub location_hit: crate::app::agent_view::HitArea,
-    /// Hit area for the header's promo upgrade CTA `[label]` button (click →
-    /// `AnnouncementsOpenCta(Dashboard)`). `None` when no CTA is shown.
-    pub upgrade_cta_hit: crate::app::agent_view::HitArea,
-    /// A pinned (non-dismissible) promo CTA is live this frame (cached by
-    /// `render_dashboard`); `Ctrl+O` opens it instead of falling through.
-    pub pinned_upgrade_cta_live: bool,
     /// When `true`, agents dispatched from the dashboard are created in a
     /// fresh git worktree (rooted at the current cwd) instead of in the cwd
     /// directly: creating an agent first opens [`Self::worktree_dialog`] to
@@ -1404,8 +1398,6 @@ impl DashboardState {
             models: crate::acp::model_state::ModelState::default(),
             location_picker: None,
             location_hit: crate::app::agent_view::HitArea::default(),
-            upgrade_cta_hit: crate::app::agent_view::HitArea::default(),
-            pinned_upgrade_cta_live: false,
             dispatch_worktree: false,
             cwd_has_git_ancestor: false,
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -3159,18 +3151,6 @@ impl DashboardState {
             return outcome;
         }
 
-        // Free-tier override: Ctrl+O opens the pinned upgrade CTA (when one is
-        // live) instead of falling through to the dispatch input. Matched on the
-        // chord directly — `ToggleYolo` is `When::AgentScreen`-scoped and never
-        // resolves here. The dispatch re-resolves the slot gate, so a stale flag
-        // stays a safe no-op. Stamped `Keyboard` (like the agent/welcome Ctrl+O)
-        // so "which surface" stays orthogonal to "was it keyboard".
-        if self.pinned_upgrade_cta_live && key!('o', CONTROL).matches(key) {
-            return InputOutcome::Action(Action::AnnouncementsOpenCta(
-                xai_grok_telemetry::events::AnnouncementCtaSurface::Keyboard,
-            ));
-        }
-
         // Shift+Tab while the peek is open cycles the PEEKED agent's live
         // mode, not the new-session staged mode. The registry resolves all
         // Shift+Tab encodings to `DashboardCycleMode`; re-route that to the
@@ -3690,7 +3670,6 @@ impl DashboardState {
                 .new_agent_button_hit
                 .update_hover(mouse.column, mouse.row);
             changed |= self.location_hit.update_hover(mouse.column, mouse.row);
-            changed |= self.upgrade_cta_hit.update_hover(mouse.column, mouse.row);
 
             // Slash / @-file dropdown hover wins over row hover so the
             // completion list tracks the pointer while open (mirrors
@@ -3990,14 +3969,6 @@ impl DashboardState {
                 self.focus_new_agent_button();
                 self.manual_scroll_active = false;
                 return InputOutcome::Action(Action::DashboardCreateNewAgentWithDetail);
-            }
-
-            // Click on the header upgrade CTA `[label]` → open the promo url
-            // (resolved through the slot gate at dispatch time).
-            if self.upgrade_cta_hit.contains(mouse.column, mouse.row) {
-                return InputOutcome::Action(Action::AnnouncementsOpenCta(
-                    xai_grok_telemetry::events::AnnouncementCtaSurface::Dashboard,
-                ));
             }
 
             // Click on the header location label → open the location

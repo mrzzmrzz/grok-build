@@ -992,21 +992,6 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 vec![]
             }
         }
-        Action::AnnouncementsOpenCta(surface) => {
-            if let Some((promo, url)) = crate::views::announcements::promo_cta_target(
-                &app.active_announcements,
-                &app.hidden_announcement_ids,
-            ) {
-                let url = url.to_owned();
-                let promo_id = promo.id.clone();
-                log_event(xai_grok_telemetry::events::AnnouncementCtaClicked {
-                    id: promo_id,
-                    source: surface,
-                });
-                open_url_or_show(app, &url);
-            }
-            vec![]
-        }
         Action::CancelTurn => dispatch_cancel_turn(app),
         Action::CancelTurnChoice(choice) => dispatch_cancel_turn_choice(app, choice),
         Action::KillBgTask(task_id) => dispatch_kill_bg_task(app, task_id),

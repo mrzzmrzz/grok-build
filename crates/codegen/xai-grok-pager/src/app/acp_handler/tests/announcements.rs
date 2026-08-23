@@ -198,6 +198,83 @@
         );
     }
 
+    /// Selection-stage severity gate on a settings push: the random pick
+    /// (`pick_random_announcement`) and the keep-current retention leg both
+    /// filter through `is_displayable_announcement` (critical-only), so a
+    /// pushed promo can neither be picked nor retained as `app.announcement`
+    /// — even though it stays in `active_announcements` for diagnostics.
+    #[test]
+    fn announcements_update_pick_and_retention_are_critical_only() {
+        let promo = |id: &str| xai_grok_announcements::RemoteAnnouncement {
+            id: Some(id.into()),
+            message: Some(format!("{id} upsell")),
+            severity: Some("promo".into()),
+            ..Default::default()
+        };
+
+        // Promo-only push: nothing is picked.
+        let mut app = make_app_with_agent("sess-ann");
+        apply_announcements_update(&mut app, 1, &[promo("promo-a")], None, None, None);
+        assert!(
+            app.announcement.is_none(),
+            "a promo-only list must leave the random pick empty"
+        );
+        assert!(
+            app.active_announcements
+                .iter()
+                .any(|a| a.id.as_deref() == Some("promo-a")),
+            "the promo still lands in active_announcements (remote state kept)"
+        );
+
+        // A stale promo already stored as `announcement` (e.g. from an older
+        // build) must not be retained by the keep-current leg.
+        let mut app = make_app_with_agent("sess-ann");
+        app.announcement = Some(promo("promo-a"));
+        apply_announcements_update(
+            &mut app,
+            1,
+            &[promo("promo-a"), critical_announcement("crit-a")],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            app.announcement.as_ref().and_then(|a| a.id.as_deref()),
+            Some("crit-a"),
+            "retention must drop the promo and re-pick from criticals only"
+        );
+
+        // Mixed push with no prior pick: only the critical can be selected.
+        let mut app = make_app_with_agent("sess-ann");
+        apply_announcements_update(
+            &mut app,
+            1,
+            &[promo("promo-a"), critical_announcement("crit-a")],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            app.announcement.as_ref().and_then(|a| a.id.as_deref()),
+            Some("crit-a"),
+            "random pick must draw from the critical-only pool"
+        );
+
+        // A retained critical stays retained (no gratuitous re-pick).
+        apply_announcements_update(
+            &mut app,
+            2,
+            &[promo("promo-b"), critical_announcement("crit-a")],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            app.announcement.as_ref().and_then(|a| a.id.as_deref()),
+            Some("crit-a")
+        );
+    }
+
     /// A mid-session push must open the `/announcements` gate on already-live
     /// subagent child views, not just top-level agents. Driven through the
     /// layer-injected seam (no real `~/.grok` reads).
