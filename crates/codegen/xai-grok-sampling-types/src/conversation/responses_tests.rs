@@ -1757,3 +1757,217 @@ fn serialized_body_contains_no_placeholder_strings() {
         "both reasoning siblings must be present"
     );
 }
+
+// ── Custom tool call id (v2) round-trip through the wire ───────────────────
+
+#[test]
+fn custom_tool_call_with_colon_ids_round_trips_to_responses_input() {
+    let call = ToolCall::custom("call:x:y", "item:z", "exec", "run()");
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![call.clone()]),
+        ConversationItem::tool_result(call.id.as_ref(), "done"),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+
+    // Assistant side: the native custom call is rebuilt with the original,
+    // undamaged provider ids.
+    let ct = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::CustomToolCall(ct)) => Some(ct),
+            _ => None,
+        })
+        .expect("a CustomToolCall input item");
+    assert_eq!(ct.call_id, "call:x:y");
+    assert_eq!(ct.id, "item:z");
+    assert_eq!(ct.name, "exec");
+    assert_eq!(ct.input, "run()");
+
+    // Result side: the decode returns the same provider call id.
+    let cto = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::CustomToolCallOutput(cto)) => Some(cto),
+            _ => None,
+        })
+        .expect("a CustomToolCallOutput input item");
+    assert_eq!(cto.call_id, "call:x:y");
+}
+
+// ── Tool result ordered parts ──────────────────────────────────────────────
+
+fn interleaved_parts() -> Vec<ContentPart> {
+    vec![
+        ContentPart::Text {
+            text: "before".into(),
+        },
+        ContentPart::Image {
+            url: "data:image/png;base64,AAA".into(),
+        },
+        ContentPart::Text {
+            text: "after".into(),
+        },
+    ]
+}
+
+fn assert_text_image_text(parts: &[rs::InputContent]) {
+    assert_eq!(parts.len(), 3);
+    assert!(matches!(&parts[0], rs::InputContent::InputText(t) if t.text == "before"));
+    assert!(
+        matches!(&parts[1], rs::InputContent::InputImage(img) if img.image_url.as_deref() == Some("data:image/png;base64,AAA"))
+    );
+    assert!(matches!(&parts[2], rs::InputContent::InputText(t) if t.text == "after"));
+}
+
+#[test]
+fn tool_result_parts_preserve_order_in_function_branch() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts("call_1", interleaved_parts()),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let fco = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::FunctionCallOutput(fco)) => Some(fco),
+            _ => None,
+        })
+        .expect("a FunctionCallOutput input item");
+    let rs::FunctionCallOutput::Content(parts) = &fco.output else {
+        panic!("Expected Content output");
+    };
+    assert_text_image_text(parts);
+}
+
+#[test]
+fn tool_result_parts_preserve_order_in_custom_branch() {
+    let call = ToolCall::custom("call_9", "fc_9", "exec", "run()");
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![call.clone()]),
+        ConversationItem::tool_result_with_parts(call.id.as_ref(), interleaved_parts()),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let cto = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::CustomToolCallOutput(cto)) => Some(cto),
+            _ => None,
+        })
+        .expect("a CustomToolCallOutput input item");
+    assert_eq!(cto.call_id, "call_9");
+    let rs::CustomToolCallOutputOutput::List(parts) = &cto.output else {
+        panic!("Expected List output");
+    };
+    assert_text_image_text(parts);
+}
+
+#[test]
+fn tool_result_single_text_part_stays_plain_text() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![ContentPart::Text { text: "out".into() }],
+        ),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let fco = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::FunctionCallOutput(fco)) => Some(fco),
+            _ => None,
+        })
+        .expect("a FunctionCallOutput input item");
+    assert!(matches!(&fco.output, rs::FunctionCallOutput::Text(t) if t == "out"));
+}
+
+#[test]
+fn tool_result_image_only_parts_serialize_in_order() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "screenshot".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Image { url: "img-1".into() },
+                ContentPart::Image { url: "img-2".into() },
+            ],
+        ),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let fco = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::FunctionCallOutput(fco)) => Some(fco),
+            _ => None,
+        })
+        .expect("a FunctionCallOutput input item");
+    let rs::FunctionCallOutput::Content(parts) = &fco.output else {
+        panic!("Expected Content output");
+    };
+    assert_eq!(parts.len(), 2);
+    assert!(
+        matches!(&parts[0], rs::InputContent::InputImage(img) if img.image_url.as_deref() == Some("img-1"))
+    );
+    assert!(
+        matches!(&parts[1], rs::InputContent::InputImage(img) if img.image_url.as_deref() == Some("img-2"))
+    );
+}
+
+#[test]
+fn tool_result_empty_parts_keeps_legacy_shape() {
+    // Empty `parts` falls back to the legacy layout even when constructed
+    // through the new entry point.
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts("call_1", Vec::new()),
+    ]);
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let fco = items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::FunctionCallOutput(fco)) => Some(fco),
+            _ => None,
+        })
+        .expect("a FunctionCallOutput input item");
+    assert!(matches!(&fco.output, rs::FunctionCallOutput::Text(t) if t.is_empty()));
+}

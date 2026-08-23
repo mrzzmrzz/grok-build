@@ -58,6 +58,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     tool_call_id: msg.tool_call_id.unwrap_or_default(),
                     content: Arc::<str>::from(content),
                     images: Vec::new(),
+                    parts: Vec::new(),
                 })
             }
         }
@@ -138,30 +139,45 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             }
         }
         ConversationItem::ToolResult(t) => {
-            if t.images.is_empty() {
-                ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned())
+            // A non-empty `parts` carries the authoritative interleaved
+            // order; a single text part keeps the plain-text wire shape.
+            // Empty `parts` keeps the legacy text-then-images layout.
+            let to_block = |part: &ContentPart| match part {
+                ContentPart::Text { text } => ChatContentBlock::Text {
+                    text: text.as_ref().to_owned(),
+                },
+                ContentPart::Image { url } => ChatContentBlock::ImageUrl {
+                    image_url: ImageUrl {
+                        url: url.as_ref().to_owned(),
+                    },
+                },
+            };
+            let blocks = if let [ContentPart::Text { text }] = t.parts.as_slice() {
+                return ChatRequestMessage::tool(t.tool_call_id, text.as_ref().to_owned());
+            } else if !t.parts.is_empty() {
+                t.parts.iter().map(to_block).collect()
+            } else if t.images.is_empty() {
+                return ChatRequestMessage::tool(t.tool_call_id, t.content.as_ref().to_owned());
             } else {
                 let mut blocks = vec![ChatContentBlock::Text {
                     text: t.content.as_ref().to_owned(),
                 }];
-                for img in t.images {
-                    if let ContentPart::Image { url } = img {
-                        blocks.push(ChatContentBlock::ImageUrl {
-                            image_url: ImageUrl {
-                                url: url.as_ref().to_owned(),
-                            },
-                        });
-                    }
-                }
-                ChatRequestMessage {
-                    role: Role::Tool,
-                    content: MessageContent::Blocks(blocks),
-                    name: None,
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(t.tool_call_id),
-                    model_id: None,
-                    reasoning_content: None,
-                }
+                blocks.extend(
+                    t.images
+                        .iter()
+                        .filter(|p| matches!(p, ContentPart::Image { .. }))
+                        .map(to_block),
+                );
+                blocks
+            };
+            ChatRequestMessage {
+                role: Role::Tool,
+                content: MessageContent::Blocks(blocks),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(t.tool_call_id),
+                model_id: None,
+                reasoning_content: None,
             }
         }
         // Backend tool calls have no Chat Completions equivalent.

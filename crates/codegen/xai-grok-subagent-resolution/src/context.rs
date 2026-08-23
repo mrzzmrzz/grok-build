@@ -411,6 +411,7 @@ mod tests {
             tool_call_id: "tc-1".to_string(),
             content: content.into(),
             images: Vec::new(),
+            parts: Vec::new(),
         })
     }
 

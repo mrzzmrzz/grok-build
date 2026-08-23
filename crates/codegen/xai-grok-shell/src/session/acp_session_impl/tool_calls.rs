@@ -2657,6 +2657,7 @@ impl SessionActor {
     ) {
         use xai_grok_sampler::{SamplingChannel, SamplingEvent};
         match event {
+            SamplingEvent::ToolCallArgumentsComplete { .. } => {}
             SamplingEvent::StreamStarted { timestamp_ms, .. } => {
                 {
                     let prompt_id = self

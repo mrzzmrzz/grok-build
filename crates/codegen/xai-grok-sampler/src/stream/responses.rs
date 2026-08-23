@@ -299,6 +299,16 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
         }
 
         let mut final_response: Option<rs::Response> = None;
+        // Durable copy of every completed output item, keyed by
+        // `output_index` so a re-emitted done frame overwrites rather than
+        // duplicates. Discarded when a terminal response arrives (that stays
+        // authoritative); used to rebuild the turn when the stream dies
+        // before one. Local to this attempt — independent of the doom-loop
+        // capture, which serves the retry path, not this stream's output.
+        let mut durable_output: BTreeMap<u32, rs::OutputItem> = BTreeMap::new();
+        // The `ResponseCreated` envelope, kept as the shell (model id,
+        // response id, ...) for a durable-output recovery.
+        let mut created_response: Option<rs::Response> = None;
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
@@ -693,6 +703,13 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                         }
                         _ => {}
                     }
+                    durable_output.insert(done_event.output_index, done_event.item);
+                }
+
+                ResponseStreamEvent::ResponseCreated(created_event) => {
+                    if created_response.is_none() {
+                        created_response = Some(created_event.response);
+                    }
                 }
 
                 // A done event without a preceding delta still carries the
@@ -758,6 +775,23 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
         // ── Build the final response ─────────────────────────────────
         let mut response = match final_response {
             Some(r) => r,
+            // The stream died before a terminal event but whole output items
+            // completed: rebuild the turn from them instead of discarding
+            // everything. Marked Incomplete — the tail may be missing.
+            None if !durable_output.is_empty() => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    recovered_items = durable_output.len(),
+                    "stream ended without ResponseCompleted/ResponseIncomplete; \
+                     recovering from completed output items"
+                );
+                let mut recovered = created_response
+                    .take()
+                    .unwrap_or_else(recovery_response_shell);
+                recovered.status = Status::Incomplete;
+                recovered.output = durable_output.into_values().collect();
+                recovered
+            }
             None => {
                 let err = SamplingError::Api {
                     status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
@@ -869,6 +903,44 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
             response: Box::new(conversation_response),
             metrics,
         };
+    }
+}
+
+/// Envelope for a durable-output recovery when the stream died before even
+/// `ResponseCreated` supplied one.
+fn recovery_response_shell() -> rs::Response {
+    rs::Response {
+        background: None,
+        billing: None,
+        conversation: None,
+        created_at: 0,
+        completed_at: None,
+        error: None,
+        id: String::new(),
+        incomplete_details: None,
+        instructions: None,
+        max_output_tokens: None,
+        metadata: None,
+        model: String::new(),
+        object: "response".into(),
+        output: Vec::new(),
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        reasoning: None,
+        safety_identifier: None,
+        service_tier: None,
+        status: rs::Status::Incomplete,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: None,
+        top_logprobs: None,
+        top_p: None,
+        truncation: None,
+        usage: None,
     }
 }
 
@@ -1611,6 +1683,189 @@ mod tests {
                 assert!(response.doom_loop_signals.is_empty());
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // ── Durable-output recovery ─────────────────────────────────────────
+
+    fn output_message_item(id: &str, text: &str) -> rs_types::OutputItem {
+        rs_types::OutputItem::Message(rs_types::OutputMessage {
+            content: vec![rs_types::OutputMessageContent::OutputText(
+                rs_types::OutputTextContent {
+                    annotations: vec![],
+                    logprobs: None,
+                    text: text.into(),
+                },
+            )],
+            id: id.into(),
+            role: rs_types::AssistantRole::Assistant,
+            status: rs_types::OutputStatus::Completed,
+        })
+    }
+
+    fn function_call_item(call_id: &str, name: &str, arguments: &str) -> rs_types::OutputItem {
+        rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+            arguments: arguments.into(),
+            call_id: call_id.into(),
+            name: name.into(),
+            id: Some(format!("fc_{call_id}")),
+            status: Some(rs_types::OutputStatus::Completed),
+        })
+    }
+
+    fn output_item_done_event(
+        output_index: u32,
+        item: rs_types::OutputItem,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: 0,
+            output_index,
+            item,
+        })
+    }
+
+    /// Completed output items survive a stream that dies before its terminal
+    /// event: the turn is rebuilt from them (deduplicated by output index)
+    /// instead of being discarded.
+    #[tokio::test]
+    async fn durable_items_recover_when_terminal_event_is_missing() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                output_message_item("msg-1", "partial answer"),
+            )),
+            Ok(output_item_done_event(
+                1,
+                function_call_item("call_1", "do_thing", "{\"x\":1}"),
+            )),
+            // A re-emitted done frame for the same index must not duplicate.
+            Ok(output_item_done_event(
+                1,
+                function_call_item("call_1", "do_thing", "{\"x\":1}"),
+            )),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let assistants: Vec<_> = response
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ConversationItem::Assistant(a) => Some(a),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(assistants.len(), 1, "exactly one assistant item");
+                assert_eq!(assistants[0].content.as_ref(), "partial answer");
+                assert_eq!(assistants[0].tool_calls.len(), 1, "no duplicated call");
+                assert_eq!(assistants[0].tool_calls[0].id.as_ref(), "call_1");
+                assert_eq!(assistants[0].tool_calls[0].name, "do_thing");
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// With no tool call in the recovered items the turn surfaces as
+    /// truncated (`Length`), matching the synthesized Incomplete status.
+    #[tokio::test]
+    async fn durable_message_only_recovery_reports_length() {
+        let raw = stream::iter(vec![Ok(output_item_done_event(
+            0,
+            output_message_item("msg-1", "cut off"),
+        ))])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "cut off");
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The terminal response stays authoritative: durable copies of done
+    /// items must not leak into or duplicate a normally completed turn.
+    #[tokio::test]
+    async fn terminal_response_stays_authoritative_over_durable_items() {
+        let mut final_resp = empty_completed_response();
+        final_resp.output = vec![output_message_item("msg-1", "final")];
+        let completed =
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response: final_resp,
+                sequence_number: 2,
+            });
+        let raw = stream::iter(vec![
+            Ok(output_item_done_event(
+                0,
+                output_message_item("msg-1", "streamed"),
+            )),
+            Ok(output_item_done_event(
+                1,
+                function_call_item("call_1", "do_thing", "{}"),
+            )),
+            Ok(completed),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "final");
+                assert!(
+                    response.tool_calls().is_empty(),
+                    "durable function call must not leak past the terminal output"
+                );
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// No terminal event and no completed items still fails as before.
+    #[tokio::test]
+    async fn missing_terminal_without_durable_items_still_fails() {
+        let raw = stream::iter(vec![Ok(text_delta_event("hi"))]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert_eq!(error.status_code, Some(500));
+            }
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 }

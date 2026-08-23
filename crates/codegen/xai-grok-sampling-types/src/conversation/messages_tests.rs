@@ -509,3 +509,169 @@ fn upgrade_legacy_reasoning_singular_anthropic_no_id() {
     assert_eq!(r.id, "");
     assert_eq!(r.encrypted_content.as_deref(), Some("signature-bytes-here"));
 }
+
+// ── Tool result ordered parts ──────────────────────────────────────────────
+
+fn tool_result_blocks(
+    req: &ConversationRequest,
+) -> (String, crate::messages::ToolResultContent) {
+    let messages_req = build_messages_request(req);
+    for msg in &messages_req.messages {
+        if let crate::messages::MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let crate::messages::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
+                    return (tool_use_id.clone(), content.clone());
+                }
+            }
+        }
+    }
+    panic!("no ToolResult block in {messages_req:?}");
+}
+
+#[test]
+fn tool_result_parts_preserve_order_to_anthropic() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Text {
+                    text: "before".into(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,AAA".into(),
+                },
+                ContentPart::Text {
+                    text: "after".into(),
+                },
+            ],
+        ),
+    ]);
+
+    let (_, content) = tool_result_blocks(&req);
+    let crate::messages::ToolResultContent::Blocks(blocks) = content else {
+        panic!("Expected Blocks content");
+    };
+    assert_eq!(blocks.len(), 3);
+    assert!(
+        matches!(&blocks[0], crate::messages::ContentBlock::Text { text, .. } if text == "before")
+    );
+    assert!(matches!(
+        &blocks[1],
+        crate::messages::ContentBlock::Image {
+            source: crate::messages::ImageSource::Base64 { media_type, data },
+            ..
+        } if media_type == "image/png" && data == "AAA"
+    ));
+    assert!(
+        matches!(&blocks[2], crate::messages::ContentBlock::Text { text, .. } if text == "after")
+    );
+}
+
+#[test]
+fn tool_result_single_text_part_stays_plain_text_to_anthropic() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![ContentPart::Text { text: "out".into() }],
+        ),
+    ]);
+
+    let (_, content) = tool_result_blocks(&req);
+    assert!(matches!(
+        content,
+        crate::messages::ToolResultContent::Text(t) if t == "out"
+    ));
+}
+
+#[test]
+fn tool_result_image_only_parts_serialize_in_order_to_anthropic() {
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "screenshot".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Image {
+                    url: "https://example.com/1.png".into(),
+                },
+                ContentPart::Image {
+                    url: "https://example.com/2.png".into(),
+                },
+            ],
+        ),
+    ]);
+
+    let (_, content) = tool_result_blocks(&req);
+    let crate::messages::ToolResultContent::Blocks(blocks) = content else {
+        panic!("Expected Blocks content");
+    };
+    assert_eq!(blocks.len(), 2);
+    for (block, expected) in blocks
+        .iter()
+        .zip(["https://example.com/1.png", "https://example.com/2.png"])
+    {
+        assert!(matches!(
+            block,
+            crate::messages::ContentBlock::Image {
+                source: crate::messages::ImageSource::Url { url },
+                ..
+            } if url == expected
+        ));
+    }
+}
+
+// ── Encoded custom-call ids across the Messages sanitizer ──────────────────
+
+/// The v2 encoding contains `:` and `.`, which the Messages sanitizer maps
+/// to `_`. Call and result ride through the same function, so both sides
+/// must land on the same (sanitized) id.
+#[test]
+fn v2_custom_call_id_sanitizes_consistently_on_both_sides() {
+    let call = ToolCall::custom("call:x:y", "item:z", "exec", r#"{"a":1}"#);
+    let req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![call.clone()]),
+        ConversationItem::tool_result(call.id.as_ref(), "done"),
+    ]);
+
+    let messages_req = build_messages_request(&req);
+    let tool_use_id = messages_req
+        .messages
+        .iter()
+        .find_map(|msg| {
+            let crate::messages::MessageContent::Blocks(blocks) = &msg.content else {
+                return None;
+            };
+            blocks.iter().find_map(|block| match block {
+                crate::messages::ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+        })
+        .expect("a ToolUse block");
+    let (tool_result_id, _) = tool_result_blocks(&req);
+
+    assert_eq!(tool_use_id, tool_result_id);
+    assert!(
+        tool_use_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+        "sanitized id must satisfy the Messages id charset, got {tool_use_id}"
+    );
+}

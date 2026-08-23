@@ -80,6 +80,18 @@ pub enum SamplingEvent {
         arguments_delta: Option<String>,
     },
 
+    /// The tool call at `tool_index` finished streaming its arguments.
+    ///
+    /// Emitted by the Responses L2 transform for client-executed native
+    /// custom tool calls, whose complete input arrives on a done frame;
+    /// `id`/`name` are set when that frame carries them.
+    ToolCallArgumentsComplete {
+        request_id: RequestId,
+        tool_index: u32,
+        id: Option<String>,
+        name: Option<String>,
+    },
+
     /// The provider opened a response (Messages `message_start`). Carries the
     /// real message id, model, and input-side token counts exactly as they
     /// arrive on the wire, before any content. Surfaced in order so partial-mode

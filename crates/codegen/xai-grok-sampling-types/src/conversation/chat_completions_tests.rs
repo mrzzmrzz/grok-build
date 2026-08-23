@@ -618,3 +618,69 @@ fn upgrade_then_fold_through_conversation_to_chat_messages() {
         "reconstructed sibling folded onto assistant.reasoning_content"
     );
 }
+
+// ── Encoded custom-call ids ride the Chat Completions wire verbatim ────────
+
+#[test]
+fn v2_custom_call_id_passes_through_chat_completions_unchanged() {
+    let call = ToolCall::custom("call:x:y", "item:z", "exec", r#"{"a":1}"#);
+    let encoded_id = call.id.as_ref().to_owned();
+    let messages = conversation_to_chat_messages(vec![
+        ConversationItem::assistant_tool_calls(vec![call]),
+        ConversationItem::tool_result(encoded_id.clone(), "done"),
+    ]);
+
+    let assistant = &messages[0];
+    assert_eq!(assistant.tool_calls.len(), 1);
+    assert_eq!(assistant.tool_calls[0].id.as_deref(), Some(encoded_id.as_str()));
+
+    let result = &messages[1];
+    assert_eq!(result.tool_call_id.as_deref(), Some(encoded_id.as_str()));
+
+    // The wire id still decodes to the original provider ids.
+    let round_tripped = ToolCall {
+        id: encoded_id.as_str().into(),
+        name: "exec".into(),
+        arguments: "{}".into(),
+    };
+    assert!(round_tripped.is_custom());
+    assert_eq!(round_tripped.call_id(), "call:x:y");
+    assert_eq!(round_tripped.custom_item_id(), Some("item:z"));
+}
+
+#[test]
+fn tool_result_parts_preserve_order_in_chat_completions() {
+    let messages = conversation_to_chat_messages(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Text {
+                    text: "before".into(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,AAA".into(),
+                },
+                ContentPart::Text {
+                    text: "after".into(),
+                },
+            ],
+        ),
+    ]);
+
+    let result = &messages[1];
+    let MessageContent::Blocks(blocks) = &result.content else {
+        panic!("Expected Blocks content, got {:?}", result.content);
+    };
+    assert_eq!(blocks.len(), 3);
+    assert!(matches!(&blocks[0], ChatContentBlock::Text { text } if text == "before"));
+    assert!(matches!(
+        &blocks[1],
+        ChatContentBlock::ImageUrl { image_url } if image_url.url == "data:image/png;base64,AAA"
+    ));
+    assert!(matches!(&blocks[2], ChatContentBlock::Text { text } if text == "after"));
+}

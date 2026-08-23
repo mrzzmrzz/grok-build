@@ -285,24 +285,19 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
             items
         }
         ConversationItem::ToolResult(t) => {
+            // A non-empty `parts` carries the authoritative interleaved
+            // order; a single text part keeps the plain-text wire shape.
+            // Empty `parts` keeps the legacy text-then-images layout.
+            let list_content = || tool_result_input_content(t);
             if let Some((call_id, _)) = decode_custom_tool_call_id(&t.tool_call_id) {
-                let output = if t.images.is_empty() {
+                let output = if let [ContentPart::Text { text }] = t.parts.as_slice() {
+                    rs::CustomToolCallOutputOutput::Text(text.as_ref().to_owned())
+                } else if !t.parts.is_empty() {
+                    rs::CustomToolCallOutputOutput::List(list_content())
+                } else if t.images.is_empty() {
                     rs::CustomToolCallOutputOutput::Text(t.content.as_ref().to_owned())
                 } else {
-                    let mut parts: Vec<rs::InputContent> =
-                        vec![rs::InputContent::InputText(rs::InputTextContent {
-                            text: t.content.as_ref().to_owned(),
-                        })];
-                    for img in &t.images {
-                        if let ContentPart::Image { url } = img {
-                            parts.push(rs::InputContent::InputImage(rs::InputImageContent {
-                                detail: rs::ImageDetail::Auto,
-                                file_id: None,
-                                image_url: Some(url.as_ref().to_owned()),
-                            }));
-                        }
-                    }
-                    rs::CustomToolCallOutputOutput::List(parts)
+                    rs::CustomToolCallOutputOutput::List(list_content())
                 };
                 return vec![rs::InputItem::Item(rs::Item::CustomToolCallOutput(
                     rs::CustomToolCallOutput {
@@ -312,23 +307,14 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     },
                 ))];
             }
-            let output = if t.images.is_empty() {
+            let output = if let [ContentPart::Text { text }] = t.parts.as_slice() {
+                rs::FunctionCallOutput::Text(text.as_ref().to_owned())
+            } else if !t.parts.is_empty() {
+                rs::FunctionCallOutput::Content(list_content())
+            } else if t.images.is_empty() {
                 rs::FunctionCallOutput::Text(t.content.as_ref().to_owned())
             } else {
-                let mut parts: Vec<rs::InputContent> =
-                    vec![rs::InputContent::InputText(rs::InputTextContent {
-                        text: t.content.as_ref().to_owned(),
-                    })];
-                for img in &t.images {
-                    if let ContentPart::Image { url } = img {
-                        parts.push(rs::InputContent::InputImage(rs::InputImageContent {
-                            detail: rs::ImageDetail::Auto,
-                            file_id: None,
-                            image_url: Some(url.as_ref().to_owned()),
-                        }));
-                    }
-                }
-                rs::FunctionCallOutput::Content(parts)
+                rs::FunctionCallOutput::Content(list_content())
             };
             vec![rs::InputItem::Item(rs::Item::FunctionCallOutput(
                 rs::FunctionCallOutputItemParam {
@@ -352,6 +338,37 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }
             }]
         }
+    }
+}
+
+/// Ordered `InputContent` for a tool result: `parts` verbatim when present,
+/// otherwise the legacy text-then-images layout.
+fn tool_result_input_content(t: &ToolResultItem) -> Vec<rs::InputContent> {
+    if !t.parts.is_empty() {
+        return t.parts.iter().map(content_part_to_input_content).collect();
+    }
+    let mut out = vec![rs::InputContent::InputText(rs::InputTextContent {
+        text: t.content.as_ref().to_owned(),
+    })];
+    out.extend(
+        t.images
+            .iter()
+            .filter(|p| matches!(p, ContentPart::Image { .. }))
+            .map(content_part_to_input_content),
+    );
+    out
+}
+
+fn content_part_to_input_content(part: &ContentPart) -> rs::InputContent {
+    match part {
+        ContentPart::Text { text } => rs::InputContent::InputText(rs::InputTextContent {
+            text: text.as_ref().to_owned(),
+        }),
+        ContentPart::Image { url } => rs::InputContent::InputImage(rs::InputImageContent {
+            detail: rs::ImageDetail::Auto,
+            file_id: None,
+            image_url: Some(url.as_ref().to_owned()),
+        }),
     }
 }
 

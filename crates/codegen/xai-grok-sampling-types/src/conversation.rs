@@ -327,6 +327,13 @@ pub struct ToolResultItem {
     /// separate follow-up user message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ContentPart>,
+    /// Ordered mixed content. When non-empty the API conversion layers emit
+    /// exactly this order; `content`/`images` stay populated for legacy
+    /// readers. Items persisted before this field existed (and the legacy
+    /// constructors) leave it empty, keeping the historical
+    /// text-then-images layout on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ContentPart>,
 }
 
 /// A server-side tool call from the backend agentic sampler.
@@ -519,14 +526,28 @@ pub struct ToolCall {
 }
 
 const CUSTOM_TOOL_CALL_ID_PREFIX: &str = "custom_tool_call:";
+const CUSTOM_TOOL_CALL_ID_V2_PREFIX: &str = "custom_tool_call.v2:";
 
+/// v2 length-prefixes the call id
+/// (`custom_tool_call.v2:<call_id byte len>:<call_id><item_id>`) so any
+/// UTF-8 call id — colons included — round-trips losslessly. Encode only
+/// ever emits v2; v1 stays decodable for persisted sessions.
 fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
     Arc::<str>::from(format!(
-        "{CUSTOM_TOOL_CALL_ID_PREFIX}{call_id}:{item_id}"
+        "{CUSTOM_TOOL_CALL_ID_V2_PREFIX}{}:{call_id}{item_id}",
+        call_id.len()
     ))
 }
 
 fn decode_custom_tool_call_id(id: &str) -> Option<(&str, &str)> {
+    if let Some(encoded) = id.strip_prefix(CUSTOM_TOOL_CALL_ID_V2_PREFIX) {
+        let (len, rest) = encoded.split_once(':')?;
+        let len: usize = len.parse().ok()?;
+        // `is_char_boundary` is false past the end, so this also bounds-checks.
+        return rest.is_char_boundary(len).then(|| rest.split_at(len));
+    }
+    // v1 (`custom_tool_call:<call_id>:<item_id>`) split on the first `:`, so
+    // a call id containing one was truncated there. Read-only compatibility.
     let encoded = id.strip_prefix(CUSTOM_TOOL_CALL_ID_PREFIX)?;
     encoded.split_once(':')
 }
@@ -751,9 +772,21 @@ fn strip_images_where(
                 }
             }
             ConversationItem::ToolResult(t) => {
-                t.images.retain(|part| match part {
+                // `images` mirrors the image subset of a non-empty `parts`,
+                // so record each stripped URL from only one of the two vecs.
+                let record_from_parts = !t.parts.is_empty();
+                t.parts.retain(|part| match part {
                     ContentPart::Image { url } if should_strip(url) => {
                         stripped.push(Arc::clone(url));
+                        false
+                    }
+                    ContentPart::Image { .. } | ContentPart::Text { .. } => true,
+                });
+                t.images.retain(|part| match part {
+                    ContentPart::Image { url } if should_strip(url) => {
+                        if !record_from_parts {
+                            stripped.push(Arc::clone(url));
+                        }
                         false
                     }
                     ContentPart::Image { .. } | ContentPart::Text { .. } => true,
@@ -1365,6 +1398,7 @@ impl ConversationItem {
             tool_call_id: tool_call_id.into(),
             content: Arc::<str>::from(content.into()),
             images: Vec::new(),
+            parts: Vec::new(),
         })
     }
 
@@ -1381,6 +1415,35 @@ impl ConversationItem {
             tool_call_id: tool_call_id.into(),
             content: Arc::<str>::from(content.into()),
             images,
+            parts: Vec::new(),
+        })
+    }
+
+    /// Create a tool result whose text/image interleaving must survive on
+    /// the wire. `content`/`images` are derived from `parts` for legacy
+    /// readers; the conversion layers emit `parts` in order.
+    pub fn tool_result_with_parts(
+        tool_call_id: impl Into<String>,
+        parts: Vec<ContentPart>,
+    ) -> Self {
+        let content: String = parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_ref()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let images: Vec<ContentPart> = parts
+            .iter()
+            .filter(|p| matches!(p, ContentPart::Image { .. }))
+            .cloned()
+            .collect();
+        Self::ToolResult(ToolResultItem {
+            tool_call_id: tool_call_id.into(),
+            content: Arc::<str>::from(content),
+            images,
+            parts,
         })
     }
 
@@ -2466,6 +2529,183 @@ mod compaction_item_bridge_tests {
             panic!("factory must produce a User item, got {item:?}");
         };
         assert_eq!(parts.synthetic_reason, expected);
+    }
+}
+
+#[cfg(test)]
+mod custom_tool_call_id_tests {
+    use super::*;
+
+    fn round_trip(call_id: &str, item_id: &str) {
+        let encoded = encode_custom_tool_call_id(call_id, item_id);
+        assert!(encoded.starts_with(CUSTOM_TOOL_CALL_ID_V2_PREFIX));
+        assert_eq!(
+            decode_custom_tool_call_id(&encoded),
+            Some((call_id, item_id)),
+            "round-trip failed for {call_id:?} / {item_id:?}"
+        );
+    }
+
+    #[test]
+    fn v2_round_trips_arbitrary_ids() {
+        round_trip("call_123", "fc_456");
+        round_trip("call:with:colons", "item:with:colons");
+        round_trip(r#"call"quoted"{braces}"#, r#"item"quoted"{braces}"#);
+        round_trip("呼び出し✓", "アイテム✓");
+        round_trip("", "item_only");
+        round_trip("call_only", "");
+        round_trip("", "");
+        let long = "x".repeat(64 * 1024);
+        round_trip(&long, &long);
+    }
+
+    #[test]
+    fn tool_call_custom_reads_back_through_the_accessors() {
+        let call = ToolCall::custom("call:a:b", "item:c", "exec", "input");
+        assert!(call.is_custom());
+        assert_eq!(call.call_id(), "call:a:b");
+        assert_eq!(call.custom_item_id(), Some("item:c"));
+        assert_eq!(call.custom_input(), Some("input"));
+
+        let plain = ToolCall {
+            id: "call_plain".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        assert!(!plain.is_custom());
+        assert_eq!(plain.call_id(), "call_plain");
+        assert_eq!(plain.custom_item_id(), None);
+        assert_eq!(plain.custom_input(), None);
+    }
+
+    #[test]
+    fn v1_ids_still_decode() {
+        // A colon-free call id parses exactly.
+        assert_eq!(
+            decode_custom_tool_call_id("custom_tool_call:call_1:fc_9"),
+            Some(("call_1", "fc_9"))
+        );
+        // Known historical behavior, kept as-is for persisted sessions: a v1
+        // call id containing a colon was truncated at the first one, the
+        // remainder folding into the item id. v2 exists because of this.
+        assert_eq!(
+            decode_custom_tool_call_id("custom_tool_call:call:1:fc_9"),
+            Some(("call", "1:fc_9"))
+        );
+        // Not encoded at all.
+        assert_eq!(decode_custom_tool_call_id("call_plain"), None);
+        assert_eq!(decode_custom_tool_call_id("custom_tool_call:no_item"), None);
+    }
+
+    #[test]
+    fn malformed_v2_ids_do_not_decode() {
+        for id in [
+            "custom_tool_call.v2:",        // no length
+            "custom_tool_call.v2:abc:x",   // non-numeric length
+            "custom_tool_call.v2:9:short", // length past the end
+        ] {
+            assert_eq!(decode_custom_tool_call_id(id), None, "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_result_parts_tests {
+    use super::*;
+
+    #[test]
+    fn with_parts_derives_legacy_fields() {
+        let item = ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Text {
+                    text: "before".into(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,AAA".into(),
+                },
+                ContentPart::Text {
+                    text: "after".into(),
+                },
+            ],
+        );
+        let ConversationItem::ToolResult(t) = &item else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(t.content.as_ref(), "before\nafter");
+        assert_eq!(t.images.len(), 1);
+        assert_eq!(t.parts.len(), 3);
+    }
+
+    #[test]
+    fn parts_round_trip_through_serde() {
+        let item = ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Image { url: "img-1".into() },
+                ContentPart::Text { text: "t".into() },
+            ],
+        );
+        let json = serde_json::to_string(&item).unwrap();
+        let back: ConversationItem = serde_json::from_str(&json).unwrap();
+        let ConversationItem::ToolResult(t) = &back else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(t.parts.len(), 2);
+        assert!(matches!(&t.parts[0], ContentPart::Image { url } if url.as_ref() == "img-1"));
+        assert!(matches!(&t.parts[1], ContentPart::Text { text } if text.as_ref() == "t"));
+    }
+
+    #[test]
+    fn legacy_serialized_items_deserialize_with_empty_parts() {
+        // A tool result persisted before `parts` existed.
+        let json = r#"{"type":"tool_result","tool_call_id":"call_1","content":"out","images":[{"type":"image","url":"data:image/png;base64,AAA"}]}"#;
+        let item: ConversationItem = serde_json::from_str(json).unwrap();
+        let ConversationItem::ToolResult(t) = &item else {
+            panic!("expected ToolResult");
+        };
+        assert!(t.parts.is_empty());
+        assert_eq!(t.content.as_ref(), "out");
+        assert_eq!(t.images.len(), 1);
+    }
+
+    #[test]
+    fn legacy_constructors_leave_parts_off_the_wire() {
+        for item in [
+            ConversationItem::tool_result("call_1", "out"),
+            ConversationItem::tool_result_with_images(
+                "call_1",
+                "out",
+                vec![ContentPart::Image { url: "img".into() }],
+            ),
+        ] {
+            let json = serde_json::to_string(&item).unwrap();
+            assert!(!json.contains("\"parts\""), "got {json}");
+        }
+    }
+
+    #[test]
+    fn strip_images_removes_from_parts_without_double_counting() {
+        let mut items = vec![ConversationItem::tool_result_with_parts(
+            "call_1",
+            vec![
+                ContentPart::Text { text: "a".into() },
+                ContentPart::Image { url: "img-1".into() },
+                ContentPart::Text { text: "b".into() },
+            ],
+        )];
+        let stripped = strip_images_by_url(&mut items, &["img-1".into()]);
+        assert_eq!(stripped, 1, "one occurrence stripped, counted once");
+        let ConversationItem::ToolResult(t) = &items[0] else {
+            panic!("expected ToolResult");
+        };
+        assert!(t.images.is_empty());
+        assert_eq!(t.parts.len(), 2);
+        assert!(
+            t.parts
+                .iter()
+                .all(|p| matches!(p, ContentPart::Text { .. }))
+        );
     }
 }
 

@@ -206,7 +206,14 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             }
             ConversationItem::ToolResult(t) => {
                 flush_assistant(&mut pending_assistant, &mut messages);
-                let content = if t.images.is_empty() {
+                // A non-empty `parts` carries the authoritative interleaved
+                // order; a single text part keeps the plain-text wire shape.
+                // Empty `parts` keeps the legacy text-then-images layout.
+                let content = if let [ContentPart::Text { text }] = t.parts.as_slice() {
+                    ToolResultContent::Text(text.as_ref().to_owned())
+                } else if !t.parts.is_empty() {
+                    ToolResultContent::Blocks(content_parts_to_anthropic_blocks(&t.parts))
+                } else if t.images.is_empty() {
                     ToolResultContent::Text(t.content.as_ref().to_owned())
                 } else {
                     let mut blocks = vec![ContentBlock::Text {
