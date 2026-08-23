@@ -458,6 +458,7 @@ fn suspend_for_child(
             stderr,
             crossterm::event::DisableFocusChange,
             crossterm::event::DisableBracketedPaste,
+            crossterm::event::DisableThemeModeUpdates,
         );
         if mouse_captured {
             let _ = crossterm::execute!(stderr, crossterm::event::DisableMouseCapture);
@@ -487,6 +488,7 @@ fn suspend_for_child(
             stderr,
             crossterm::event::EnableFocusChange,
             crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableThemeModeUpdates,
         );
         if mouse_captured {
             let _ = crossterm::execute!(stderr, crossterm::event::EnableMouseCapture);
@@ -3780,6 +3782,44 @@ async fn drain_and_process(
                 if app.gboom_active() {
                     app.gboom_release_all_games();
                     needs_draw = true;
+                }
+                return false;
+            }
+            Event::ThemeModeChanged(mode) => {
+                // Live mode 2031 color-scheme report (ghostty/kitty/…; it
+                // rides the input stream, so it also arrives across SSH).
+                // Record it as the top-priority appearance source and apply
+                // immediately instead of waiting out the appearance
+                // watcher's polling interval.
+                let appearance = match mode {
+                    crossterm::event::ThemeMode::Dark => {
+                        system_appearance::SystemAppearance::Dark
+                    }
+                    crossterm::event::ThemeMode::Light => {
+                        system_appearance::SystemAppearance::Light
+                    }
+                };
+                system_appearance::set_terminal_reported(appearance);
+                if theme_cache::is_auto_mode() {
+                    let config = theme_cache::auto_theme_config();
+                    let new_kind = system_appearance::to_theme_kind(
+                        appearance,
+                        config.dark_theme,
+                        config.light_theme,
+                    );
+                    let current = Theme::current_kind();
+                    let effective = Theme::apply_kind(new_kind);
+                    if effective != current {
+                        tracing::info!(
+                            ?appearance,
+                            new_theme = %effective.display_name(),
+                            previous_theme = %current.display_name(),
+                            "terminal reported color-scheme change, switching theme"
+                        );
+                        force_repaint = true;
+                        needs_draw = true;
+                        had_non_resize_change = true;
+                    }
                 }
                 return false;
             }

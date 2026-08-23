@@ -1461,6 +1461,13 @@ fn init_terminal(
                 stderr,
                 event::EnableFocusChange,
                 event::EnableBracketedPaste,
+                // Mode 2031: live color-scheme reports for auto theming
+                // (ignored by terminals without support). The one-shot query
+                // fetches the CURRENT scheme — the mode alone only reports
+                // future switches — so a remote session starts on the right
+                // theme without waiting for the first toggle.
+                event::EnableThemeModeUpdates,
+                event::RequestThemeMode,
                 cursor::Hide,
             )?;
             let policy = cursor_style_policy(cursor_blink);
@@ -1652,7 +1659,11 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
         });
     }
     xai_grok_shell::util::with_locked_stderr(|stderr| {
-        let _ = execute!(stderr, event::DisableFocusChange);
+        let _ = execute!(
+            stderr,
+            event::DisableFocusChange,
+            event::DisableThemeModeUpdates
+        );
     });
     pop_gboom_keyboard_flags();
     if crate::terminal::take_kitty_flags_pushed() {

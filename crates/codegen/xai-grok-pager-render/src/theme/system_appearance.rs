@@ -1,6 +1,9 @@
 //! System appearance detection for automatic day/night theming.
 //!
 //! Detection chain (each step only runs when the previous returns nothing):
+//! 0. Live mode 2031 terminal report — the terminal's own statement of its
+//!    scheme, updated on every theme switch (works across SSH). See
+//!    [`set_terminal_reported`].
 //! 1. `dark-light` desktop APIs — macOS `AppleInterfaceStyle`, Linux XDG
 //!    portal `org.freedesktop.appearance.color-scheme`, Windows registry
 //! 2. Explicit env stamps — `GROK_APPEARANCE` / `LC_GROK_APPEARANCE`
@@ -21,6 +24,40 @@ use tokio::sync::watch;
 /// [`detect_with_osc11_fallback`] runs. Runtime `detect` reuses it so a live
 /// OSC 11 polarity is not replaced by inherited `COLORFGBG`.
 static OSC11_STARTUP: OnceLock<Option<SystemAppearance>> = OnceLock::new();
+
+/// Latest mode 2031 color-scheme report from the terminal
+/// (`0` none, `1` dark, `2` light).
+///
+/// Unlike the startup-only OSC 11 probe this updates live: terminals that
+/// support mode 2031 (ghostty, kitty, contour, foot, …) send a report on
+/// every theme switch, and the report rides the normal input stream so it
+/// also arrives across SSH. It outranks every other source in the chain —
+/// it is the terminal's own statement of its current scheme, while desktop
+/// APIs and env stamps only infer it.
+static TERMINAL_REPORTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Record a live mode 2031 color-scheme report from the terminal.
+pub fn set_terminal_reported(appearance: SystemAppearance) {
+    let value = match appearance {
+        SystemAppearance::Dark => 1,
+        SystemAppearance::Light => 2,
+    };
+    TERMINAL_REPORTED.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn terminal_reported() -> Option<SystemAppearance> {
+    match TERMINAL_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(SystemAppearance::Dark),
+        2 => Some(SystemAppearance::Light),
+        _ => None,
+    }
+}
+
+/// Clear the recorded terminal report (test isolation only).
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_terminal_reported() {
+    TERMINAL_REPORTED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Detected system appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,12 +161,14 @@ pub fn detect_desktop() -> Option<SystemAppearance> {
 /// `COLORFGBG` (no mock, no new OSC 11 probe).
 fn detect_without_mock() -> Option<SystemAppearance> {
     let env = crate::host::collect_unicode_env();
-    resolve_appearance_chain(
-        detect_desktop(),
-        super::env_appearance::detect_explicit_from_env_map(&env),
-        OSC11_STARTUP.get().copied().flatten(),
-        super::env_appearance::detect_colorfgbg_from_env_map(&env),
-    )
+    terminal_reported().or_else(|| {
+        resolve_appearance_chain(
+            detect_desktop(),
+            super::env_appearance::detect_explicit_from_env_map(&env),
+            OSC11_STARTUP.get().copied().flatten(),
+            super::env_appearance::detect_colorfgbg_from_env_map(&env),
+        )
+    })
 }
 
 /// Return the mock value if one has been set (test builds only).
@@ -519,5 +558,32 @@ mod tests {
 
         assert_eq!(watcher.current(), Some(SystemAppearance::Dark));
         clear_mock();
+    }
+
+    #[test]
+    fn terminal_report_outranks_every_other_source() {
+        let _guard = theme_cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The live mode 2031 report is the terminal's own statement of its
+        // scheme, so it must win over desktop APIs, env stamps, cached
+        // OSC 11, and COLORFGBG regardless of what they would return.
+        set_terminal_reported(SystemAppearance::Light);
+        assert_eq!(detect_without_mock(), Some(SystemAppearance::Light));
+        set_terminal_reported(SystemAppearance::Dark);
+        assert_eq!(detect_without_mock(), Some(SystemAppearance::Dark));
+        clear_terminal_reported();
+    }
+
+    #[test]
+    fn terminal_report_updates_are_not_latched() {
+        let _guard = theme_cache::test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_terminal_reported(SystemAppearance::Dark);
+        set_terminal_reported(SystemAppearance::Light);
+        assert_eq!(terminal_reported(), Some(SystemAppearance::Light));
+        clear_terminal_reported();
+        assert_eq!(terminal_reported(), None);
     }
 }
