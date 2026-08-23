@@ -25,6 +25,8 @@ members = [
     "crates/codegen/xai-grok-announcements",
     "crates/codegen/xai-grok-auth",
     "crates/codegen/xai-grok-bundle",
+    "crates/codegen/xai-grok-code-mode",
+    "crates/codegen/xai-grok-code-mode-protocol",
     "crates/codegen/xai-grok-config",
     "crates/codegen/xai-grok-config-types",
     "crates/codegen/xai-grok-diag-server",
@@ -143,6 +145,7 @@ crossterm = "0.28"
 cryptify = "3.2"
 ctor = "0.4"
 dashmap = "6"
+deno_core_icudata = "0.77.0"
 derive_more = { version = "2", features = ["add", "add_assign", "debug", "deref", "deref_mut", "display", "from", "from_str", "into", "into_iterator", "as_ref", "try_into"] }
 dhat = "0.3"
 dirs = "5.0"
@@ -293,6 +296,7 @@ unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
+v8 = "=149.2.0"
 vte = "0.15.0"
 wait-timeout = "0.2"
 walkdir = "2"
@@ -317,6 +321,8 @@ xai-grok-agent = { path = "crates/codegen/xai-grok-agent" }
 xai-grok-announcements = { path = "crates/codegen/xai-grok-announcements" }
 xai-grok-auth = { path = "crates/codegen/xai-grok-auth" }
 xai-grok-bundle = { path = "crates/codegen/xai-grok-bundle" }
+xai-grok-code-mode = { path = "crates/codegen/xai-grok-code-mode" }
+xai-grok-code-mode-protocol = { path = "crates/codegen/xai-grok-code-mode-protocol" }
 xai-grok-config = { path = "crates/codegen/xai-grok-config" }
 xai-grok-config-types = { path = "crates/codegen/xai-grok-config-types" }
 xai-grok-diag-server = { path = "crates/codegen/xai-grok-diag-server" }

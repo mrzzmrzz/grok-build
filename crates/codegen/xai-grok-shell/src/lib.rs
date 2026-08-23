@@ -13,6 +13,8 @@ pub(crate) use xai_grok_telemetry::unified_log;
 pub use xai_tracing_macros::{teprintln, timed, tprintln};
 pub mod agent;
 pub mod auth;
+pub mod codex_auth;
+pub(crate) mod codex_models;
 pub mod builtin;
 pub use xai_grok_bundle as bundle;
 pub mod claude_import;
