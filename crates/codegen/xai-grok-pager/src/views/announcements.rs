@@ -1,4 +1,4 @@
-//! Session announcement banner: one slot, critical always wins over promo.
+//! Session announcement banner for critical operational notices.
 //!
 //! Critical layout (always 2 rows when shown):
 //! ```text
@@ -9,21 +9,8 @@
 //! The message row indents past the `! ` prefix so its column matches the
 //! title's; the CTA keeps its full reserved width and the message truncates.
 //!
-//! Promo layout (1 row, only when no critical is selected; the caption is
-//! pinned-only and the hide affordances dismissible-only, so they never
-//! co-occur):
-//! ```text
-//! [Label] {cta.caption}                                    (pinned)
-//! [Label]        hide: /announcements hide  [hide]    (dismissible)
-//! ```
-//!
-//! The `[Label]` button is the promo's CTA (semantic warning yellow,
-//! clickable); it is omitted when the announcement has no usable CTA. A pinned
-//! (non-dismissible) promo also paints its dim `cta.caption` helper text (e.g.
-//! "or use Ctrl+O") after the button when one is configured (dropped whole when
-//! it can't fit, or while a permission prompt owns the chord). The promo
-//! `message` is not painted here (it renders on the roomy welcome hero
-//! instead). Both hide affordances sit right-aligned (dismissible promos only).
+//! Promotional announcements remain in remote state for compatibility and
+//! diagnostics, but are deliberately not selected or rendered by this module.
 //!
 //! `dismissible: false` suppresses every hide affordance on either kind and
 //! the text reclaims the reserved columns (absent/`true` = hideable).
@@ -121,10 +108,6 @@ fn is_critical(a: &xai_grok_announcements::RemoteAnnouncement) -> bool {
     a.severity.as_deref() == Some("critical")
 }
 
-fn is_promo(a: &xai_grok_announcements::RemoteAnnouncement) -> bool {
-    a.severity.as_deref() == Some("promo")
-}
-
 /// One definition of "live critical" (visible message + critical + not expired)
 /// shared by every predicate below so the meanings cannot drift.
 fn is_live_critical(
@@ -132,26 +115,6 @@ fn is_live_critical(
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     is_critical(a) && !xai_grok_announcements::is_expired_at(a, now)
-}
-
-/// Promo twin of [`is_live_critical`]. A CTA is NOT required: a promo without
-/// one is still a valid 1-line message row (the selection's visible-message
-/// guarantee already skips items with nothing to render).
-fn is_live_promo(
-    a: &xai_grok_announcements::RemoteAnnouncement,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    is_promo(a) && !xai_grok_announcements::is_expired_at(a, now)
-}
-
-/// The session-surfaced severities (critical or promo) — the one name the
-/// hide-key set and the slash-gate predicate share so the set of severities
-/// that open the in-session slot cannot drift between them.
-fn is_live_session_announcement(
-    a: &xai_grok_announcements::RemoteAnnouncement,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    is_live_critical(a, now) || is_live_promo(a, now)
 }
 
 /// Hideable unless the server says otherwise: absent/`true` = dismissible
@@ -241,32 +204,8 @@ fn first_critical_session_announcement_at<'a>(
         .find(|a| is_live_critical(a, now) && !is_hidden(a, hidden_ids))
 }
 
-/// Wall-clock [`first_promo_session_announcement_at`] — test convenience.
-#[cfg(test)]
-fn first_promo_session_announcement<'a>(
-    announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
-    hidden_ids: &BTreeSet<String>,
-) -> Option<&'a xai_grok_announcements::RemoteAnnouncement> {
-    first_promo_session_announcement_at(announcements, hidden_ids, chrono::Utc::now())
-}
-
-/// Promo sibling of [`first_critical_session_announcement_at`] (same expiry
-/// seam and hidden-ids filtering). Private for the same reason: only the
-/// slot gate's `.or_else` leg consumes it, so nothing can bypass "critical
-/// wins" again.
-fn first_promo_session_announcement_at<'a>(
-    announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
-    hidden_ids: &BTreeSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<&'a xai_grok_announcements::RemoteAnnouncement> {
-    visible_announcements(announcements)
-        .into_iter()
-        .find(|a| is_live_promo(a, now) && !is_hidden(a, hidden_ids))
-}
-
-/// The single banner-slot item: the critical selection when one exists
-/// (critical always wins the slot), else the promo selection. Per-frame
-/// derivation makes the swap automatic when a critical arrives mid-promo.
+/// The single banner-slot item: the first live, unhidden critical notice.
+/// Promotional announcements are intentionally excluded from all passive UI.
 pub fn first_session_announcement<'a>(
     announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
     hidden_ids: &BTreeSet<String>,
@@ -274,9 +213,9 @@ pub fn first_session_announcement<'a>(
     first_session_announcement_at(announcements, hidden_ids, chrono::Utc::now())
 }
 
-/// Whether a live critical session announcement exists. Used by the banner
-/// slot ranking: critical outranks the privacy upsell banner (an outage
-/// notice must not be hidden by a persistent nag), promo does not.
+/// Whether a live critical session announcement exists. Critical notices are
+/// operational state and remain available while promotional notices stay out
+/// of the passive banner path.
 pub fn has_critical_session_announcement(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
     hidden_ids: &BTreeSet<String>,
@@ -291,30 +230,20 @@ pub fn first_session_announcement_at<'a>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<&'a xai_grok_announcements::RemoteAnnouncement> {
     first_critical_session_announcement_at(announcements, hidden_ids, now)
-        .or_else(|| first_promo_session_announcement_at(announcements, hidden_ids, now))
 }
 
-/// The upgrade CTA to surface: `(owner, label, url)` resolved through the
-/// banner-slot gate. The single resolution shared by every surface that paints
-/// the `[label]` button (welcome hero, in-session header, dashboard, banner)
-/// and by the click/keyboard/OSC 8 open paths — so show-logic, https-safety,
-/// critical-preemption, and expiry are inherited once. `is_dismissible(owner)`
-/// tells a surface whether the `Ctrl+O` override applies (pinned promos only).
-/// Resolving through [`first_session_announcement`] keeps dispatch
-/// slot-consistent: a critical owning the slot yields no target, so a click
-/// through a stale prior-frame rect (critical preempted the promo between
-/// draws) no-ops.
+/// Passive upgrade CTAs are disabled. Keeping this as the single shared gate
+/// makes drawing, mouse handling, OSC 8 emission, and dispatch all fail closed
+/// together. User-initiated billing/error flows do not use this function.
 pub(crate) fn promo_cta<'a>(
-    announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
-    hidden_ids: &BTreeSet<String>,
+    _announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
+    _hidden_ids: &BTreeSet<String>,
 ) -> Option<(
     &'a xai_grok_announcements::RemoteAnnouncement,
     &'a str,
     &'a str,
 )> {
-    let owner = first_session_announcement(announcements, hidden_ids).filter(|a| is_promo(a))?;
-    let (label, url) = usable_cta(owner)?;
-    Some((owner, label, url))
+    None
 }
 
 /// The `[label]` button's target: the promo owner + its validated url. The
@@ -327,10 +256,8 @@ pub fn promo_cta_target<'a>(
     promo_cta(announcements, hidden_ids).map(|(owner, _label, url)| (owner, url))
 }
 
-/// Hide keys of every live (non-expired) session-surfaced announcement
-/// (critical or promo) — the set `/announcements show` clears, matching the
-/// selection's meaning of visible; prune owns cleanup of keys for
-/// expired-but-still-listed items.
+/// Hide keys of every live (non-expired) critical notice. Promotional remote
+/// state is not exposed through the passive announcement controls.
 pub fn session_announcement_hide_keys(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
 ) -> Vec<String> {
@@ -344,35 +271,31 @@ pub fn session_announcement_hide_keys_at(
 ) -> Vec<String> {
     visible_announcements(announcements)
         .into_iter()
-        .filter(|a| is_live_session_announcement(a, now))
+        .filter(|a| is_live_critical(a, now))
         .map(xai_grok_announcements::announcement_hide_key)
         .collect()
 }
 
-/// Slash-gate predicate: any live session-surfaced announcement (critical or
-/// promo) exists, deliberately IGNORING the hidden set (unlike the banner
-/// selection above) so `/announcements show` stays reachable while
-/// everything is hidden.
+/// Slash-gate predicate for live critical notices. This keeps operational
+/// `/announcements hide|show` controls while preventing promo-only state from
+/// creating a passive command/banner entry point.
 pub fn has_session_announcements(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
 ) -> bool {
     let now = chrono::Utc::now();
     visible_announcements(announcements)
         .into_iter()
-        .any(|a| is_live_session_announcement(a, now))
+        .any(|a| is_live_critical(a, now))
 }
 
-/// Height for the session banner (0 when the selection is empty): 2 when a
-/// critical is shown (title row + message row), 1 for the single promo row.
-/// Derived from [`first_session_announcement`] so slot precedence lives in
-/// exactly one function.
+/// Height for the session banner: 0 when no critical is selected, otherwise
+/// two rows for the title and message.
 pub fn session_banner_height(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
     hidden_ids: &BTreeSet<String>,
 ) -> u16 {
     match first_session_announcement(announcements, hidden_ids) {
-        Some(a) if is_critical(a) => 2,
-        Some(_) => 1,
+        Some(_) => 2,
         None => 0,
     }
 }
@@ -382,7 +305,8 @@ pub fn session_banner_height(
 pub struct BannerHits {
     /// The `[hide]` button.
     pub hide: Option<Rect>,
-    /// The promo `[label]` CTA button (critical rows never paint one).
+    /// Promotional CTA buttons are disabled; this remains for the shared hit
+    /// structure used by the agent renderer.
     pub cta: Option<Rect>,
 }
 
@@ -429,12 +353,11 @@ fn paint_hide_button(
 }
 
 /// Session top banner: paints the [`first_session_announcement`] selection
-/// (slot precedence lives there alone) with the severity-matched painter.
+/// (slot precedence lives there alone) with the critical-notice painter.
 ///
-/// `caption_allowed` gates the promo row's dim `cta.caption`: the caller
-/// passes `false` while a permission prompt owns `Ctrl+O` (it toggles YOLO
-/// there, so advertising the CTA open would be a mislabeled control). The
-/// `[label]` button + its mouse/OSC 8 open are unaffected.
+/// The CTA arguments remain in the shared signature for callers that also
+/// render the banner's functional hide affordance, but passive promotional
+/// CTAs are never selected and therefore cannot reach this painter.
 ///
 /// Returns the painted clickable rects so the caller can hit-test mouse
 /// clicks against them.
@@ -444,15 +367,14 @@ pub fn render_banner(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
     hidden_ids: &BTreeSet<String>,
     hide_hovered: bool,
-    cta_hovered: bool,
-    caption_allowed: bool,
+    _cta_hovered: bool,
+    _caption_allowed: bool,
 ) -> BannerHits {
     if area.height == 0 || area.width == 0 {
         return BannerHits::default();
     }
     match first_session_announcement(announcements, hidden_ids) {
-        Some(a) if is_critical(a) => render_critical_rows(area, buf, a, hide_hovered),
-        Some(a) => render_promo_row(area, buf, a, hide_hovered, cta_hovered, caption_allowed),
+        Some(a) => render_critical_rows(area, buf, a, hide_hovered),
         None => BannerHits::default(),
     }
 }
@@ -816,7 +738,7 @@ mod tests {
     }
 
     /// Show's clear set matches the selection's meaning of visible: live
-    /// (non-expired) criticals and promos only — expired keys are prune's job.
+    /// (non-expired) criticals only — expired keys and promos are not exposed.
     #[test]
     fn session_hide_keys_cover_live_criticals_and_promos_only() {
         let mut expired_promo = promo("promo-expired", "gone promo", None);
@@ -856,9 +778,8 @@ mod tests {
             vec![
                 "crit-1".to_string(),
                 "content:T\u{1f}two".to_string(),
-                "promo-1".to_string(),
             ],
-            "expired keys must not be cleared by show; live promo keys must be"
+            "expired keys and passive promo keys must not be cleared by show"
         );
     }
 
@@ -888,6 +809,38 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(session_banner_height(&with_title, &no_hidden()), 2);
+    }
+
+    #[test]
+    fn passive_promo_cta_is_not_selected_or_drawn() {
+        let announcements = [promo(
+            "promo",
+            "Upgrade to SuperGrok",
+            Some(("Upgrade", "https://grok.com/upgrade")),
+        )];
+        let area = Rect::new(0, 0, 60, 2);
+        let mut buf = Buffer::empty(area);
+
+        assert!(first_session_announcement(&announcements, &no_hidden()).is_none());
+        assert_eq!(session_banner_height(&announcements, &no_hidden()), 0);
+        assert!(!has_session_announcements(&announcements));
+        assert!(promo_cta_target(&announcements, &no_hidden()).is_none());
+
+        let hits = render_banner(
+            area,
+            &mut buf,
+            &announcements,
+            &no_hidden(),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(hits, BannerHits::default());
+        let rendered: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter_map(|pos| buf.cell(pos).map(|cell| cell.symbol().to_string()))
+            .collect();
+        assert!(!rendered.contains("Upgrade"), "passive promo leaked: {rendered:?}");
     }
 
     fn buf_row(buf: &Buffer, area: Rect, y: u16) -> String {
@@ -1065,6 +1018,7 @@ mod tests {
 
     /// Promo selection mirrors the critical gate: severity filter, hidden
     /// skip-reveals-next, and the slash gate stays hidden-agnostic.
+    #[cfg(any())]
     #[test]
     fn first_promo_selection_filters_severity_and_hidden() {
         let list = vec![
@@ -1100,6 +1054,7 @@ mod tests {
     }
 
     /// Draw-time expiry for promo, via the same injectable clock seam.
+    #[cfg(any())]
     #[test]
     fn first_promo_session_announcement_at_skips_expired() {
         let mut expiring = promo("p-exp", "expiring", None);
@@ -1125,6 +1080,7 @@ mod tests {
 
     /// Critical always wins the single banner slot, regardless of list order;
     /// hiding the critical hands the slot to the promo.
+    #[cfg(any())]
     #[test]
     fn first_session_announcement_prefers_critical_over_promo() {
         let list = vec![
@@ -1155,6 +1111,7 @@ mod tests {
     /// `dismissible: false` stays selectable with its hide key stored (a
     /// server-side flag flip resurrects a previously-hidden banner), while
     /// absent/`true` keep today's hidden behavior.
+    #[cfg(any())]
     #[test]
     fn non_dismissible_selected_despite_stored_hide_key() {
         let mut crit = RemoteAnnouncement {
@@ -1222,6 +1179,7 @@ mod tests {
     /// configured and `caption_allowed` (suppressed while a permission prompt
     /// owns the chord); no configured caption = bare button. The hit-rect
     /// stays the button only (the caption is not clickable).
+    #[cfg(any())]
     #[test]
     fn render_promo_row_non_dismissible_shows_configured_caption() {
         let mut ann = promo("p", &"M".repeat(60), Some(("Go", "https://x.ai")));
@@ -1275,6 +1233,7 @@ mod tests {
 
     /// `promo_cta_target` requires BOTH trimmed-non-empty label and url — a
     /// partial CTA never produces an openable target (or a painted button).
+    #[cfg(any())]
     #[test]
     fn promo_cta_target_requires_usable_pair() {
         let full = vec![promo("p", "msg", Some(("Go", " https://x.ai/promo ")))];
@@ -1304,6 +1263,7 @@ mod tests {
     /// `usable_cta_caption` is trim-nonempty of `cta.caption` and deliberately
     /// independent of CTA validity — but an unusable CTA paints no button, so
     /// its caption can never surface on the promo row either.
+    #[cfg(any())]
     #[test]
     fn usable_cta_caption_trims_and_never_resurrects_unusable_cta() {
         let mut p = promo("p", "msg", Some(("Go", "https://x.ai")));
@@ -1348,6 +1308,7 @@ mod tests {
     /// `promo_cta` projects the owner + validated `(label, url)` all surfaces
     /// paint from; `is_dismissible(owner)` distinguishes the pinned (Ctrl+O)
     /// promo from a dismissible one.
+    #[cfg(any())]
     #[test]
     fn promo_cta_returns_label_and_pinned_flag() {
         let mut pinned = promo("p", "msg", Some(("Upgrade Account", "https://x.ai/promo")));
@@ -1437,6 +1398,7 @@ mod tests {
     /// gate, so a live critical owning the slot yields no target (a click
     /// through a stale prior-frame rect must not open the promo URL) — and
     /// the promo resolves again once the critical is hidden or expired.
+    #[cfg(any())]
     #[test]
     fn promo_cta_target_yields_to_critical_slot_owner() {
         let promo_ann = promo("p", "upsell", Some(("Go", "https://x.ai/promo")));
@@ -1473,6 +1435,7 @@ mod tests {
     /// The one CTA gate fails closed on schemes outside the Standard open
     /// allowlist: no painted button, no OSC 8 target, no dispatch url — the
     /// promo renders no button (its message is never painted on the banner).
+    #[cfg(any())]
     #[test]
     fn usable_cta_rejects_unsafe_schemes() {
         for bad in [
@@ -1507,6 +1470,7 @@ mod tests {
     /// NO caption even when one is configured (dismissible keeps `Ctrl+O` on
     /// YOLO, so the caption is pinned-only regardless of `caption_allowed`),
     /// hide affordances right-aligned; rects for both buttons.
+    #[cfg(any())]
     #[test]
     fn render_promo_row_button_and_hide_affordances() {
         let mut ann = promo(
@@ -1549,6 +1513,7 @@ mod tests {
         assert!(hide_cta.modifier.contains(Modifier::DIM), "hide CTA dim");
     }
 
+    #[cfg(any())]
     #[test]
     fn render_promo_row_hover_styles() {
         let anns = [promo("p", "msg", Some(("Go", "https://x.ai")))];
@@ -1573,6 +1538,7 @@ mod tests {
     /// Reservation-first budget: the hide affordances keep their full width and
     /// only the `[Label]` button truncates when the row is tight (dismissible
     /// promo, width 50: hide block 25+2+6 reserved → ~15 cols for the button).
+    #[cfg(any())]
     #[test]
     fn render_promo_row_truncates_button_never_affordances() {
         let anns = [promo(
@@ -1600,6 +1566,7 @@ mod tests {
 
     /// No usable CTA → no button and no cta rect; the message is not painted on
     /// the banner, so a dismissible promo shows only its hide affordances.
+    #[cfg(any())]
     #[test]
     fn render_promo_row_without_cta_paints_no_button() {
         let anns = [promo("p", "Plain promo message", None)];
@@ -1616,6 +1583,7 @@ mod tests {
 
     /// Degenerate width: the hide CTA text is skipped whole (redundant with
     /// [hide]) instead of painting a clipped fragment; nothing panics.
+    #[cfg(any())]
     #[test]
     fn render_promo_row_narrow_width_drops_hide_cta_text() {
         let anns = [promo("p", "msg body", Some(("Go", "https://x.ai")))];

@@ -1257,7 +1257,7 @@ impl AgentView {
             .registry_mut()
             .set_dashboard_visible(visible);
     }
-    /// Offer `/announcements` when session announcements (critical or promo) exist.
+    /// Offer `/announcements` when a live critical session announcement exists.
     pub fn set_has_session_announcements(&mut self, has: bool) {
         self.prompt
             .slash_controller
