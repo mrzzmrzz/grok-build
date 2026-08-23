@@ -1101,6 +1101,14 @@ pub struct ProviderProfile {
     pub prompt_cache_headers: bool,
 }
 
+/// xAI is the default so configs serialized before the profile existed keep
+/// their transport behavior on deserialize.
+impl Default for ProviderProfile {
+    fn default() -> Self {
+        Self::XAI
+    }
+}
+
 impl ProviderProfile {
     pub const XAI: Self = Self {
         provider: ModelProvider::Xai,

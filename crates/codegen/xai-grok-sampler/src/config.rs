@@ -9,7 +9,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
+    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ProviderProfile,
+    ReasoningEffort,
 };
 
 use crate::attribution::SharedAttributionCallback;
@@ -54,6 +55,11 @@ pub struct SamplerConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    /// Provider transport policy (header sets, Responses dialect). The shell
+    /// selects it from model metadata; the sampler only reads it. Defaults to
+    /// xAI so configs serialized before the field existed are unchanged.
+    #[serde(default)]
+    pub provider_profile: ProviderProfile,
     #[serde(default)]
     pub auth_scheme: AuthScheme,
     /// Extra request headers applied verbatim. The sampler never inspects
@@ -148,6 +154,7 @@ impl Default for SamplerConfig {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider_profile: ProviderProfile::default(),
             auth_scheme: AuthScheme::default(),
             extra_headers: IndexMap::new(),
             extra_response_includes: Vec::new(),
@@ -175,9 +182,31 @@ impl Default for SamplerConfig {
     }
 }
 
+/// One credential snapshot: bearer plus the account facts that must come
+/// from the same read. Providers that scope requests to an account (Codex)
+/// return `account_id`/`fedramp` alongside the token so the pair can never
+/// be sourced from two different credential generations.
+#[derive(Clone, Debug)]
+pub struct ResolvedBearerAuth {
+    pub bearer: String,
+    pub account_id: Option<String>,
+    pub fedramp: bool,
+}
+
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
+
+    /// Bearer + same-source account facts. The default synthesizes from
+    /// [`Self::current_bearer`] with no account scoping, so bearer-only
+    /// resolvers need no changes.
+    fn resolve_auth(&self) -> Option<ResolvedBearerAuth> {
+        self.current_bearer().map(|bearer| ResolvedBearerAuth {
+            bearer,
+            account_id: None,
+            fedramp: false,
+        })
+    }
 }
 
 pub type SharedBearerResolver = std::sync::Arc<dyn BearerResolver>;
@@ -259,5 +288,23 @@ mod tests {
             round_tripped.doom_loop_recovery,
             with_policy.doom_loop_recovery
         );
+    }
+
+    /// Configs serialized before `provider_profile` existed must deserialize
+    /// to the xAI profile; a Codex profile must round-trip.
+    #[test]
+    fn config_without_provider_profile_deserializes_to_xai() {
+        let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();
+        stripped.as_object_mut().unwrap().remove("provider_profile");
+        let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
+        assert_eq!(config.provider_profile, ProviderProfile::XAI);
+
+        let codex = SamplerConfig {
+            provider_profile: ProviderProfile::CODEX,
+            ..Default::default()
+        };
+        let round_tripped: SamplerConfig =
+            serde_json::from_value(serde_json::to_value(&codex).unwrap()).unwrap();
+        assert_eq!(round_tripped.provider_profile, ProviderProfile::CODEX);
     }
 }

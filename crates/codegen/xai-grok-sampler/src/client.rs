@@ -34,6 +34,7 @@ use xai_grok_sampling_types::{
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
 use xai_grok_auth::bearer_suffix;
+use xai_grok_sampling_types::{ModelProvider, ProviderProfile};
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -58,7 +59,16 @@ struct GrokRequestHeaders<'a> {
 }
 
 impl GrokRequestHeaders<'_> {
-    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// No-op for profiles that don't speak the `x-grok-*` header dialect
+    /// (Codex): those requests must carry no xAI request metadata.
+    fn apply(
+        &self,
+        builder: reqwest::RequestBuilder,
+        profile: ProviderProfile,
+    ) -> reqwest::RequestBuilder {
+        if !profile.sends_x_grok_headers {
+            return builder;
+        }
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
             .header("x-grok-req-id", self.req_id)
@@ -393,6 +403,7 @@ struct ClientDefaults {
     temperature: Option<f32>,
     top_p: Option<f32>,
     api_backend: ApiBackend,
+    provider_profile: ProviderProfile,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     extra_response_includes: Vec<String>,
@@ -621,41 +632,56 @@ impl SamplingClient {
             &mut headers,
         );
 
-        // Add x-grok-client-version header for version gating at the proxy.
-        if let Some(client_version) = config.client_version.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(client_version)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-client-version"),
-                header_value,
-            );
-        }
-
-        if let Some(deployment_id) = config.deployment_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(deployment_id)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-deployment-id"),
-                header_value,
-            );
-        }
-
-        if let Some(user_id) = config.user_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(user_id)
-        {
-            headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
-        }
-
-        {
-            let client_id = config
-                .client_identifier
-                .clone()
-                .unwrap_or_else(|| DEFAULT_CLIENT_IDENTIFIER.to_string());
-            if let Ok(header_value) = HeaderValue::from_str(&client_id) {
+        if config.provider_profile.sends_x_grok_headers {
+            // Add x-grok-client-version header for version gating at the proxy.
+            if let Some(client_version) = config.client_version.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(client_version)
+            {
                 headers.insert(
-                    HeaderName::from_static("x-grok-client-identifier"),
+                    HeaderName::from_static("x-grok-client-version"),
                     header_value,
                 );
+            }
+
+            if let Some(deployment_id) = config.deployment_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(deployment_id)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-deployment-id"),
+                    header_value,
+                );
+            }
+
+            if let Some(user_id) = config.user_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(user_id)
+            {
+                headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
+            }
+
+            {
+                let client_id = config
+                    .client_identifier
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_CLIENT_IDENTIFIER.to_string());
+                if let Ok(header_value) = HeaderValue::from_str(&client_id) {
+                    headers.insert(
+                        HeaderName::from_static("x-grok-client-identifier"),
+                        header_value,
+                    );
+                }
+            }
+        } else {
+            // A non-xAI profile must put no `x-grok-*` header on the wire.
+            // This also drops config-supplied entries (extra/env headers),
+            // including the shell's internal `x-grok-build-codex-*` identity
+            // anchors, which exist only for in-process credential pinning.
+            let grok_named: Vec<HeaderName> = headers
+                .keys()
+                .filter(|name| name.as_str().starts_with("x-grok"))
+                .cloned()
+                .collect();
+            for name in grok_named {
+                headers.remove(name);
             }
         }
 
@@ -702,6 +728,7 @@ impl SamplingClient {
             temperature: config.temperature,
             top_p: config.top_p,
             api_backend: config.api_backend,
+            provider_profile: config.provider_profile,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
             extra_response_includes: config.extra_response_includes,
@@ -740,17 +767,36 @@ impl SamplingClient {
         if let Some(resolver) = &self.bearer_resolver {
             headers.remove(AUTHORIZATION);
             headers.remove(HeaderName::from_static("x-api-key"));
-            if let Some(fresh) = resolver.current_bearer() {
+            headers.remove(HeaderName::from_static("chatgpt-account-id"));
+            headers.remove(HeaderName::from_static("x-openai-fedramp"));
+            if let Some(auth) = resolver.resolve_auth() {
                 match self.defaults.auth_scheme {
                     AuthScheme::XApiKey => {
-                        if let Ok(v) = HeaderValue::from_str(&fresh) {
+                        if let Ok(v) = HeaderValue::from_str(&auth.bearer) {
                             headers.insert(HeaderName::from_static("x-api-key"), v);
                         }
                     }
                     AuthScheme::Bearer => {
-                        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {fresh}")) {
+                        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", auth.bearer)) {
                             headers.insert(AUTHORIZATION, v);
                         }
+                    }
+                }
+                // Account scoping rides the same snapshot as the bearer so a
+                // credential rotation can never pair a token with another
+                // account's id. Codex-only: xAI requests carry no account
+                // headers even if a resolver reports them.
+                if self.defaults.provider_profile.provider == ModelProvider::Codex {
+                    if let Some(account_id) = auth.account_id.as_deref()
+                        && let Ok(v) = HeaderValue::from_str(account_id)
+                    {
+                        headers.insert(HeaderName::from_static("chatgpt-account-id"), v);
+                    }
+                    if auth.fedramp {
+                        headers.insert(
+                            HeaderName::from_static("x-openai-fedramp"),
+                            HeaderValue::from_static("true"),
+                        );
                     }
                 }
             }
@@ -989,7 +1035,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers.apply(builder).json(&payload);
+        let http_request = grok_headers
+            .apply(builder, self.defaults.provider_profile)
+            .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -1050,7 +1098,7 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
         let http_request = grok_headers
-            .apply(builder)
+            .apply(builder, self.defaults.provider_profile)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1272,7 +1320,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder).json(&request_body);
+        let http_request = grok_headers
+            .apply(builder, self.defaults.provider_profile)
+            .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1415,9 +1465,14 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("responses"));
         let mut http_request = grok_headers
-            .apply(builder)
+            .apply(builder, self.defaults.provider_profile)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        if let Some(policy) = self.defaults.doom_loop_recovery {
+        // The opt-in header is x-grok-*; a non-xAI profile must not send it
+        // (the collector stays armed so a misbehaving server's check events
+        // are still absorbed rather than breaking typed decode).
+        if let Some(policy) = self.defaults.doom_loop_recovery
+            && self.defaults.provider_profile.sends_x_grok_headers
+        {
             http_request =
                 http_request.header(DOOM_LOOP_CHECK_HEADER, policy.window_tokens.to_string());
         }
@@ -1620,7 +1675,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("messages"));
-        let http_request = grok_headers.apply(builder).json(&request.inner);
+        let http_request = grok_headers
+            .apply(builder, self.defaults.provider_profile)
+            .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1735,7 +1792,7 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("messages"));
         let http_request = grok_headers
-            .apply(builder)
+            .apply(builder, self.defaults.provider_profile)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -2236,6 +2293,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            provider_profile: Default::default(),
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             extra_response_includes: Vec::new(),
