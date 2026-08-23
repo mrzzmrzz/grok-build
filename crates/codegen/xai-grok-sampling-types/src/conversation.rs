@@ -12,6 +12,7 @@ pub use chat_completions::{conversation_item_to_chat_message, conversation_to_ch
 pub use messages::build_messages_request;
 pub use responses::{
     extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,
+    response_to_conversation_items_with_client_custom_tools,
 };
 
 use std::sync::Arc;
@@ -517,6 +518,56 @@ pub struct ToolCall {
     pub arguments: Arc<str>,
 }
 
+const CUSTOM_TOOL_CALL_ID_PREFIX: &str = "custom_tool_call:";
+
+fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
+    Arc::<str>::from(format!(
+        "{CUSTOM_TOOL_CALL_ID_PREFIX}{call_id}:{item_id}"
+    ))
+}
+
+fn decode_custom_tool_call_id(id: &str) -> Option<(&str, &str)> {
+    let encoded = id.strip_prefix(CUSTOM_TOOL_CALL_ID_PREFIX)?;
+    encoded.split_once(':')
+}
+
+impl ToolCall {
+    /// Construct a native Responses custom-tool call without changing the
+    /// stable three-field persistence shape used by existing function calls.
+    pub fn custom(
+        call_id: impl AsRef<str>,
+        item_id: impl AsRef<str>,
+        name: impl Into<String>,
+        input: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            id: encode_custom_tool_call_id(call_id.as_ref(), item_id.as_ref()),
+            name: name.into(),
+            arguments: input.into(),
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        decode_custom_tool_call_id(&self.id).is_some()
+    }
+
+    /// Provider call id for either a custom or ordinary function call.
+    pub fn call_id(&self) -> &str {
+        decode_custom_tool_call_id(&self.id)
+            .map_or(self.id.as_ref(), |(call_id, _)| call_id)
+    }
+
+    /// Responses output-item id for a native custom call.
+    pub fn custom_item_id(&self) -> Option<&str> {
+        decode_custom_tool_call_id(&self.id).map(|(_, item_id)| item_id)
+    }
+
+    /// Raw custom-tool input. Ordinary function arguments return `None`.
+    pub fn custom_input(&self) -> Option<&str> {
+        self.is_custom().then_some(self.arguments.as_ref())
+    }
+}
+
 /// Tool/function definition for the model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -529,10 +580,24 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Native Responses custom tool. Its input is free-form text rather than a
+/// JSON object, so it is kept separate from [`ToolSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CustomToolSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub format: rs::CustomToolParamFormat,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum HostedTool {
     WebSearch { options: Option<WebSearchOptions> },
     XSearch { options: Option<XSearchOptions> },
+    /// A client-executed native Responses custom tool, such as Code Mode's
+    /// free-form JavaScript `exec` tool.
+    ClientCustom(CustomToolSpec),
 }
 
 impl HostedTool {
@@ -540,6 +605,14 @@ impl HostedTool {
         match self {
             HostedTool::WebSearch { .. } => "web_search",
             HostedTool::XSearch { .. } => "x_search",
+            HostedTool::ClientCustom(_) => "",
+        }
+    }
+
+    pub fn client_custom_name(&self) -> Option<&str> {
+        match self {
+            HostedTool::ClientCustom(tool) => Some(tool.name.as_str()),
+            HostedTool::WebSearch { .. } | HostedTool::XSearch { .. } => None,
         }
     }
 }
@@ -572,6 +645,7 @@ pub fn apply_tool_overrides(
                 }
                 applied.web_search = drop_empty(options.clone(), WebSearchOptions::is_empty);
             }
+            HostedTool::ClientCustom(_) => {}
         }
     }
     applied
@@ -709,6 +783,8 @@ pub enum ConversationToolChoice {
     Required,
     /// Model must use a specific tool
     Function(String),
+    /// Model must use a specific native Responses custom tool
+    Custom(String),
 }
 
 // ============================================================================

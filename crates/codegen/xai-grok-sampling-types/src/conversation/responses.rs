@@ -6,6 +6,17 @@ use super::*;
 /// order. Replaying that order byte for byte on the next turn is what keeps
 /// the server-side prefix cache hot.
 pub fn response_to_conversation_items(response: rs::Response) -> Vec<ConversationItem> {
+    response_to_conversation_items_with_client_custom_tools(response, &[])
+}
+
+/// Convert a Responses response while distinguishing client-executed native
+/// custom tools from xAI's backend custom-tool carrier. The typed Responses
+/// dependency uses the same output item for both, so the declared client tool
+/// names are the narrow discriminator available at this boundary.
+pub fn response_to_conversation_items_with_client_custom_tools(
+    response: rs::Response,
+    client_custom_tool_names: &[String],
+) -> Vec<ConversationItem> {
     let model_id = response.model.clone();
     let model_fingerprint = response
         .metadata
@@ -57,10 +68,19 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
                 }));
             }
             rs::OutputItem::CustomToolCall(ct) => {
-                backend_tool_count += 1;
-                items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
-                    kind: BackendToolKind::XSearch(ct),
-                }));
+                if client_custom_tool_names.iter().any(|name| name == &ct.name) {
+                    tool_calls.push(ToolCall::custom(
+                        ct.call_id,
+                        ct.id,
+                        ct.name,
+                        ct.input,
+                    ));
+                } else {
+                    backend_tool_count += 1;
+                    items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                        kind: BackendToolKind::XSearch(ct),
+                    }));
+                }
             }
             rs::OutputItem::CodeInterpreterCall(ci) => {
                 backend_tool_count += 1;
@@ -107,6 +127,9 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             }
             ConversationToolChoice::Function(name) => {
                 rs::ToolChoiceParam::Function(rs::ToolChoiceFunction { name: name.clone() })
+            }
+            ConversationToolChoice::Custom(name) => {
+                rs::ToolChoiceParam::Custom(rs::ToolChoiceCustom { name: name.clone() })
             }
         });
 
@@ -233,21 +256,62 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
             }
 
             for tc in &a.tool_calls {
-                let arguments = sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
-                items.push(rs::InputItem::Item(rs::Item::FunctionCall(
-                    rs::FunctionToolCall {
-                        call_id: tc.id.as_ref().to_owned(),
-                        name: tc.name.clone(),
-                        arguments: arguments.as_ref().to_owned(),
-                        id: None,
-                        status: None,
-                    },
-                )));
+                if tc.is_custom() {
+                    let custom_call: rs::CustomToolCall = serde_json::from_value(
+                        serde_json::json!({
+                            "call_id": tc.call_id(),
+                            "input": tc.arguments.as_ref(),
+                            "name": tc.name,
+                            "id": tc.custom_item_id().unwrap_or(tc.call_id()),
+                        }),
+                    )
+                    .expect("native custom tool call fields must satisfy the Responses schema");
+                    items.push(rs::InputItem::Item(rs::Item::CustomToolCall(custom_call)));
+                } else {
+                    let arguments =
+                        sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
+                    items.push(rs::InputItem::Item(rs::Item::FunctionCall(
+                        rs::FunctionToolCall {
+                            call_id: tc.id.as_ref().to_owned(),
+                            name: tc.name.clone(),
+                            arguments: arguments.as_ref().to_owned(),
+                            id: None,
+                            status: None,
+                        },
+                    )));
+                }
             }
 
             items
         }
         ConversationItem::ToolResult(t) => {
+            if let Some((call_id, _)) = decode_custom_tool_call_id(&t.tool_call_id) {
+                let output = if t.images.is_empty() {
+                    rs::CustomToolCallOutputOutput::Text(t.content.as_ref().to_owned())
+                } else {
+                    let mut parts: Vec<rs::InputContent> =
+                        vec![rs::InputContent::InputText(rs::InputTextContent {
+                            text: t.content.as_ref().to_owned(),
+                        })];
+                    for img in &t.images {
+                        if let ContentPart::Image { url } = img {
+                            parts.push(rs::InputContent::InputImage(rs::InputImageContent {
+                                detail: rs::ImageDetail::Auto,
+                                file_id: None,
+                                image_url: Some(url.as_ref().to_owned()),
+                            }));
+                        }
+                    }
+                    rs::CustomToolCallOutputOutput::List(parts)
+                };
+                return vec![rs::InputItem::Item(rs::Item::CustomToolCallOutput(
+                    rs::CustomToolCallOutput {
+                        call_id: call_id.to_owned(),
+                        output,
+                        id: None,
+                    },
+                ))];
+            }
             let output = if t.images.is_empty() {
                 rs::FunctionCallOutput::Text(t.content.as_ref().to_owned())
             } else {
@@ -324,7 +388,10 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
         .tools
         .iter()
         .filter(|t| {
-            let collides = req.hosted_tools.iter().any(|h| h.wire_name() == t.name);
+            let collides = req.hosted_tools.iter().any(|h| {
+                h.wire_name() == t.name
+                    || h.client_custom_name() == Some(t.name.as_str())
+            });
             if collides {
                 tracing::warn!(
                     tool = %t.name,
@@ -367,6 +434,18 @@ pub fn extra_tool_entries(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value>
                     Some(o) => o.to_tool_entry(),
                     None => XSearchOptions::default().to_tool_entry(),
                 });
+            }
+            HostedTool::ClientCustom(tool) => {
+                let mut entry = serde_json::json!({
+                    "type": "custom",
+                    "name": tool.name,
+                    "format": serde_json::to_value(&tool.format)
+                        .expect("custom tool format must serialize"),
+                });
+                if let Some(description) = &tool.description {
+                    entry["description"] = serde_json::Value::String(description.clone());
+                }
+                entries.push(entry);
             }
         }
     }

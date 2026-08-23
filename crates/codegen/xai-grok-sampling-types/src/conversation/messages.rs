@@ -307,6 +307,8 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         ConversationToolChoice::Required => ToolChoiceParam::Any,
         ConversationToolChoice::Function(name) => ToolChoiceParam::Tool { name: name.clone() },
         ConversationToolChoice::None => ToolChoiceParam::Auto, // default
+        // Native custom tools are a Responses-only wire feature.
+        ConversationToolChoice::Custom(_) => ToolChoiceParam::Auto,
     });
 
     let effort = req

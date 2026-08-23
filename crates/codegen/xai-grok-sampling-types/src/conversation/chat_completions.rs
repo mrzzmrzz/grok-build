@@ -274,6 +274,8 @@ impl From<ConversationRequest> for ChatCompletionRequest {
                 ConversationToolChoice::None => ToolChoice::none(),
                 ConversationToolChoice::Required => ToolChoice::required(),
                 ConversationToolChoice::Function(name) => ToolChoice::function(name),
+                // Native custom tools are a Responses-only wire feature.
+                ConversationToolChoice::Custom(_) => ToolChoice::auto(),
             });
 
         let response_format = req

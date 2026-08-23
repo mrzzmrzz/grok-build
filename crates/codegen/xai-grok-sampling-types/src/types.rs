@@ -773,6 +773,31 @@ pub enum ReasoningEffort {
     Max,
 }
 
+/// Detail level requested for Responses reasoning summaries.
+///
+/// `None` is a local sentinel: the field is omitted instead of sending the
+/// literal string `"none"` to Codex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    #[default]
+    Detailed,
+    None,
+}
+
+impl ReasoningSummary {
+    pub const fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => Some("auto"),
+            Self::Concise => Some("concise"),
+            Self::Detailed => Some("detailed"),
+            Self::None => None,
+        }
+    }
+}
+
 impl ReasoningEffort {
     pub fn to_responses_api(self) -> crate::rs::ReasoningEffort {
         match self {
@@ -1033,6 +1058,84 @@ impl ApiBackend {
     /// [`ConversationRequest::prompt_cache_key`]: crate::conversation::ConversationRequest::prompt_cache_key
     pub fn forwards_prompt_cache_key(&self) -> bool {
         matches!(self, Self::Responses)
+    }
+}
+
+/// Explicit provider identity for transport policy.
+///
+/// This is intentionally separate from [`ApiBackend`]. Both xAI and Codex
+/// use a Responses-shaped API, but their headers, request metadata, and
+/// replay contracts are different. Callers must select this identity from
+/// model metadata rather than infer it from a model slug or URL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProvider {
+    #[default]
+    Xai,
+    Codex,
+}
+
+/// Provider-specific Responses wire dialect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesDialect {
+    Xai,
+    Codex,
+}
+
+/// Native representation used for client-executed Code Mode tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeTransport {
+    FunctionEnvelope,
+    NativeCustomGrammar,
+}
+
+/// Provider policy for request metadata and Responses behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub provider: ModelProvider,
+    pub responses: Option<ResponsesDialect>,
+    pub code_mode_transport: CodeModeTransport,
+    pub sends_x_grok_headers: bool,
+    pub prompt_cache_headers: bool,
+}
+
+impl ProviderProfile {
+    pub const XAI: Self = Self {
+        provider: ModelProvider::Xai,
+        responses: Some(ResponsesDialect::Xai),
+        code_mode_transport: CodeModeTransport::FunctionEnvelope,
+        sends_x_grok_headers: true,
+        prompt_cache_headers: false,
+    };
+
+    pub const CODEX: Self = Self {
+        provider: ModelProvider::Codex,
+        responses: Some(ResponsesDialect::Codex),
+        code_mode_transport: CodeModeTransport::NativeCustomGrammar,
+        sends_x_grok_headers: false,
+        prompt_cache_headers: true,
+    };
+
+    pub const fn for_provider(provider: ModelProvider) -> Self {
+        match provider {
+            ModelProvider::Xai => Self::XAI,
+            ModelProvider::Codex => Self::CODEX,
+        }
+    }
+
+    pub const fn supports_backend(self, backend: &ApiBackend) -> bool {
+        match self.provider {
+            ModelProvider::Xai => true,
+            ModelProvider::Codex => matches!(backend, ApiBackend::Responses),
+        }
+    }
+}
+
+impl ModelProvider {
+    pub const fn profile(self) -> ProviderProfile {
+        ProviderProfile::for_provider(self)
     }
 }
 

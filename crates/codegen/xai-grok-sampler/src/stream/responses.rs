@@ -3,7 +3,7 @@
 //! Consumes a raw `rs::ResponseStreamEvent` stream and produces
 //! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -93,6 +93,16 @@ pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamE
 pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -> bool {
     !matches!(event, rs::ResponseStreamEvent::ResponseError(_))
         && responses_event_has_meaningful_content(event)
+}
+
+fn missing_tool_input_suffix(streamed: &mut String, complete: &str) -> Option<String> {
+    let suffix = complete.strip_prefix(streamed.as_str())?;
+    if suffix.is_empty() {
+        return None;
+    }
+    let suffix = suffix.to_owned();
+    streamed.push_str(&suffix);
+    Some(suffix)
 }
 
 /// Copy everything the Doom-loop capture needs out of a frame.
@@ -206,7 +216,28 @@ pub fn stream_responses<'a>(
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
-    stream_responses_tracked(
+    stream_responses_with_client_custom_tools(
+        raw_stream,
+        model_metadata,
+        request_id,
+        idle_timeout,
+        doom_loop,
+        Vec::new(),
+    )
+}
+
+/// Responses stream transform with the names of client-executed native
+/// custom tools. An unlisted `CustomToolCall` remains the xAI hosted-search
+/// carrier used by the official grok backend.
+pub fn stream_responses_with_client_custom_tools<'a>(
+    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+    model_metadata: Option<ResponseModelMetadata>,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+    client_custom_tool_names: Vec<String>,
+) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+    stream_responses_tracked_with_client_custom_tools(
         raw_stream,
         model_metadata,
         request_id,
@@ -214,6 +245,7 @@ pub fn stream_responses<'a>(
         doom_loop,
         Arc::new(AtomicBool::new(false)),
         FailedResponseCapture::default(),
+        client_custom_tool_names,
     )
 }
 
@@ -225,6 +257,28 @@ pub(crate) fn stream_responses_tracked<'a>(
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     output_observed: Arc<AtomicBool>,
     failed_response: FailedResponseCapture,
+) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+    stream_responses_tracked_with_client_custom_tools(
+        raw_stream,
+        model_metadata,
+        request_id,
+        idle_timeout,
+        doom_loop,
+        output_observed,
+        failed_response,
+        Vec::new(),
+    )
+}
+
+pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
+    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+    model_metadata: Option<ResponseModelMetadata>,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
+    output_observed: Arc<AtomicBool>,
+    failed_response: FailedResponseCapture,
+    client_custom_tool_names: Vec<String>,
 ) -> impl Stream<Item = SamplingEvent> + Send + 'a {
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
@@ -256,6 +310,8 @@ pub(crate) fn stream_responses_tracked<'a>(
         // later `ResponseFunctionCallArgumentsDelta` events
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut custom_input_streamed: BTreeMap<u32, String> = BTreeMap::new();
+        let mut arguments_complete_emitted: BTreeSet<u32> = BTreeSet::new();
         let mut next_tool_index: u32 = 0;
 
         let mut stream = raw_stream;
@@ -388,18 +444,44 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // Start of a Responses FunctionCall — emit initial id+name
                 // and remember the output_index → tool_index mapping.
                 ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
-                    if let rs::OutputItem::FunctionCall(fc) = added_event.item {
-                        let tool_index = next_tool_index;
-                        next_tool_index += 1;
-                        output_to_tool_index.insert(added_event.output_index, tool_index);
+                    match added_event.item {
+                        rs::OutputItem::FunctionCall(fc) => {
+                            let tool_index = next_tool_index;
+                            next_tool_index += 1;
+                            output_to_tool_index.insert(added_event.output_index, tool_index);
 
-                        yield SamplingEvent::ToolCallDelta {
-                            request_id: request_id.clone(),
-                            tool_index,
-                            id: Some(fc.call_id),
-                            name: Some(fc.name),
-                            arguments_delta: None,
-                        };
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: Some(fc.call_id),
+                                name: Some(fc.name),
+                                arguments_delta: None,
+                            };
+                        }
+                        rs::OutputItem::CustomToolCall(ct)
+                            if client_custom_tool_names.iter().any(|name| name == &ct.name) =>
+                        {
+                            let tool_index = next_tool_index;
+                            next_tool_index += 1;
+                            output_to_tool_index.insert(added_event.output_index, tool_index);
+                            custom_input_streamed
+                                .insert(added_event.output_index, ct.input.clone());
+                            let call = xai_grok_sampling_types::ToolCall::custom(
+                                &ct.call_id,
+                                &ct.id,
+                                &ct.name,
+                                ct.input.clone(),
+                            );
+
+                            yield SamplingEvent::ToolCallDelta {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: Some(call.id.as_ref().to_owned()),
+                                name: Some(ct.name),
+                                arguments_delta: (!ct.input.is_empty()).then_some(ct.input),
+                            };
+                        }
+                        _ => {}
                     }
                 }
 
@@ -411,6 +493,28 @@ pub(crate) fn stream_responses_tracked<'a>(
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&args_event.output_index)
                     {
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: None,
+                            name: None,
+                            arguments_delta: Some(delta),
+                        };
+                    }
+                }
+
+                // Native custom tools stream raw text rather than JSON args.
+                ResponseStreamEvent::ResponseCustomToolCallInputDelta(input_event) => {
+                    let delta = input_event.delta;
+                    if !delta.is_empty()
+                        && !arguments_complete_emitted.contains(&input_event.output_index)
+                        && let Some(&tool_index) =
+                            output_to_tool_index.get(&input_event.output_index)
+                    {
+                        custom_input_streamed
+                            .entry(input_event.output_index)
+                            .or_default()
+                            .push_str(&delta);
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -536,6 +640,35 @@ pub(crate) fn stream_responses_tracked<'a>(
                         // Use "x_search" consistently (matching the Started event);
                         // the specific sub-type is in the serialized result payload
                         // and extracted by the pager from raw_output.name.
+                        rs::OutputItem::CustomToolCall(ct)
+                            if client_custom_tool_names.iter().any(|name| name == &ct.name) =>
+                        {
+                            if let Some(&tool_index) =
+                                output_to_tool_index.get(&done_event.output_index)
+                                && arguments_complete_emitted.insert(done_event.output_index)
+                            {
+                                let streamed = custom_input_streamed
+                                    .entry(done_event.output_index)
+                                    .or_default();
+                                if let Some(arguments_delta) =
+                                    missing_tool_input_suffix(streamed, &ct.input)
+                                {
+                                    yield SamplingEvent::ToolCallDelta {
+                                        request_id: request_id.clone(),
+                                        tool_index,
+                                        id: None,
+                                        name: None,
+                                        arguments_delta: Some(arguments_delta),
+                                    };
+                                }
+                                yield SamplingEvent::ToolCallArgumentsComplete {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: Some(ct.call_id.clone()),
+                                    name: Some(ct.name.clone()),
+                                };
+                            }
+                        }
                         rs::OutputItem::CustomToolCall(ct) => {
                             let result = serde_json::to_value(ct).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
@@ -562,14 +695,41 @@ pub(crate) fn stream_responses_tracked<'a>(
                     }
                 }
 
-                // CustomToolCallInputDelta is x_search in-progress streaming.
-                // Emit a started event on first delta per item_id.
+                // A done event without a preceding delta still carries the
+                // complete custom input. Unlisted custom calls remain hosted
+                // x_search and use the backend lifecycle below.
                 ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
-                    yield SamplingEvent::BackendToolCallStarted {
-                        request_id: request_id.clone(),
-                        call_id: ev.item_id.clone(),
-                        name: "x_search".to_string(),
-                    };
+                    if let Some(&tool_index) = output_to_tool_index.get(&ev.output_index) {
+                        if !arguments_complete_emitted.contains(&ev.output_index) {
+                            let streamed = custom_input_streamed
+                                .entry(ev.output_index)
+                                .or_default();
+                            if let Some(arguments_delta) =
+                                missing_tool_input_suffix(streamed, &ev.input)
+                            {
+                                yield SamplingEvent::ToolCallDelta {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: None,
+                                    name: None,
+                                    arguments_delta: Some(arguments_delta),
+                                };
+                            }
+                            arguments_complete_emitted.insert(ev.output_index);
+                            yield SamplingEvent::ToolCallArgumentsComplete {
+                                request_id: request_id.clone(),
+                                tool_index,
+                                id: None,
+                                name: None,
+                            };
+                        }
+                    } else {
+                        yield SamplingEvent::BackendToolCallStarted {
+                            request_id: request_id.clone(),
+                            call_id: ev.item_id.clone(),
+                            name: "x_search".to_string(),
+                        };
+                    }
                 }
 
                 // All other events (intermediate progress, annotations,
@@ -651,7 +811,11 @@ pub(crate) fn stream_responses_tracked<'a>(
         // text as a fallback when the final response lacks `content` /
         // `summary` (the streaming deltas may have arrived out of band).
         // Splice policy lives in `inject_streaming_reasoning_fallback`.
-        let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        let mut items =
+            xai_grok_sampling_types::response_to_conversation_items_with_client_custom_tools(
+                response,
+                &client_custom_tool_names,
+            );
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {

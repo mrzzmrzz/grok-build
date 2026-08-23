@@ -2099,9 +2099,21 @@ impl SamplingClient {
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Responses => {
+                let client_custom_tool_names: Vec<String> = request
+                    .hosted_tools
+                    .iter()
+                    .filter_map(|tool| tool.client_custom_name().map(str::to_owned))
+                    .collect();
                 let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
                 let events =
-                    crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
+                    crate::stream::stream_responses_with_client_custom_tools(
+                        raw,
+                        meta,
+                        request_id,
+                        idle_timeout,
+                        doom_loop,
+                        client_custom_tool_names,
+                    );
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Messages => {

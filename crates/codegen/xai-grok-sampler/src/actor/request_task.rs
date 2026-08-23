@@ -30,7 +30,6 @@ use crate::metrics::InferenceLatencyStats;
 use crate::retry::{
     self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
 };
-use crate::stream::responses::stream_responses_tracked;
 use crate::stream::{stream_chat_completions, stream_messages};
 use crate::types::RequestId;
 
@@ -538,6 +537,12 @@ async fn run_one_attempt(
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
 ) -> AttemptOutcome {
+    let client_custom_tool_names: Vec<String> = request
+        .hosted_tools
+        .iter()
+        .filter_map(|tool| tool.client_custom_name().map(str::to_owned))
+        .collect();
+
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
             let (raw, metadata) = match client.conversation_stream(request).await {
@@ -577,7 +582,7 @@ async fn run_one_attempt(
             } else {
                 FailedResponseCapture::default()
             };
-            let l2 = stream_responses_tracked(
+            let l2 = crate::stream::responses::stream_responses_tracked_with_client_custom_tools(
                 teed,
                 metadata,
                 request_id.clone(),
@@ -585,6 +590,7 @@ async fn run_one_attempt(
                 doom_loop,
                 Arc::clone(&output_observed),
                 failed_response.clone(),
+                client_custom_tool_names,
             );
             drive_l2(
                 l2,
