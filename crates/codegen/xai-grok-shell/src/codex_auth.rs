@@ -1064,6 +1064,11 @@ async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
         }
     }
     let _lock = acquire_auth_lock(path)?;
+    // Logout invalidates the whole account association, so the account-scoped
+    // model catalog cache beside the auth store must go too. Like revocation,
+    // this is best-effort: a failed cache delete never blocks credential
+    // removal.
+    remove_models_cache_beside(path);
     let removed = match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -1071,6 +1076,21 @@ async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
     };
     clear_permanent_refresh_failure(path);
     Ok(removed)
+}
+
+/// Best-effort removal of the Codex model catalog cache stored in the same
+/// directory as the given auth store path.
+fn remove_models_cache_beside(auth_path: &Path) {
+    let cache_path = auth_path.with_file_name(crate::codex_models::CODEX_MODELS_CACHE_FILE);
+    match std::fs::remove_file(&cache_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %cache_path.display(),
+            %error,
+            "Codex models cache could not be removed during logout"
+        ),
+    }
 }
 
 pub async fn fetch_usage() -> Result<CodexUsageSnapshot> {
@@ -1540,6 +1560,62 @@ mod tests {
 
         assert!(removed);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn logout_removes_models_cache_alongside_auth_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let cache_path = dir.path().join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
+        // A tokenless store keeps logout offline: nothing to revoke.
+        let store = CodexAuthStore {
+            auth_mode: Some("chatgpt".to_owned()),
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        };
+        save_store_at(&path, &store).unwrap();
+        std::fs::write(&cache_path, b"{\"models\": []}").unwrap();
+
+        let removed = logout_at(&path, &CodexEndpoints::default()).await.unwrap();
+
+        assert!(removed);
+        assert!(!path.exists());
+        assert!(
+            !cache_path.exists(),
+            "logout must not leave the account-scoped model catalog cache behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_succeeds_when_models_cache_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let store = CodexAuthStore {
+            auth_mode: Some("chatgpt".to_owned()),
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        };
+        save_store_at(&path, &store).unwrap();
+
+        let removed = logout_at(&path, &CodexEndpoints::default()).await.unwrap();
+
+        assert!(removed);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn logout_without_auth_store_still_removes_models_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let cache_path = dir.path().join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
+        std::fs::write(&cache_path, b"{\"models\": []}").unwrap();
+
+        let removed = logout_at(&path, &CodexEndpoints::default()).await.unwrap();
+
+        assert!(!removed, "no auth store means nothing was logged out");
+        assert!(!cache_path.exists());
     }
 
     #[test]

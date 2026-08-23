@@ -9,7 +9,7 @@ use crate::codex_auth::{self, CODEX_INFERENCE_BASE_URL, CODEX_ORIGINATOR, CodexC
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::header::{ETAG, USER_AGENT};
+use reqwest::header::{ETAG, IF_NONE_MATCH, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -250,24 +250,57 @@ impl CodexModelsClient {
     }
 
     /// Fetch a live catalog, retrying once after a Codex-only 401 refresh.
+    ///
+    /// A matching cached catalog with an ETag turns this into a conditional
+    /// request; a 304 revalidates the cache and extends its TTL without
+    /// re-parsing a body.
     pub async fn fetch_and_cache(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
         let Some(mut credentials) = self.auth.fresh_credentials().await? else {
             return Ok(None);
         };
+        // Freshness is irrelevant here: even a stale cache may be revalidated,
+        // but only one recorded for this exact endpoint, version pair, and
+        // account fingerprint.
+        let cached = self.load_matching_cache(&credentials);
 
-        let catalog = match self.fetch_once(&credentials).await {
-            Ok(catalog) => catalog,
+        let outcome = match self
+            .fetch_once(
+                &credentials,
+                revalidation_etag(cached.as_ref(), &credentials).as_deref(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
             Err(CodexModelsRequestError::Unauthorized) => {
                 credentials = self
                     .auth
                     .force_refresh()
                     .await?
                     .ok_or_else(|| anyhow!("Codex login is no longer available"))?;
-                self.fetch_once(&credentials)
-                    .await
-                    .map_err(CodexModelsRequestError::into_anyhow)?
+                // The fingerprint is rechecked against the refreshed
+                // credentials so another account's ETag is never replayed.
+                self.fetch_once(
+                    &credentials,
+                    revalidation_etag(cached.as_ref(), &credentials).as_deref(),
+                )
+                .await
+                .map_err(CodexModelsRequestError::into_anyhow)?
             }
             Err(error) => return Err(error.into_anyhow()),
+        };
+
+        let catalog = match outcome {
+            CodexModelsFetchOutcome::Fresh(catalog) => catalog,
+            CodexModelsFetchOutcome::NotModified => {
+                let Some(cache) = cached else {
+                    // fetch_once only reports 304 for a conditional request,
+                    // which requires the cache loaded above.
+                    return Err(anyhow!(
+                        "Codex models endpoint returned 304 without a cached catalog"
+                    ));
+                };
+                cache.into_catalog()
+            }
         };
 
         if self.catalog_matches_current_account(&catalog) {
@@ -309,6 +342,17 @@ impl CodexModelsClient {
     }
 
     fn load_fresh_cache_for(&self, credentials: &CodexCredentials) -> Option<CodexModelsCatalog> {
+        let cache = self.load_matching_cache(credentials)?;
+        if !cache.is_fresh(self.cache_ttl) {
+            return None;
+        }
+        Some(cache.into_catalog())
+    }
+
+    /// Load the cache entry bound to this endpoint, version pair, and account
+    /// fingerprint, regardless of freshness. Callers decide whether to serve
+    /// it directly (fresh) or revalidate it conditionally (any age).
+    fn load_matching_cache(&self, credentials: &CodexCredentials) -> Option<CodexModelsCache> {
         let data = std::fs::read(&self.cache_path).ok()?;
         let cache: CodexModelsCache = serde_json::from_slice(&data).ok()?;
         let (base_origin, base_url) = self.cache_endpoint_identity().ok()?;
@@ -318,17 +362,17 @@ impl CodexModelsClient {
             || cache.base_origin != base_origin
             || cache.base_url != base_url
             || cache.account_fingerprint != account_fingerprint(credentials)?
-            || !cache.is_fresh(self.cache_ttl)
         {
             return None;
         }
-        Some(cache.into_catalog())
+        Some(cache)
     }
 
     async fn fetch_once(
         &self,
         credentials: &CodexCredentials,
-    ) -> Result<CodexModelsCatalog, CodexModelsRequestError> {
+        if_none_match: Option<&str>,
+    ) -> Result<CodexModelsFetchOutcome, CodexModelsRequestError> {
         let request_account = account_fingerprint(credentials).ok_or_else(|| {
             CodexModelsRequestError::Other(anyhow!(
                 "Codex credentials have no stable account identity"
@@ -349,12 +393,23 @@ impl CodexModelsClient {
         if credentials.account_is_fedramp {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
+        if let Some(etag) = if_none_match {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
 
         let response = request.send().await.map_err(|error| {
             CodexModelsRequestError::Other(anyhow!(error).context("Codex models request failed"))
         })?;
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(CodexModelsRequestError::Unauthorized);
+        }
+        if response.status() == StatusCode::NOT_MODIFIED {
+            if if_none_match.is_some() {
+                return Ok(CodexModelsFetchOutcome::NotModified);
+            }
+            return Err(CodexModelsRequestError::Other(anyhow!(
+                "Codex models request returned 304 Not Modified to an unconditional request"
+            )));
         }
         let status = response.status();
         if !status.is_success() {
@@ -385,11 +440,11 @@ impl CodexModelsClient {
             .filter_map(convert_model)
             .collect::<Vec<_>>();
         models.sort_by_key(|model| model.priority);
-        Ok(CodexModelsCatalog {
+        Ok(CodexModelsFetchOutcome::Fresh(CodexModelsCatalog {
             models,
             etag,
             account_fingerprint: request_account,
-        })
+        }))
     }
 
     fn models_url(&self) -> anyhow::Result<Url> {
@@ -494,6 +549,33 @@ impl Default for CodexModelsClient {
     }
 }
 
+/// Result of one Codex models request: a full catalog, or a 304 confirming
+/// the conditional request's cached catalog is still current.
+#[derive(Debug)]
+enum CodexModelsFetchOutcome {
+    Fresh(CodexModelsCatalog),
+    NotModified,
+}
+
+/// The cached ETag, but only when the cache belongs to exactly the account
+/// that will make the request. A refreshed credential set is rechecked so a
+/// stale account's ETag can never be traded for a 304 on a new account.
+fn revalidation_etag(
+    cache: Option<&CodexModelsCache>,
+    credentials: &CodexCredentials,
+) -> Option<String> {
+    let cache = cache?;
+    if account_fingerprint(credentials)? != cache.account_fingerprint {
+        return None;
+    }
+    cache
+        .etag
+        .as_deref()
+        .map(str::trim)
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_owned)
+}
+
 #[derive(Debug)]
 enum CodexModelsRequestError {
     Unauthorized,
@@ -592,7 +674,9 @@ fn hash_identity_component(hasher: &mut blake3::Hasher, value: Option<&str>) {
             hasher.update(&(value.len() as u64).to_be_bytes());
             hasher.update(value.as_bytes());
         }
-        None => hasher.update(&[0]),
+        None => {
+            hasher.update(&[0]);
+        }
     }
 }
 
@@ -666,6 +750,7 @@ mod tests {
         originator: Option<String>,
         user_agent: Option<String>,
         version: Option<String>,
+        if_none_match: Option<String>,
     }
 
     #[derive(Clone)]
@@ -673,6 +758,7 @@ mod tests {
         observed: Arc<Mutex<Vec<ObservedRequest>>>,
         statuses: Arc<Mutex<VecDeque<StatusCode>>>,
         body: serde_json::Value,
+        etag: Option<String>,
         gate: Option<(Arc<Notify>, Arc<Notify>)>,
     }
 
@@ -694,6 +780,7 @@ mod tests {
             originator: value("originator"),
             user_agent: value("user-agent"),
             version: value("version"),
+            if_none_match: value("if-none-match"),
         });
         if let Some((started, release)) = &state.gate {
             started.notify_one();
@@ -705,12 +792,29 @@ mod tests {
             .unwrap()
             .pop_front()
             .unwrap_or(StatusCode::OK);
-        (status, axum::Json(state.body.clone())).into_response()
+        let mut headers = HeaderMap::new();
+        if let Some(etag) = &state.etag {
+            headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+        }
+        if status == StatusCode::NOT_MODIFIED {
+            (status, headers).into_response()
+        } else {
+            (status, headers, axum::Json(state.body.clone())).into_response()
+        }
     }
 
     async fn spawn_server(
         statuses: impl IntoIterator<Item = StatusCode>,
         body: serde_json::Value,
+        gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    ) -> (String, Arc<Mutex<Vec<ObservedRequest>>>, tokio::task::JoinHandle<()>) {
+        spawn_server_with_etag(statuses, body, None, gate).await
+    }
+
+    async fn spawn_server_with_etag(
+        statuses: impl IntoIterator<Item = StatusCode>,
+        body: serde_json::Value,
+        etag: Option<&str>,
         gate: Option<(Arc<Notify>, Arc<Notify>)>,
     ) -> (String, Arc<Mutex<Vec<ObservedRequest>>>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -720,6 +824,7 @@ mod tests {
             observed: observed.clone(),
             statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
             body,
+            etag: etag.map(str::to_owned),
             gate,
         };
         let app = Router::new()
@@ -828,6 +933,147 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].authorization.as_deref(), Some("Bearer old-token"));
         assert_eq!(requests[1].authorization.as_deref(), Some("Bearer new-token"));
+    }
+
+    #[tokio::test]
+    async fn conditional_request_revalidates_with_etag_and_304_extends_ttl() {
+        let (base_url, observed, server) = spawn_server_with_etag(
+            [StatusCode::OK, StatusCode::NOT_MODIFIED],
+            model_response(),
+            Some("\"catalog-v1\""),
+            None,
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let account = credentials("codex-token", "account-1");
+        let auth = Arc::new(TestAuthSource {
+            current: Mutex::new(Some(account.clone())),
+            fresh: Some(account.clone()),
+            refreshed: None,
+            force_calls: AtomicUsize::new(0),
+        });
+        let client = test_client(&temp, base_url, auth);
+
+        let first = client.fetch_and_cache().await.unwrap().unwrap();
+        assert_eq!(first.etag.as_deref(), Some("\"catalog-v1\""));
+
+        // Age the cache past its TTL so only a successful 304 revalidation can
+        // make it fresh again.
+        client
+            .persist(&first, &account, Utc::now() - ChronoDuration::hours(1))
+            .unwrap();
+        assert!(client.load_fresh_cache().is_none());
+
+        let second = client.fetch_and_cache().await.unwrap().unwrap();
+        server.abort();
+
+        let requests = observed.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].if_none_match, None,
+            "the first request has no cache to revalidate"
+        );
+        assert_eq!(requests[1].if_none_match.as_deref(), Some("\"catalog-v1\""));
+        assert_eq!(second.models, first.models);
+        assert_eq!(second.etag.as_deref(), Some("\"catalog-v1\""));
+        assert!(
+            client.load_fresh_cache().is_some(),
+            "a 304 must refresh the cache timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_account_cache_never_sends_if_none_match() {
+        let (base_url, observed, server) = spawn_server_with_etag(
+            [StatusCode::OK],
+            model_response(),
+            Some("\"catalog-v2\""),
+            None,
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let account_a = credentials("token-a", "account-a");
+        let account_b = credentials("token-b", "account-b");
+        let auth = Arc::new(TestAuthSource {
+            current: Mutex::new(Some(account_b.clone())),
+            fresh: Some(account_b.clone()),
+            refreshed: None,
+            force_calls: AtomicUsize::new(0),
+        });
+        let client = test_client(&temp, base_url, auth);
+        let model = convert_model(serde_json::from_value(json!({
+            "slug": "cached",
+            "display_name": "Cached",
+            "visibility": "list",
+            "context_window": 100000
+        })).unwrap()).unwrap();
+        let stale_catalog = CodexModelsCatalog {
+            models: vec![model],
+            etag: Some("\"other-account-etag\"".to_owned()),
+            account_fingerprint: account_fingerprint(&account_a).unwrap(),
+        };
+        client.persist(&stale_catalog, &account_a, Utc::now()).unwrap();
+
+        let fetched = client.fetch_and_cache().await.unwrap().unwrap();
+        server.abort();
+
+        let requests = observed.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].if_none_match, None,
+            "another account's ETag must never be traded for a 304"
+        );
+        assert_eq!(
+            fetched.account_fingerprint(),
+            account_fingerprint(&account_b).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_retry_keeps_conditional_revalidation() {
+        let (base_url, observed, server) = spawn_server_with_etag(
+            [StatusCode::UNAUTHORIZED, StatusCode::NOT_MODIFIED],
+            model_response(),
+            Some("\"catalog-v1\""),
+            None,
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let old = credentials("old-token", "account-1");
+        let new = credentials("new-token", "account-1");
+        let auth = Arc::new(TestAuthSource {
+            current: Mutex::new(Some(old.clone())),
+            fresh: Some(old.clone()),
+            refreshed: Some(new),
+            force_calls: AtomicUsize::new(0),
+        });
+        let client = test_client(&temp, base_url, auth);
+        let model = convert_model(serde_json::from_value(json!({
+            "slug": "cached",
+            "display_name": "Cached",
+            "visibility": "list",
+            "context_window": 100000
+        })).unwrap()).unwrap();
+        let cached_catalog = CodexModelsCatalog {
+            models: vec![model],
+            etag: Some("\"catalog-v1\"".to_owned()),
+            account_fingerprint: account_fingerprint(&old).unwrap(),
+        };
+        client.persist(&cached_catalog, &old, Utc::now()).unwrap();
+
+        let fetched = client.fetch_and_cache().await.unwrap().unwrap();
+        server.abort();
+
+        let requests = observed.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].if_none_match.as_deref(), Some("\"catalog-v1\""));
+        assert_eq!(
+            requests[1].if_none_match.as_deref(),
+            Some("\"catalog-v1\""),
+            "the post-refresh retry stays conditional for the same account"
+        );
+        assert_eq!(fetched.models, cached_catalog.models);
+        assert_eq!(fetched.etag.as_deref(), Some("\"catalog-v1\""));
     }
 
     #[tokio::test]
