@@ -32,6 +32,7 @@ pub mod events;
 pub mod handle;
 pub mod image_budget;
 pub mod persistence;
+pub mod tool_result_edit;
 pub mod types;
 pub mod usage;
 
@@ -49,6 +50,10 @@ pub use handle::ChatStateHandle;
 pub use persistence::{
     ChatPersistence, MockChatPersistence, MockPersistenceReceiver, NullChatPersistence,
     PersistenceRecord, StripOutcome,
+};
+pub use tool_result_edit::{
+    append_tool_result_note, remove_first_tool_result_image, retain_tool_result_images,
+    set_tool_result_text, transform_conversation_cwd_synced,
 };
 pub use types::*;
 pub use usage::{UsageLedger, UsageTotals};

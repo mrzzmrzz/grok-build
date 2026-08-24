@@ -98,11 +98,16 @@ impl CodexCatalogModel {
 }
 
 /// Account-scoped catalog snapshot returned by the live endpoint or cache.
+///
+/// `account_fingerprint` is `None` when the producing credentials carry no
+/// stable identity claims: such a catalog is servable for the current process
+/// but must never be persisted to, or matched against, the account-scoped
+/// disk cache — nor published into the account-fenced in-memory catalog.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CodexModelsCatalog {
     pub models: Vec<CodexCatalogModel>,
     pub etag: Option<String>,
-    account_fingerprint: String,
+    account_fingerprint: Option<String>,
 }
 
 impl CodexModelsCatalog {
@@ -114,8 +119,10 @@ impl CodexModelsCatalog {
         self.models.iter().filter(|model| model.is_visible())
     }
 
-    pub(crate) fn account_fingerprint(&self) -> &str {
-        &self.account_fingerprint
+    /// Fingerprint of the producing account; `None` for identity-less
+    /// credentials (no account-scoped cache publication or reuse).
+    pub(crate) fn account_fingerprint(&self) -> Option<&str> {
+        self.account_fingerprint.as_deref()
     }
 
     /// Test-only constructor for crate-internal tests outside this module.
@@ -128,7 +135,7 @@ impl CodexModelsCatalog {
         Self {
             models,
             etag,
-            account_fingerprint,
+            account_fingerprint: Some(account_fingerprint),
         }
     }
 }
@@ -198,7 +205,7 @@ impl CodexModelsCache {
         CodexModelsCatalog {
             models: self.models,
             etag: self.etag,
-            account_fingerprint: self.account_fingerprint,
+            account_fingerprint: Some(self.account_fingerprint),
         }
     }
 }
@@ -319,6 +326,10 @@ impl CodexModelsClient {
 
         if self.catalog_matches_current_account(&catalog) {
             self.persist(&catalog, &credentials, Utc::now())?;
+        } else if catalog.account_fingerprint().is_none() {
+            tracing::debug!(
+                "skipping Codex catalog cache write: credentials carry no stable account identity"
+            );
         } else {
             tracing::debug!("skipping Codex catalog cache write after account change");
         }
@@ -332,14 +343,21 @@ impl CodexModelsClient {
         self.fetch_and_cache().await
     }
 
-    /// Recheck the stable account identity before publishing a completed fetch.
+    /// Recheck the stable account identity before publishing a completed
+    /// fetch. Requires BOTH sides to carry a fingerprint: an identity-less
+    /// catalog (or identity-less current credentials) never matches, so
+    /// account-scoped persistence stays conservatively disabled for it.
     pub(crate) fn catalog_matches_current_account(&self, catalog: &CodexModelsCatalog) -> bool {
-        self.auth
+        let current = self
+            .auth
             .current_credentials()
             .ok()
             .flatten()
-            .and_then(|credentials| account_fingerprint(&credentials))
-            .is_some_and(|fingerprint| fingerprint == catalog.account_fingerprint)
+            .and_then(|credentials| account_fingerprint(&credentials));
+        match (catalog.account_fingerprint(), current.as_deref()) {
+            (Some(catalog_fp), Some(current_fp)) => catalog_fp == current_fp,
+            _ => false,
+        }
     }
 
     /// Remove only the Codex catalog cache.
@@ -387,11 +405,10 @@ impl CodexModelsClient {
         credentials: &CodexCredentials,
         if_none_match: Option<&str>,
     ) -> Result<CodexModelsFetchOutcome, CodexModelsRequestError> {
-        let request_account = account_fingerprint(credentials).ok_or_else(|| {
-            CodexModelsRequestError::Other(anyhow!(
-                "Codex credentials have no stable account identity"
-            ))
-        })?;
+        // Identity-less credentials still fetch (the bearer is what the
+        // endpoint needs); the missing fingerprint only disables the
+        // account-scoped cache write and publication downstream.
+        let request_account = account_fingerprint(credentials);
         let url = self.models_url().map_err(CodexModelsRequestError::Other)?;
         let mut request = self
             .http
@@ -1025,7 +1042,7 @@ mod tests {
         let stale_catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("\"other-account-etag\"".to_owned()),
-            account_fingerprint: account_fingerprint(&account_a).unwrap(),
+            account_fingerprint: Some(account_fingerprint(&account_a).unwrap()),
         };
         client.persist(&stale_catalog, &account_a, Utc::now()).unwrap();
 
@@ -1040,7 +1057,7 @@ mod tests {
         );
         assert_eq!(
             fetched.account_fingerprint(),
-            account_fingerprint(&account_b).unwrap()
+            account_fingerprint(&account_b).as_deref()
         );
     }
 
@@ -1072,7 +1089,7 @@ mod tests {
         let cached_catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("\"catalog-v1\"".to_owned()),
-            account_fingerprint: account_fingerprint(&old).unwrap(),
+            account_fingerprint: Some(account_fingerprint(&old).unwrap()),
         };
         client.persist(&cached_catalog, &old, Utc::now()).unwrap();
 
@@ -1146,7 +1163,7 @@ mod tests {
         let catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("etag".to_owned()),
-            account_fingerprint: account_fingerprint(&account_a).unwrap(),
+            account_fingerprint: Some(account_fingerprint(&account_a).unwrap()),
         };
 
         client.persist(&catalog, &account_a, Utc::now()).unwrap();
@@ -1184,7 +1201,7 @@ mod tests {
         let catalog = CodexModelsCatalog {
             models: vec![model],
             etag: None,
-            account_fingerprint: account_fingerprint(&account).unwrap(),
+            account_fingerprint: Some(account_fingerprint(&account).unwrap()),
         };
         client.persist(&catalog, &account, Utc::now()).unwrap();
         assert_eq!(
@@ -1215,5 +1232,61 @@ mod tests {
             account_is_fedramp: false,
         };
         assert!(account_fingerprint(&credentials).is_none());
+    }
+
+    fn identity_less_credentials(token: &str) -> CodexCredentials {
+        CodexCredentials {
+            access_token: token.to_owned(),
+            account_id: None,
+            chatgpt_user_id: None,
+            email: None,
+            plan_type: None,
+            is_workspace_account: false,
+            account_is_fedramp: false,
+        }
+    }
+
+    /// Finding regression: valid credentials without any identity claim are
+    /// still logged in — the live refresh runs and returns a catalog — but
+    /// with no stable account fingerprint the result is never written to the
+    /// account-scoped disk cache, and never matches account-scoped reuse.
+    #[tokio::test]
+    async fn identity_less_credentials_fetch_but_never_persist() {
+        let (base_url, observed, server) =
+            spawn_server([StatusCode::OK], model_response(), None).await;
+        let temp = tempfile::tempdir().unwrap();
+        let auth = Arc::new(TestAuthSource {
+            current: Mutex::new(Some(identity_less_credentials("anon-token"))),
+            fresh: Some(identity_less_credentials("anon-token")),
+            refreshed: None,
+            force_calls: AtomicUsize::new(0),
+        });
+        let client = test_client(&temp, base_url, auth);
+
+        let catalog = client
+            .fetch_and_cache()
+            .await
+            .expect("identity-less fetch must not error")
+            .expect("catalog returned");
+        server.abort();
+
+        assert!(catalog.is_authoritative(), "live models are served");
+        assert!(
+            catalog.account_fingerprint().is_none(),
+            "no fingerprint without identity claims"
+        );
+        assert_eq!(observed.lock().unwrap().len(), 1, "the wire fetch ran");
+        assert!(
+            !client.cache_path().exists(),
+            "identity-less results must not land in the account-scoped cache"
+        );
+        assert!(
+            !client.catalog_matches_current_account(&catalog),
+            "identity-less catalogs never match for account-scoped publication"
+        );
+        assert!(
+            client.load_fresh_cache().is_none(),
+            "no account-scoped cache reuse without an identity"
+        );
     }
 }

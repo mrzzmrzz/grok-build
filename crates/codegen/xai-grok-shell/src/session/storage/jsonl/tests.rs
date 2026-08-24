@@ -1232,6 +1232,7 @@ fn write_test_summary(
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
         last_recap: None,
+        ever_used_codex: false,
     };
     let json = serde_json::to_vec_pretty(&summary).unwrap();
     std::fs::write(session_dir.join("summary.json"), json).unwrap();
@@ -1613,6 +1614,42 @@ fn strip_invalid_images_heals_tool_result_images() {
     assert!(
             matches!(&t.images[0], ContentPart::Image { url } if url.as_ref() == good_url.as_str())
         );
+}
+/// Wire-level: a poisoned image persisted in the ordered `parts` must be
+/// removed there too — a survivor would ride `parts` onto the wire and 400
+/// every turn even though the legacy `images` mirror was healed.
+#[test]
+fn strip_invalid_images_heals_ordered_parts_on_the_wire() {
+    let bad_url = "data:image/png;base64,!!!not-valid-base64!!!".to_string();
+    let good_url = image_data_uri("image/png", &test_png_bytes());
+    let mut items = vec![ConversationItem::tool_result_with_parts(
+            "call_1".to_string(),
+            vec![
+                ContentPart::Text {
+                    text: "before".into(),
+                },
+                ContentPart::Image {
+                    url: bad_url.clone().into(),
+                },
+                ContentPart::Image {
+                    url: good_url.clone().into(),
+                },
+            ],
+        )];
+    assert_eq!(strip_invalid_images(&mut items), 1);
+    let ConversationItem::ToolResult(t) = &items[0] else {
+        panic!("expected ToolResult");
+    };
+    assert_eq!(t.images.len(), 1, "mirror keeps only the valid image");
+    assert_eq!(t.parts.len(), 2, "parts keep only the text and valid image");
+    let req = crate::sampling::ConversationRequest::from_items(items);
+    let responses: xai_grok_sampling_types::rs::CreateResponse = (&req).into();
+    let body = serde_json::to_string(&responses).unwrap();
+    assert!(
+        !body.contains("not-valid-base64"),
+        "invalid persisted image leaked to the wire"
+    );
+    assert!(body.contains(&good_url), "valid image must survive");
 }
 #[test]
 fn strip_invalid_images_empty_conversation() {

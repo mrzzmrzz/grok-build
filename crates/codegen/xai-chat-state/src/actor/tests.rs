@@ -3859,6 +3859,183 @@ async fn prune_retained_synthetic_user_does_not_advance_age() {
     }
 }
 
+/// Retained-history hard clear must go through `set_tool_result_text` so a
+/// tool result's ordered `parts` cannot keep the old text alive: the
+/// Responses serialization treats non-empty `parts` as authoritative, so a
+/// content-only clear would leave the full old text in persisted state AND
+/// replay it on the next wire request.
+#[tokio::test]
+async fn prune_retained_clears_ordered_parts_in_persisted_state_and_wire_json() {
+    use crate::actor::ChatStateActor;
+    use crate::persistence::{MockChatPersistence, PersistenceRecord};
+    use crate::types::PruningConfig;
+    use xai_grok_sampling_types::ContentPart;
+
+    const OLD_SECRET: &str = "OLD-SECRET-CODE-MODE-OUTPUT";
+
+    let (mock, mut rx) = MockChatPersistence::new();
+    let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    let config = PruningConfig {
+        hard_clear_age_turns: 3,
+        keep_last_n_turns: 1,
+        ..Default::default()
+    };
+    let handle = ChatStateActor::spawn_with_pruning(
+        vec![],
+        test_config(),
+        config,
+        Box::new(mock),
+        event_tx,
+        token,
+    );
+
+    // Turn 0 carries an ordered-parts tool result (text + image), the shape a
+    // Code Mode result uses.
+    handle.push_user_message(ConversationItem::user("q0"));
+    handle.increment_prompt_index();
+    handle.push_assistant_response(ConversationItem::assistant("a0"));
+    handle.push_tool_result(ConversationItem::tool_result_with_parts(
+        "call_0",
+        vec![
+            ContentPart::Text {
+                text: OLD_SECRET.into(),
+            },
+            ContentPart::Image {
+                url: "https://example.invalid/old.png".into(),
+            },
+        ],
+    ));
+
+    // Enough further turns for turn 0 to age past hard_clear_age_turns.
+    for i in 1..6usize {
+        handle.push_user_message(ConversationItem::user(format!("q{i}")));
+        handle.increment_prompt_index();
+        handle.push_assistant_response(ConversationItem::assistant(format!("a{i}")));
+        handle.push_tool_result(ConversationItem::tool_result(
+            format!("call_{i}"),
+            "recent output",
+        ));
+    }
+
+    // In-memory state: content AND parts must both be cleared.
+    let conv = handle.get_conversation().await;
+    let old_tr = conv
+        .iter()
+        .find_map(|item| match item {
+            ConversationItem::ToolResult(tr) if tr.tool_call_id == "call_0" => Some(tr),
+            _ => None,
+        })
+        .expect("turn 0 tool result present");
+    assert_eq!(
+        old_tr.content.as_ref(),
+        "[Tool result omitted — too old]",
+        "legacy content mirror must be hard-cleared"
+    );
+    assert!(
+        !old_tr.parts.iter().any(|part| {
+            matches!(part, ContentPart::Text { text } if text.contains(OLD_SECRET))
+        }),
+        "ordered parts must not retain the cleared text"
+    );
+
+    // Persisted state: the final ReplaceHistory written by the prune must not
+    // contain the old content anywhere (parts included).
+    let last_replace = rx
+        .drain()
+        .into_iter()
+        .filter_map(|record| match record {
+            PersistenceRecord::ReplaceHistory(items) => Some(items),
+            _ => None,
+        })
+        .next_back()
+        .expect("retained prune must persist a history replace");
+    let persisted_json = serde_json::to_string(&last_replace).unwrap();
+    assert!(
+        !persisted_json.contains(OLD_SECRET),
+        "persisted history must not retain cleared tool-result content"
+    );
+
+    // Wire JSON: the Responses request built from this conversation must not
+    // replay the old content (non-empty `parts` are authoritative there).
+    let req = handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    let wire = serde_json::to_string(
+        &async_openai::types::responses::CreateResponse::from(&req),
+    )
+    .unwrap();
+    assert!(
+        !wire.contains(OLD_SECRET),
+        "wire request must not replay cleared tool-result content"
+    );
+}
+
+/// A tool result mis-pruned by an older build (legacy `content` cleared while
+/// `parts` kept the full text) is repaired by the next retained prune pass.
+#[tokio::test]
+async fn prune_retained_repairs_content_only_cleared_tool_results() {
+    use crate::actor::ChatStateActor;
+    use crate::persistence::MockChatPersistence;
+    use crate::types::PruningConfig;
+    use xai_grok_sampling_types::{ContentPart, ToolResultItem};
+
+    const OLD_SECRET: &str = "LEGACY-PARTS-LEAK";
+
+    // Simulate the pre-fix shape: content already placeholder, parts alive.
+    let stale = ConversationItem::ToolResult(ToolResultItem {
+        tool_call_id: "call_stale".into(),
+        content: std::sync::Arc::<str>::from("[Tool result omitted — too old]"),
+        images: vec![],
+        parts: vec![ContentPart::Text {
+            text: OLD_SECRET.into(),
+        }],
+    });
+
+    let (mock, _rx) = MockChatPersistence::new();
+    let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    let config = PruningConfig {
+        hard_clear_age_turns: 3,
+        keep_last_n_turns: 1,
+        ..Default::default()
+    };
+    let handle = ChatStateActor::spawn_with_pruning(
+        vec![
+            ConversationItem::user("q0"),
+            ConversationItem::assistant("a0"),
+            stale,
+        ],
+        test_config(),
+        config,
+        Box::new(mock),
+        event_tx,
+        token,
+    );
+
+    for i in 1..8usize {
+        handle.push_user_message(ConversationItem::user(format!("q{i}")));
+        handle.increment_prompt_index();
+        handle.push_assistant_response(ConversationItem::assistant(format!("a{i}")));
+    }
+
+    let conv = handle.get_conversation().await;
+    let repaired = conv
+        .iter()
+        .find_map(|item| match item {
+            ConversationItem::ToolResult(tr) if tr.tool_call_id == "call_stale" => Some(tr),
+            _ => None,
+        })
+        .expect("stale tool result present");
+    assert!(
+        !repaired.parts.iter().any(|part| {
+            matches!(part, ContentPart::Text { text } if text.contains(OLD_SECRET))
+        }),
+        "a content-only cleared tool result must have its parts repaired"
+    );
+}
+
 #[tokio::test]
 async fn get_last_model_metadata_returns_both_fields() {
     let h = TestHarness::with_conversation(vec![
@@ -4991,4 +5168,30 @@ async fn repair_history_command_refused_while_turn_active() {
         .unwrap()
         .unwrap();
     assert_eq!(report.stripped_tool_result_ids, vec!["call_ORPHAN"]);
+}
+
+/// `ever_used_codex` is a monotonic latch: snapshots carry it, and restoring
+/// a snapshot taken *before* the mark can never clear it (rewind across a
+/// provider switch must not forget that Codex output entered the session).
+#[tokio::test]
+async fn ever_used_codex_is_monotonic_across_snapshot_restore() {
+    let h = TestHarness::new();
+    assert!(!h.handle.ever_used_codex().await, "fresh session is unmarked");
+
+    // Snapshot before the mark, then mark.
+    let pre_mark_snapshot = h.handle.snapshot().await.unwrap();
+    assert!(!pre_mark_snapshot.ever_used_codex);
+    h.handle.mark_ever_used_codex();
+    assert!(h.handle.ever_used_codex().await);
+
+    // A snapshot taken after the mark carries it (fork inheritance).
+    let post_mark_snapshot = h.handle.snapshot().await.unwrap();
+    assert!(post_mark_snapshot.ever_used_codex);
+
+    // Restoring the pre-mark snapshot must NOT clear the mark.
+    h.handle.restore_snapshot(pre_mark_snapshot);
+    assert!(
+        h.handle.ever_used_codex().await,
+        "restore is OR-merge: rewind can never un-mark a Codex session"
+    );
 }

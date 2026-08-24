@@ -28,6 +28,7 @@ impl ChatStateActor {
             turn_start_ms: self.state.turn_start_ms,
             last_compaction_prompt_index: self.state.last_compaction_prompt_index,
             credentials: self.state.credentials.clone(),
+            ever_used_codex: self.state.ever_used_codex,
         }
     }
 

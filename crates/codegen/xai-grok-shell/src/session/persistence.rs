@@ -322,6 +322,11 @@ pub enum PersistenceMsg {
     /// or clears (`None`, on conversation rewind) the previous one in
     /// `summary.json`.
     LastTurnSummary(Option<(String, String)>),
+    /// Monotonically mark that the session has sampled through the Codex
+    /// provider: persists `Summary::ever_used_codex` and permanently disables
+    /// remote/relay sync of session content to xAI backends for this actor.
+    /// There is deliberately no way to clear the mark.
+    MarkEverUsedCodex,
     /// Enable remote writeback for a session created `Local` before remote
     /// settings resolved (non-blocking startup); backfills its local history.
     UpgradeToWriteback {
@@ -948,6 +953,14 @@ pub struct Summary {
     /// committed value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_recap: Option<String>,
+    /// Monotonic: `true` once this session has ever sampled through the
+    /// Codex provider. Set via [`SummaryPatch`]'s OR-merge (never cleared),
+    /// inherited by forks/resumes, and used to keep Codex-derived session
+    /// content off xAI-only egress paths (remote sync/relay, prompt traces).
+    ///
+    /// [`SummaryPatch`]: crate::session::storage::summary_write::SummaryPatch
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ever_used_codex: bool,
 }
 
 /// Current `grok_home` as a UTF-8 string, or `None` if the path isn't valid UTF-8.
@@ -1007,6 +1020,7 @@ impl Summary {
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,
+            ever_used_codex: false,
         })
     }
 
@@ -1162,6 +1176,12 @@ impl PersistenceHandle {
         self.disk_full_rx.clone()
     }
 
+    /// Monotonically mark that the session has sampled through the Codex
+    /// provider (see [`PersistenceMsg::MarkEverUsedCodex`]). Fire-and-forget.
+    pub(crate) fn mark_ever_used_codex(&self) {
+        let _ = self.tx.send(PersistenceMsg::MarkEverUsedCodex);
+    }
+
     /// Append after older buffered updates and wait for the durable barrier.
     ///
     /// [`DurableAppendError::NotCommitted`] is safe to retry; [`DurableAppendError::Committed`]
@@ -1231,6 +1251,12 @@ struct SessionPersistence {
     search_index: crate::session::storage::search::SharedSearchIndex,
     disk_full_tx: watch::Sender<bool>,
     disk_full_notified: bool,
+    /// Monotonic mirror of `Summary::ever_used_codex`: once `true`, remote
+    /// and relay sync of session content to xAI backends stays disabled for
+    /// this actor's lifetime (Codex-derived history must not ride xAI-only
+    /// egress). Seeded from the summary at construction and flipped by
+    /// [`PersistenceMsg::MarkEverUsedCodex`]; never cleared.
+    ever_used_codex: bool,
 }
 
 impl SessionPersistence {
@@ -1415,6 +1441,11 @@ impl SessionPersistence {
     }
 
     fn queue_acp_sync(&self, notification: acp::SessionNotification) {
+        // Provider isolation: a session that ever sampled through Codex must
+        // not stream its content to the xAI backend or relay.
+        if self.ever_used_codex {
+            return;
+        }
         if let Some(sync) = &self.remote_sync {
             sync.queue(notification.clone());
         }
@@ -1428,6 +1459,13 @@ impl SessionPersistence {
     /// No-op once syncing, so a repeat upgrade is harmless.
     async fn upgrade_to_writeback(&mut self, auth_manager: Arc<crate::auth::AuthManager>) {
         if self.remote_sync.is_some() {
+            return;
+        }
+        if self.ever_used_codex {
+            tracing::info!(
+                session_id = %self.info.id,
+                "session ever used the Codex provider: refusing writeback upgrade to the xAI backend"
+            );
             return;
         }
         // Flush the merge-pending notification so the backfill re-reads it.
@@ -1605,6 +1643,25 @@ impl SessionPersistence {
                 spawn_worktree_touch(&self.info);
             }
             match msg {
+                PersistenceMsg::MarkEverUsedCodex => {
+                    // Monotonic latch: only the false→true transition does
+                    // work (every Codex response re-sends the mark, and a
+                    // per-response summary.json rewrite would be waste).
+                    if !self.ever_used_codex {
+                        tracing::info!(
+                            session_id = %self.info.id,
+                            "session marked ever_used_codex: dropping remote/relay sync of session content to xAI backends"
+                        );
+                        self.ever_used_codex = true;
+                        // Drop live sync channels: content produced from here
+                        // on must not reach xAI backends.
+                        self.remote_sync = None;
+                        self.relay_sync = None;
+                        if let Err(error) = self.storage.mark_ever_used_codex(&self.info).await {
+                            tracing::warn!(%error, "failed to persist ever_used_codex mark");
+                        }
+                    }
+                }
                 PersistenceMsg::UpgradeToWriteback { auth_manager } => {
                     self.upgrade_to_writeback(auth_manager).await;
                 }
@@ -2106,6 +2163,18 @@ fn init_remote_sync(
     match storage_mode {
         StorageMode::Local => Ok(None),
         StorageMode::Writeback => {
+            if summary.ever_used_codex {
+                // Provider isolation: this session's history contains (or
+                // contained) Codex-provider output — including opaque
+                // encrypted reasoning — which must not be uploaded to the
+                // xAI backend. Monotonic: once marked, remote sync stays off
+                // for the session's lifetime.
+                tracing::info!(
+                    session_id = %summary.info.id,
+                    "session ever used the Codex provider: remote sync to the xAI backend is disabled"
+                );
+                return Ok(None);
+            }
             let auth_manager = auth_manager.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -2297,6 +2366,7 @@ pub(crate) async fn new(
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&summary, storage_mode, auth_manager)?;
+    let ever_used_codex = summary.ever_used_codex;
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -2318,6 +2388,7 @@ pub(crate) async fn new(
             search_index,
             disk_full_tx,
             disk_full_notified: false,
+            ever_used_codex,
         };
         persistence.run().await;
     });
@@ -2365,6 +2436,7 @@ pub(crate) async fn new_with_explicit_dir(
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
+    let ever_used_codex = summary.ever_used_codex;
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -2388,6 +2460,7 @@ pub(crate) async fn new_with_explicit_dir(
             search_index: crate::session::storage::search::SharedSearchIndex::never_indexed(),
             disk_full_tx,
             disk_full_notified: false,
+            ever_used_codex,
         };
         persistence.run().await;
     });
@@ -2489,6 +2562,7 @@ pub(crate) async fn load(
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
+    let ever_used_codex = persisted_info.summary.ever_used_codex;
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
@@ -2514,6 +2588,7 @@ pub(crate) async fn load(
             search_index,
             disk_full_tx,
             disk_full_notified: false,
+            ever_used_codex,
         };
         persistence.run().await;
     });
@@ -2579,6 +2654,7 @@ pub(crate) async fn load_light(
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
+    let ever_used_codex = persisted_info.summary.ever_used_codex;
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
@@ -2604,6 +2680,7 @@ pub(crate) async fn load_light(
             search_index,
             disk_full_tx,
             disk_full_notified: false,
+            ever_used_codex,
         };
         persistence.run().await;
     });

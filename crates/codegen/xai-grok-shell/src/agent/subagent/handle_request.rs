@@ -969,6 +969,21 @@ pub(crate) async fn run_shell_child(
     });
     let subagent_session_default_agent_profile = Some(definition.name.clone());
     let subagent_model_id = effective_sampling_config.model.clone();
+    // Monotonic Codex provenance, part 1: a child spawned on a Codex provider
+    // profile taints the parent now, so even a cancelled or failed child that
+    // never reports back still leaves the parent correctly marked.
+    completion_data.record_child_codex_provenance(
+        effective_sampling_config.provider_profile.provider
+            == xai_grok_sampling_types::ModelProvider::Codex,
+    );
+    // Parent-provenance inheritance for the fresh child: a parent that ever
+    // used Codex spawns children whose forked/summarized context derives from
+    // Codex output, so the child starts marked too (consumed by the session
+    // spawn path via `StartupHints::ever_used_codex`).
+    let parent_ever_used_codex = match ctx.parent_chat_state.as_ref() {
+        Some(chat) => chat.ever_used_codex().await,
+        None => false,
+    };
     let _ = persistence
         .tx
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
@@ -1008,6 +1023,7 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
+            ever_used_codex: parent_ever_used_codex,
             ..Default::default()
         },
         xai_grok_workspace::permission::ClientType::Generic,
@@ -1219,6 +1235,19 @@ pub(crate) async fn run_shell_child(
         trace,
         cancellation_may_hide_usage,
     } = attempt;
+    // Monotonic Codex provenance, part 2: fold in what the child actually
+    // did (e.g. a mid-run switch onto a Codex model) while its chat-state
+    // actor is still alive. Runs on success, failure, AND cancellation —
+    // all three continue through this funnel to `child_run_output`. An
+    // already-gone actor (cancel may shut the child down first) contributes
+    // nothing here; the spawn-time provider mark above is the backstop.
+    completion_data.record_child_codex_provenance(
+        child_handle
+            .chat_state_handle
+            .try_ever_used_codex()
+            .await
+            .unwrap_or(false),
+    );
     let OneTurnTraceCapture {
         before_copy_rx,
         child_prompt_id,

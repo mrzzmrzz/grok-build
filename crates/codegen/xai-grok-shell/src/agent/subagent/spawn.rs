@@ -203,6 +203,20 @@ impl coordinator::ChildRunner for ShellChildRunner {
         })
     }
     fn on_completed(&self, completion: coordinator::ChildCompletion<Self::CompletionData>) {
+        // Codex subagent output taints the parent session: repeat the
+        // chat-state mark (the worker already applied it before returning
+        // the envelope) and mark the parent's persistence actor so
+        // remote/relay sync of the merged output is dropped. Runs for
+        // success, failure, and cancellation alike.
+        if completion.completion_data.child_ever_used_codex() {
+            let parent_sid = acp::SessionId::new(completion.request.parent_session_id.clone());
+            if let Some(handle) = self.agent_ref.get().resident_handle(&parent_sid) {
+                handle.chat_state_handle.mark_ever_used_codex();
+                let _ = handle
+                    .persistence_tx
+                    .send(crate::session::persistence::PersistenceMsg::MarkEverUsedCodex);
+            }
+        }
         let gateway = self.agent_ref.get().gateway.clone();
         let will_wake = will_wake_for(&completion);
         let reservations = completion

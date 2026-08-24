@@ -42,6 +42,13 @@ fn prefire_lead_percent() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
 }
+/// Whether the Codex compaction-compatibility hash *changed* between two
+/// turns. Only a transition between two **present** values counts —
+/// `None` on either side is "no signal" (xAI model, or catalog metadata not
+/// plumbed), never a trigger.
+fn comp_hash_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    matches!((previous, current), (Some(prev), Some(cur)) if prev != cur)
+}
 fn compaction_mode_label(
     mode: xai_chat_state::CompactionMode,
 ) -> xai_grok_telemetry::events::CompactionModeLabel {
@@ -1988,6 +1995,31 @@ impl SessionActor {
             return Ok(());
         };
         if cfg.model == prev.model_slug {
+            // Same slug, but the Codex compaction-compatibility hash rolled:
+            // the server-side compaction format changed under us, so compact
+            // proactively before the next turn rather than letting a stale
+            // opaque history hit the new format.
+            if comp_hash_changed(
+                prev.comp_hash.as_deref(),
+                self.current_codex_comp_hash().as_deref(),
+            ) && !self.is_account_state_suppressed()
+            {
+                let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
+                if let Some(trigger_info) =
+                    self.should_auto_compact(total_tokens, cfg.context_window)
+                {
+                    tracing::info!(
+                        model = %cfg.model,
+                        "Proactive compact: Codex compaction compatibility hash changed"
+                    );
+                    if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                        tracing::error!(error = %e, "comp_hash-change compaction failed");
+                        if Self::is_auth_compact_error(&e) {
+                            return Err(self.surface_compact_auth_failure(e).await);
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
         if self.is_account_state_suppressed() {
@@ -2026,9 +2058,23 @@ impl SessionActor {
                 crate::session::compaction_config::PreviousModelInfo {
                     model_slug: cfg.model.clone(),
                     context_window: cfg.context_window.get(),
+                    comp_hash: self.current_codex_comp_hash(),
                 },
             ));
         }
+    }
+
+    /// Codex compaction-compatibility hash for the session's current model,
+    /// from the live Codex catalog.
+    ///
+    /// Currently always `None`: `comp_hash` is per-model catalog metadata
+    /// (`/models` → `CodexWireModel.comp_hash`) and the catalog structs live
+    /// in `codex_models.rs`, outside this port stage's editable surface — see
+    /// the phase-8 integration notes for the exact plumbing. `None` is a safe
+    /// "no signal": [`comp_hash_changed`] fires only between two *present*
+    /// values, so nothing triggers until the metadata lands.
+    fn current_codex_comp_hash(&self) -> Option<String> {
+        None
     }
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
     /// Emits telemetry (`auto_compact_fired`) and UI notifications automatically.

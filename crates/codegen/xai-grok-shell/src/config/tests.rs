@@ -3912,3 +3912,118 @@ fn from_remote_gated_requires_xai_auth_for_writeback() {
         StorageMode::Local
     );
 }
+
+/// Nothing configured anywhere: the legacy fields still resolve to the
+/// compiled defaults, but every provenance pin reports `Unpinned` — the
+/// signal provider-isolation gates key on.
+#[test]
+fn model_overrides_aux_pins_unpinned_when_defaults_apply() {
+    with_model_overrides_env(None, None, None, || {
+        let empty = toml::Value::Table(toml::map::Map::new());
+        let cfg = ModelOverrideConfig::resolve(None, None, &empty, None);
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Unpinned);
+        assert_eq!(cfg.session_summary_pin, AuxModelPin::Unpinned);
+        assert_eq!(cfg.image_description_pin, AuxModelPin::Unpinned);
+        assert!(!cfg.session_summary_pin.is_explicit());
+        // Legacy fields keep their historical default-filling.
+        assert_eq!(cfg.web_search, crate::models::default_web_search_model());
+        assert_eq!(
+            cfg.session_summary.as_deref(),
+            Some(crate::models::default_session_summary_model())
+        );
+        assert_eq!(
+            cfg.image_description.as_deref(),
+            Some(crate::models::default_image_description_model())
+        );
+    });
+}
+
+/// toml and remote sources both record as an explicit `Pinned` provenance,
+/// local beating remote exactly like the resolved value does.
+#[test]
+fn model_overrides_aux_pins_record_local_and_remote_sources() {
+    with_model_overrides_env(None, None, None, || {
+        let config: toml::Value = toml::from_str(
+            r#"
+            [models]
+            web_search = "local-ws"
+            session_summary = "local-ss"
+            "#,
+        )
+        .unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            web_search_model: Some("remote-ws".to_owned()),
+            session_summary_model: Some("remote-ss".to_owned()),
+            image_description_model: Some("remote-id".to_owned()),
+            ..Default::default()
+        };
+        let cfg = ModelOverrideConfig::resolve(None, None, &config, Some(&remote));
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Pinned("local-ws".to_owned()));
+        assert_eq!(
+            cfg.session_summary_pin,
+            AuxModelPin::Pinned("local-ss".to_owned())
+        );
+        assert_eq!(
+            cfg.image_description_pin,
+            AuxModelPin::Pinned("remote-id".to_owned())
+        );
+        assert_eq!(cfg.session_summary_pin.explicit_model(), Some("local-ss"));
+    });
+}
+
+/// Env vars record as `Env` provenance and beat local + remote; a blank env
+/// value clears both the value and the provenance back to the default.
+#[test]
+fn model_overrides_aux_pins_env_wins_and_blank_env_clears() {
+    with_model_overrides_env(Some("env-ws"), Some("env-ss"), Some("env-id"), || {
+        let config: toml::Value = toml::from_str(
+            r#"
+            [models]
+            web_search = "local-ws"
+            session_summary = "local-ss"
+            image_description = "local-id"
+            "#,
+        )
+        .unwrap();
+        let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Env("env-ws".to_owned()));
+        assert_eq!(cfg.session_summary_pin, AuxModelPin::Env("env-ss".to_owned()));
+        assert_eq!(
+            cfg.image_description_pin,
+            AuxModelPin::Env("env-id".to_owned())
+        );
+    });
+    // Blank env clears the toml pin: the value falls back to the compiled
+    // default, so the provenance must report Unpinned (no phantom consent).
+    with_model_overrides_env(None, Some("  "), Some("  "), || {
+        let config: toml::Value = toml::from_str(
+            r#"
+            [models]
+            session_summary = "local-ss"
+            image_description = "local-id"
+            "#,
+        )
+        .unwrap();
+        let cfg = ModelOverrideConfig::resolve(None, None, &config, None);
+        assert_eq!(cfg.session_summary_pin, AuxModelPin::Unpinned);
+        assert_eq!(cfg.image_description_pin, AuxModelPin::Unpinned);
+        assert_eq!(
+            cfg.session_summary.as_deref(),
+            Some(crate::models::default_session_summary_model())
+        );
+    });
+}
+
+/// CLI flags are explicit pins and beat everything.
+#[test]
+fn model_overrides_aux_pins_cli_wins() {
+    with_model_overrides_env(Some("env-ws"), Some("env-ss"), None, || {
+        let empty = toml::Value::Table(toml::map::Map::new());
+        let cfg =
+            ModelOverrideConfig::resolve(Some("cli-ws"), Some("cli-ss"), &empty, None);
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Pinned("cli-ws".to_owned()));
+        assert_eq!(cfg.session_summary_pin, AuxModelPin::Pinned("cli-ss".to_owned()));
+        assert_eq!(cfg.web_search, "cli-ws");
+        assert_eq!(cfg.session_summary.as_deref(), Some("cli-ss"));
+    });
+}

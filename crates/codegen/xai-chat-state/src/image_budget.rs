@@ -99,11 +99,21 @@ fn inline_image_count(conversation: &[ConversationItem]) -> usize {
                 .iter()
                 .filter(|part| matches!(part, ContentPart::Image { .. }))
                 .count(),
-            ConversationItem::ToolResult(tool_result) => tool_result
-                .images
-                .iter()
-                .filter(|part| matches!(part, ContentPart::Image { .. }))
-                .count(),
+            // `parts` and `images` mirror each other, so an image counts
+            // once; `max` keeps the count honest if the two ever skew.
+            ConversationItem::ToolResult(tool_result) => {
+                let mirror = tool_result
+                    .images
+                    .iter()
+                    .filter(|part| matches!(part, ContentPart::Image { .. }))
+                    .count();
+                let in_parts = tool_result
+                    .parts
+                    .iter()
+                    .filter(|part| matches!(part, ContentPart::Image { .. }))
+                    .count();
+                mirror.max(in_parts)
+            }
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
             | ConversationItem::BackendToolCall(_)
@@ -216,6 +226,9 @@ fn conversation_body_bytes(conversation: &[ConversationItem]) -> usize {
             }
             ConversationItem::ToolResult(tool_result) => {
                 blank_image_urls(&mut tool_result.images, &mut image_url_bytes);
+                // Ordered parts serialize alongside the legacy mirror, so
+                // their image URLs contribute to the persisted JSON too.
+                blank_image_urls(&mut tool_result.parts, &mut image_url_bytes);
             }
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
@@ -266,7 +279,25 @@ fn evict_images_to_budget(
                 }
             }
             ConversationItem::ToolResult(tool_result) => {
-                for content_part in &tool_result.images {
+                // Discover through whichever representation holds more images
+                // so an image that drifted into `parts` alone still gets
+                // budgeted and evicted.
+                let mirror_count = tool_result
+                    .images
+                    .iter()
+                    .filter(|p| matches!(p, ContentPart::Image { .. }))
+                    .count();
+                let parts_count = tool_result
+                    .parts
+                    .iter()
+                    .filter(|p| matches!(p, ContentPart::Image { .. }))
+                    .count();
+                let source = if parts_count > mirror_count {
+                    &tool_result.parts
+                } else {
+                    &tool_result.images
+                };
+                for content_part in source {
                     if let ContentPart::Image { .. } = content_part {
                         images.push((
                             ImageLocation::ToolResult { item },
@@ -300,17 +331,18 @@ fn evict_images_to_budget(
                 let ConversationItem::ToolResult(tool_result) = &mut conversation[item] else {
                     unreachable!("image location must retain its item variant")
                 };
-                let image_index = tool_result
-                    .images
-                    .iter()
-                    .position(|part| matches!(part, ContentPart::Image { .. }))
+                // Removes from the `images` mirror AND the ordered `parts`
+                // atomically — an image surviving in `parts` would still
+                // serialize on the wire and defeat the budget.
+                crate::tool_result_edit::remove_first_tool_result_image(tool_result)
                     .unwrap_or_else(|| unreachable!("discovered tool image must remain present"));
-                tool_result.images.remove(image_index);
                 running = running
                     .saturating_sub(image_bytes + usize::from(!tool_result.images.is_empty()));
                 if !tool_result.content.contains(TOOL_IMAGE_COMPACT_NOTE) {
-                    tool_result.content =
-                        format!("{}\n\n{TOOL_IMAGE_COMPACT_NOTE}", tool_result.content).into();
+                    crate::tool_result_edit::append_tool_result_note(
+                        tool_result,
+                        TOOL_IMAGE_COMPACT_NOTE,
+                    );
                     running = running.saturating_add(tool_note_bytes);
                 }
             }

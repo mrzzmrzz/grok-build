@@ -397,6 +397,18 @@ impl ChatStateActor {
             ChatStateCommand::GetCredentials { reply } => {
                 let _ = reply.send(self.state.credentials.clone());
             }
+            ChatStateCommand::MarkEverUsedCodex => {
+                if !self.state.ever_used_codex {
+                    tracing::info!(
+                        "session marked ever_used_codex: xAI-only egress of session \
+                         content is disabled for the session's remaining lifetime"
+                    );
+                }
+                self.state.ever_used_codex = true;
+            }
+            ChatStateCommand::GetEverUsedCodex { reply } => {
+                let _ = reply.send(self.state.ever_used_codex);
+            }
             ChatStateCommand::GetLastModelMetadata { reply } => {
                 let _ = reply.send(self.get_last_model_metadata());
             }

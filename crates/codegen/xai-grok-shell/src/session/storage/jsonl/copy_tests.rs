@@ -1399,3 +1399,49 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
         vec![(0, b"aa".to_vec()), (1, b"bb".to_vec())]
     );
 }
+
+/// `ever_used_codex` rides every fork shape — full forks AND partial forks
+/// (`target_prompt_index`): any retained prefix may contain Codex output, so
+/// the mark must be inherited unconditionally.
+#[test]
+fn fork_summary_inherits_ever_used_codex_for_full_and_partial_forks() {
+    let mut source =
+        crate::session::persistence::Summary::new(
+            &Info {
+                id: acp::SessionId::new("fork-source"),
+                cwd: "/tmp/fork-source".into(),
+            },
+            default_model_id(),
+        )
+        .expect("source summary");
+    source.ever_used_codex = true;
+    let target_info = Info {
+        id: acp::SessionId::new("fork-target"),
+        cwd: "/tmp/fork-target".into(),
+    };
+    let counters = || super::ForkCounters {
+        num_messages: 0,
+        num_chat_messages: 0,
+        cwd_switch_bookkeeping_generation: 0,
+        inherited_prefix_len: None,
+    };
+
+    let full = super::fork_summary(
+        source.clone(),
+        &target_info,
+        &CopySessionOptions::default(),
+        counters(),
+    );
+    assert!(full.ever_used_codex, "full fork must inherit the mark");
+
+    let partial = super::fork_summary(
+        source,
+        &target_info,
+        &CopySessionOptions {
+            target_prompt_index: Some(1),
+            ..Default::default()
+        },
+        counters(),
+    );
+    assert!(partial.ever_used_codex, "partial fork must inherit the mark");
+}

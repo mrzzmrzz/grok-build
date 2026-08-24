@@ -96,41 +96,44 @@ impl MvpAgent {
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
         let slug = self.resolve_session_summary_model();
-        let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
-        let models = self.models_manager.models();
-        let endpoints = self.models_manager.endpoints();
-        let (disable_api_key_auth, alpha_test_key, client_version) = {
-            let cfg = self.cfg.borrow();
-            (
-                cfg.grok_com_config.api_key_auth_disabled(),
-                cfg.endpoints.alpha_test_key.clone(),
-                cfg.client_version.clone(),
+        // Provenance approximation until `Config` carries the
+        // `AuxModelPin` fields (see `crate::config::AuxModelPin`): a slug
+        // that differs from the compiled default can only come from an
+        // explicit source (CLI/env/toml/remote).
+        let slug_is_explicit = slug != crate::models::default_session_summary_model();
+        let resolved_aux = if summary_aux_resolution_allowed(primary, slug_is_explicit) {
+            // Only an xAI credential may become the aux resolver's xAI proxy
+            // bearer (tier 2 adopts `session_key` verbatim); a Codex OAuth
+            // key must never ride an xAI request. Mirrors the `user_id`
+            // filter in `sampler_turn.rs`.
+            let session_key = self
+                .auth_manager
+                .current_or_expired()
+                .filter(|a| a.is_xai_auth())
+                .map(|a| a.key.clone());
+            let models = self.models_manager.models();
+            let endpoints = self.models_manager.endpoints();
+            let (disable_api_key_auth, alpha_test_key, client_version) = {
+                let cfg = self.cfg.borrow();
+                (
+                    cfg.grok_com_config.api_key_auth_disabled(),
+                    cfg.endpoints.alpha_test_key.clone(),
+                    cfg.client_version.clone(),
+                )
+            };
+            crate::agent::config::resolve_aux_model_sampling_config(
+                &slug,
+                &models,
+                &endpoints,
+                session_key.as_deref(),
+                disable_api_key_auth,
+                alpha_test_key,
+                client_version,
             )
+        } else {
+            None
         };
-        let config = match crate::agent::config::resolve_aux_model_sampling_config(
-            &slug,
-            &models,
-            &endpoints,
-            session_key.as_deref(),
-            disable_api_key_auth,
-            alpha_test_key,
-            client_version,
-        ) {
-            Some(mut cfg) => {
-                crate::agent::config::stamp_session_local_sampler_fields(
-                    &mut cfg,
-                    primary,
-                    primary.client_identifier.clone(),
-                    primary.max_retries,
-                );
-                cfg
-            }
-            None => {
-                let mut fallback = primary.clone();
-                fallback.model = slug;
-                fallback
-            }
-        };
+        let config = plan_summary_sampler_config(primary, slug, resolved_aux, slug_is_explicit);
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
         Ok((client, model))
@@ -3767,11 +3770,31 @@ impl MvpAgent {
         uploads
     }
     /// Gets the trace context for a prompt using cloud storage.
+    ///
+    /// Codex provenance gate: prompt traces ride an xAI-only upload
+    /// pipeline, so a session that ever sampled through the Codex provider —
+    /// or whose effective model currently resolves to Codex — gets no trace
+    /// context at all. Gating here (the single construction site) means no
+    /// capture ever begins for such a session, for main turns, harness trace
+    /// turns, synthetic turns, and `/share` alike. The check is monotonic:
+    /// `ever_used_codex` never clears for a session's remaining lifetime.
     pub(crate) async fn get_trace_context(
         &self,
         session_info: &crate::session::info::Info,
         turn_number: u64,
     ) -> Option<PromptTraceContext> {
+        if let Some(handle) = self.resident_handle(&session_info.id)
+            && self.session_has_codex_provenance(&handle).await
+        {
+            xai_grok_telemetry::session_ctx::log_session_event(
+                crate::agent::session_metrics::TraceUploadSkipped {
+                    session_id: session_info.id.0.to_string(),
+                    turn_number,
+                    reason: "codex_provenance".to_owned(),
+                },
+            );
+            return None;
+        }
         let (upload_method, upload_reason) = self
             .trace_upload_config_with_reason()
             .await;
@@ -3872,6 +3895,45 @@ impl MvpAgent {
             artifact_tracker: crate::upload::manifest::new_artifact_tracker(),
             auth_manager: self.auth_manager.clone(),
         })
+    }
+    /// Whether `handle`'s session must be excluded from xAI-only egress:
+    /// its monotonic `ever_used_codex` chat-state mark, or an effective
+    /// sampling model that resolves to the Codex provider (merged
+    /// account-scoped catalog first, static config as fallback — a live-only
+    /// Codex slug is invisible to a static resolve). The provider check is
+    /// the safety net for a session whose provenance mark has not landed yet
+    /// when the turn's trace decision is made.
+    async fn session_has_codex_provenance(
+        &self,
+        handle: &crate::session::SessionHandle,
+    ) -> bool {
+        if let Some(marked) = handle.chat_state_handle.try_ever_used_codex().await
+            && marked
+        {
+            return true;
+        }
+        // Effective model: the live sampling config when the chat-state
+        // actor answers, else the session's pinned model id.
+        let model = match handle.chat_state_handle.get_sampling_config().await {
+            Some(cfg) => cfg.model,
+            None => handle.model_id.0.to_string(),
+        };
+        self.model_provider_is_codex(&model)
+    }
+    /// Provider identity of `model`, merged account-scoped catalog first
+    /// (live-only Codex slugs are invisible to a static resolve), static
+    /// config as fallback.
+    fn model_provider_is_codex(&self, model: &str) -> bool {
+        let provider = self
+            .models_manager
+            .model_auth_state(model)
+            .map(|(facts, _)| facts.model_provider)
+            .unwrap_or_else(|| {
+                crate::agent::config::resolve_model_auth_facts_and_provider(model)
+                    .0
+                    .model_provider
+            });
+        provider == xai_grok_sampling_types::ModelProvider::Codex
     }
     /// Resolve the agent definition for a session.
     ///
@@ -5052,5 +5114,406 @@ impl Drop for LocalWorkspaceReapGuard {
                 handle.shutdown().await;
             });
         }
+    }
+}
+
+/// Whether the session-summary path may resolve the auxiliary (xAI-routed)
+/// summary model at all.
+///
+/// Provider isolation (spec §12.2): a non-xAI session's conversation content
+/// must not flow to an xAI auxiliary helper unless the user explicitly pinned
+/// the summary model. The aux resolver's tier-2 fallback synthesizes an
+/// xAI-profiled config from the session/env bearer, so for an unpinned
+/// non-xAI session we must not even ask it.
+pub(crate) fn summary_aux_resolution_allowed(
+    primary: &SamplingConfig,
+    slug_is_explicit: bool,
+) -> bool {
+    primary.provider_profile.provider == xai_grok_sampling_types::ModelProvider::Xai
+        || slug_is_explicit
+}
+
+/// Choose the sampling config the session-summary client is built from —
+/// pure, so the provider-isolation rules are unit-testable.
+///
+/// - xAI session + resolved aux: use the aux config (stamped with the
+///   session-local fields), exactly as before.
+/// - xAI session + no aux: legacy fallback — the session config with the aux
+///   slug stamped on (the xAI proxy routes internal slugs).
+/// - non-xAI (Codex) session + explicit pin + resolved aux: the user
+///   consented to the cross-provider helper; use it.
+/// - non-xAI session otherwise: keep the session's own config *unchanged*
+///   (model included). Never stamp the xAI aux slug onto the non-xAI
+///   endpoint — that request can only fail (the slug does not exist there) —
+///   and never route content to the xAI helper by default.
+pub(crate) fn plan_summary_sampler_config(
+    primary: &SamplingConfig,
+    slug: String,
+    resolved_aux: Option<SamplingConfig>,
+    slug_is_explicit: bool,
+) -> SamplingConfig {
+    use xai_grok_sampling_types::ModelProvider;
+    let is_xai_session = primary.provider_profile.provider == ModelProvider::Xai;
+    match resolved_aux {
+        Some(mut cfg) if is_xai_session || slug_is_explicit => {
+            crate::agent::config::stamp_session_local_sampler_fields(
+                &mut cfg,
+                primary,
+                primary.client_identifier.clone(),
+                primary.max_retries,
+            );
+            cfg
+        }
+        _ if is_xai_session => {
+            let mut fallback = primary.clone();
+            fallback.model = slug;
+            fallback
+        }
+        _ => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    aux_model = %slug,
+                    session_model = %primary.model,
+                    "session-summary helper model is not reachable from this \
+                     provider's session; summaries stay on the session model. \
+                     To route summaries to a specific model, pin one your \
+                     credentials can reach via [models].session_summary in \
+                     config.toml or GROK_SESSION_SUMMARY_MODEL."
+                );
+            });
+            primary.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod summary_client_plan_tests {
+    use super::{plan_summary_sampler_config, summary_aux_resolution_allowed};
+    use crate::sampling::SamplerConfig;
+    use xai_grok_sampling_types::ProviderProfile;
+
+    fn config(model: &str, profile: ProviderProfile) -> SamplerConfig {
+        SamplerConfig {
+            model: model.to_owned(),
+            base_url: match profile.provider {
+                xai_grok_sampling_types::ModelProvider::Xai => "https://api.x.ai/v1".to_owned(),
+                xai_grok_sampling_types::ModelProvider::Codex => {
+                    "https://chatgpt.example/backend-api/codex".to_owned()
+                }
+            },
+            provider_profile: profile,
+            ..Default::default()
+        }
+    }
+
+    /// The guaranteed-404 regression: a Codex session whose aux slug cannot
+    /// be resolved must NOT get the xAI slug stamped onto the Codex endpoint.
+    #[test]
+    fn codex_session_without_aux_keeps_its_own_model_and_endpoint() {
+        let primary = config("gpt-5.1-codex", ProviderProfile::CODEX);
+        let planned = plan_summary_sampler_config(
+            &primary,
+            crate::models::default_session_summary_model().to_owned(),
+            None,
+            false,
+        );
+        assert_eq!(planned.model, "gpt-5.1-codex");
+        assert_eq!(planned.base_url, primary.base_url);
+        assert_eq!(planned.provider_profile, ProviderProfile::CODEX);
+    }
+
+    /// Default (unpinned) Codex sessions must not even resolve the xAI aux
+    /// helper, and must ignore a resolved xAI config if handed one: content
+    /// stays on the session provider.
+    #[test]
+    fn codex_session_content_does_not_flow_to_xai_aux_by_default() {
+        let primary = config("gpt-5.1-codex", ProviderProfile::CODEX);
+        assert!(!summary_aux_resolution_allowed(&primary, false));
+        let xai_aux = config("grok-summary", ProviderProfile::XAI);
+        let planned = plan_summary_sampler_config(
+            &primary,
+            "grok-summary".to_owned(),
+            Some(xai_aux),
+            false,
+        );
+        assert_eq!(
+            planned.provider_profile,
+            ProviderProfile::CODEX,
+            "unpinned Codex session content must stay on the Codex provider"
+        );
+        assert_eq!(planned.model, "gpt-5.1-codex");
+    }
+
+    /// An explicit user pin is cross-provider consent: the resolved aux
+    /// config (with its own xAI credentials) is used.
+    #[test]
+    fn explicit_pin_allows_cross_provider_aux_for_codex_session() {
+        let primary = config("gpt-5.1-codex", ProviderProfile::CODEX);
+        assert!(summary_aux_resolution_allowed(&primary, true));
+        let xai_aux = config("grok-summary", ProviderProfile::XAI);
+        let planned =
+            plan_summary_sampler_config(&primary, "grok-summary".to_owned(), Some(xai_aux), true);
+        assert_eq!(planned.provider_profile, ProviderProfile::XAI);
+        assert_eq!(planned.model, "grok-summary");
+    }
+
+    /// An explicit pin that still fails to resolve must not fabricate a
+    /// doomed request either.
+    #[test]
+    fn explicit_pin_without_resolution_stays_on_session_provider() {
+        let primary = config("gpt-5.1-codex", ProviderProfile::CODEX);
+        let planned =
+            plan_summary_sampler_config(&primary, "grok-summary".to_owned(), None, true);
+        assert_eq!(planned.model, "gpt-5.1-codex");
+        assert_eq!(planned.provider_profile, ProviderProfile::CODEX);
+    }
+
+    /// xAI sessions keep the legacy behavior on both arms.
+    #[test]
+    fn xai_session_behavior_is_unchanged() {
+        let primary = config("grok-main", ProviderProfile::XAI);
+        assert!(summary_aux_resolution_allowed(&primary, false));
+
+        let aux = config("grok-summary", ProviderProfile::XAI);
+        let planned =
+            plan_summary_sampler_config(&primary, "grok-summary".to_owned(), Some(aux), false);
+        assert_eq!(planned.model, "grok-summary");
+
+        let planned =
+            plan_summary_sampler_config(&primary, "grok-summary".to_owned(), None, false);
+        assert_eq!(planned.model, "grok-summary", "legacy slug-on-session-endpoint fallback");
+        assert_eq!(planned.base_url, primary.base_url);
+    }
+}
+
+#[cfg(test)]
+mod codex_trace_gate_tests {
+    use crate::agent::MvpAgent;
+    use agent_client_protocol as acp;
+    use std::sync::{Arc, OnceLock};
+    use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
+
+    fn build_agent() -> MvpAgent {
+        use crate::agent::config::Config as AgentConfig;
+        use crate::auth::{AuthManager, GrokComConfig};
+        let temp_dir = tempfile::tempdir().unwrap();
+        let auth_manager =
+            Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = GatewaySender::new(tx);
+        let cfg = AgentConfig::default();
+        let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+        {
+            let mut cfg = agent.cfg.borrow_mut();
+            cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
+            cfg.telemetry.trace_upload = Some(true);
+            cfg.endpoints.trace_upload_bucket = Some("gs://codex-gate-test".to_string());
+        }
+        agent
+    }
+
+    fn sampling_config(model: &str) -> xai_grok_sampling_types::SamplingConfig {
+        xai_grok_sampling_types::SamplingConfig {
+            base_url: "https://api.test/v1".to_string(),
+            model: model.to_string(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            api_backend: Default::default(),
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+            reasoning_effort: None,
+            stream_tool_calls: None,
+        }
+    }
+
+    fn spawn_chat_state(model: &str) -> xai_chat_state::ChatStateHandle {
+        let (mock, _rx) = xai_chat_state::MockChatPersistence::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        xai_chat_state::ChatStateActor::spawn(
+            vec![],
+            sampling_config(model),
+            Box::new(mock),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    fn make_handle(
+        session_id: &str,
+        model: &str,
+        chat_state_handle: xai_chat_state::ChatStateHandle,
+    ) -> crate::session::SessionHandle {
+        let (cmd_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hunk_event_tx, _hunk_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hunk_tracker_handle = xai_hunk_tracker::HunkTrackerActor::spawn(
+            "test".to_string(),
+            std::path::PathBuf::from("/tmp"),
+            hunk_event_tx,
+            xai_hunk_tracker::TrackingMode::AllDirty,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        crate::session::SessionHandle {
+            cmd_tx,
+            persistence_tx,
+            current_prompt_id: Arc::new(std::sync::Mutex::new(None)),
+            pending_interactions: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            info: crate::session::info::Info {
+                id: acp::SessionId::new(session_id),
+                cwd: "/tmp".to_string(),
+            },
+            max_turns: None,
+            resolved_tool_overrides: Arc::new(arc_swap::ArcSwapOption::empty()),
+            hunk_tracker_handle,
+            chat_state_handle,
+            signals_handle: crate::session::signals::SessionSignalsHandle::new(),
+            gateway_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mcp_servers: vec![],
+            initial_client_mcp_servers: vec![],
+            display_cwd: None,
+            feedback_manager: Arc::new(
+                crate::session::feedback_manager::FeedbackManager::local_only("test"),
+            ),
+            upload_queue: Arc::new(OnceLock::new()),
+            upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tool_context: crate::tools::ToolContext::new_local_context(
+                xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap(),
+                Arc::new(xai_grok_workspace::file_system::LocalFs::new(
+                    std::path::PathBuf::from("/tmp"),
+                )),
+                Arc::new(crate::terminal::LocalTerminalRunner),
+            ),
+            model_id: acp::ModelId::new(model),
+            scheduler_background_loops: true,
+            reasoning_effort: None,
+            yolo_mode: false,
+            origin_client: None,
+            code_nav_enabled: false,
+            ask_user_question_enabled: true,
+            non_interactive: false,
+            plan_mode: Arc::new(parking_lot::Mutex::new(
+                crate::session::plan_mode::PlanModeTracker::new(std::path::PathBuf::from(
+                    "/tmp",
+                )),
+            )),
+            force_compact: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            permission_handle: xai_grok_workspace::permission::PermissionHandle::allow_all(),
+            attribution_callback: None,
+            agent_name: "grok-build".to_string(),
+            managed_mcp_proxy_base_url: String::new(),
+            session_default_agent_profile: None,
+            allowed_subagent_types: None,
+            hook_registry: None,
+            workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
+            terminal_backend: None,
+            tools_notification_handle: None,
+            scheduler_handle: None,
+        }
+    }
+
+    fn preset_upload_queue(agent: &MvpAgent, handle: &crate::session::SessionHandle) {
+        let queue_home = tempfile::tempdir().unwrap();
+        let queue_cfg = crate::session::repo_changes::TraceExportConfig {
+            bucket_url: Some("gs://codex-gate-test".to_string()),
+            service_account_key: None,
+            prefix_dir: None,
+            gcs_prefix: None,
+            absolute_paths: false,
+            archive_name_override: None,
+            upload_method: crate::session::repo_changes::UploadMethod::Direct {
+                service_account_key: None,
+            },
+        };
+        let queue = crate::upload::trace::spawn_upload_queue(
+            queue_home.path(),
+            &queue_cfg,
+            Some(xai_grok_version::VERSION),
+            agent.auth_manager.clone(),
+        );
+        let _ = handle.upload_queue.set(queue);
+    }
+
+    /// A session marked `ever_used_codex` must not get a trace context, even
+    /// with trace uploads fully enabled; an unmarked xAI session on the same
+    /// agent still does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn marked_session_produces_no_trace_context() {
+        let agent = build_agent();
+
+        // Unmarked xAI session: trace context is created (control case —
+        // proves the None below comes from the provenance gate, not from
+        // upload configuration).
+        let xai_sid = acp::SessionId::new("gate-xai-sess");
+        let xai_chat = spawn_chat_state("grok-4.5");
+        let xai_handle = make_handle("gate-xai-sess", "grok-4.5", xai_chat);
+        preset_upload_queue(&agent, &xai_handle);
+        agent.insert_resident(&xai_sid, xai_handle);
+        let xai_info = crate::session::info::Info {
+            id: xai_sid.clone(),
+            cwd: "/tmp".to_string(),
+        };
+        assert!(
+            agent.get_trace_context(&xai_info, 0).await.is_some(),
+            "control: an unmarked xAI session must still get a trace context"
+        );
+
+        // Marked session: no trace context, ever.
+        let sid = acp::SessionId::new("gate-marked-sess");
+        let chat = spawn_chat_state("grok-4.5");
+        chat.mark_ever_used_codex();
+        assert!(chat.ever_used_codex().await, "mark must land");
+        let handle = make_handle("gate-marked-sess", "grok-4.5", chat);
+        preset_upload_queue(&agent, &handle);
+        agent.insert_resident(&sid, handle);
+        let info = crate::session::info::Info {
+            id: sid.clone(),
+            cwd: "/tmp".to_string(),
+        };
+        assert!(
+            agent.get_trace_context(&info, 0).await.is_none(),
+            "a session that ever used Codex must not produce a trace context"
+        );
+    }
+
+    /// Even before the provenance mark lands, an effective model that
+    /// resolves to the Codex provider (merged catalog) blocks the trace
+    /// context — the safety net for mark-ordering races.
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_effective_model_produces_no_trace_context() {
+        let agent = build_agent();
+        let mut entry = crate::agent::config::ModelInfo::fallback("gpt-codex-gate-test");
+        entry.model_family = Some("codex".to_string());
+        agent.models_manager.insert_test_entry(
+            "gpt-codex-gate-test",
+            crate::agent::config::ModelEntry {
+                info: entry,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+            },
+        );
+
+        let sid = acp::SessionId::new("gate-provider-sess");
+        let chat = spawn_chat_state("gpt-codex-gate-test");
+        assert!(!chat.ever_used_codex().await, "provenance not yet marked");
+        let handle = make_handle("gate-provider-sess", "gpt-codex-gate-test", chat);
+        preset_upload_queue(&agent, &handle);
+        agent.insert_resident(&sid, handle);
+        let info = crate::session::info::Info {
+            id: sid.clone(),
+            cwd: "/tmp".to_string(),
+        };
+        assert!(
+            agent.get_trace_context(&info, 0).await.is_none(),
+            "a Codex-provider effective model must block trace-context creation"
+        );
     }
 }

@@ -394,76 +394,166 @@ struct DeviceTokenRequest<'a> {
 }
 
 /// Monotonic count of Codex logouts completed by this process. A login flow
-/// captures it before opening the browser and refuses to persist tokens if
-/// it moved (see [`persist_token_response_fenced`]): a browser callback that
-/// lands after a logout must not resurrect credentials the user just
-/// removed. Reads/writes that matter for the fence happen while the on-disk
-/// auth lock is held, so check-then-write is race-free within the process.
+/// captures it (together with the on-disk logout epoch, see [`LoginFence`])
+/// before opening the browser and refuses to persist tokens if it moved
+/// (see [`persist_token_response_fenced`]): a browser callback that lands
+/// after a logout must not resurrect credentials the user just removed.
+/// Reads/writes that matter for the fence happen while the on-disk auth lock
+/// is held, so check-then-write is race-free within the process. It is
+/// process-local; the cross-process half of the fence is the persisted
+/// logout epoch beside the auth file.
 static LOGOUT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn logout_generation() -> u64 {
     LOGOUT_GENERATION.load(Ordering::Acquire)
 }
 
-/// The pending interactive login's cancellation token, if one is waiting for
-/// its browser/device callback. A logout cancels it up front so it never has
-/// to queue behind the full callback window.
-struct PendingLoginSlot(Mutex<Option<tokio_util::sync::CancellationToken>>);
+/// Both halves of the logout fence a login captures before its browser or
+/// device wait begins: the in-process generation and the on-disk epoch
+/// (which survives across processes, so a logout completed by a separate
+/// CLI/TUI process still fences this login's late callback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoginFence {
+    generation: u64,
+    disk_epoch: u64,
+}
 
-impl PendingLoginSlot {
+fn capture_login_fence(path: &Path) -> LoginFence {
+    LoginFence {
+        generation: logout_generation(),
+        disk_epoch: read_disk_logout_epoch(path),
+    }
+}
+
+/// Sibling tombstone file carrying the persisted logout epoch. Written under
+/// the same cross-process auth file lock that guards credential mutation;
+/// never removed by a login, so its value only moves forward.
+fn logout_epoch_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| CODEX_AUTH_FILE_NAME.to_owned());
+    path.with_file_name(format!("{name}.logout-epoch"))
+}
+
+/// The persisted logout epoch for the auth store at `path`; `0` when no
+/// logout has ever been recorded (or the tombstone is unreadable).
+fn read_disk_logout_epoch(path: &Path) -> u64 {
+    std::fs::read_to_string(logout_epoch_path(path))
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Advance the persisted logout epoch. The caller MUST hold the auth file
+/// lock, so the bump is atomic with the credential removal it records.
+/// Best-effort: a failed write degrades cross-process fencing but never
+/// blocks the logout itself (the in-process generation still advanced).
+fn bump_disk_logout_epoch(path: &Path) {
+    let next = read_disk_logout_epoch(path).saturating_add(1);
+    let epoch_path = logout_epoch_path(path);
+    if let Some(parent) = epoch_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(&epoch_path, next.to_string()) {
+        tracing::warn!(
+            %error,
+            path = %epoch_path.display(),
+            "could not persist the Codex logout epoch; cross-process login fencing is degraded"
+        );
+    }
+}
+
+/// Registered cancellable login attempts: the flow actively waiting on its
+/// browser/device callback AND any attempts still queued behind the
+/// extension layer's FIFO operation lock. A logout cancels them all —
+/// registration happens at enqueue time (see `extensions::codex`), so a
+/// queued login can no longer escape a logout issued after it was requested
+/// but before it reached the lock.
+struct PendingLoginRegistry {
+    next_id: AtomicU64,
+    slots: Mutex<Vec<(u64, tokio_util::sync::CancellationToken)>>,
+}
+
+impl PendingLoginRegistry {
     const fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-
-    /// Register a login attempt as cancellable by a logout. Replaces (and
-    /// cancels) any earlier pending attempt — the newest attempt is the
-    /// user's latest intent.
-    fn register(&self) -> tokio_util::sync::CancellationToken {
-        let token = tokio_util::sync::CancellationToken::new();
-        let mut slot = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(old) = slot.replace(token.clone()) {
-            old.cancel();
+        Self {
+            next_id: AtomicU64::new(0),
+            slots: Mutex::new(Vec::new()),
         }
-        token
     }
 
-    /// Drop the registration (the attempt finished either way).
-    fn take(&self) {
-        self.0
+    fn register(&self) -> (u64, tokio_util::sync::CancellationToken) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let token = tokio_util::sync::CancellationToken::new();
+        self.slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .push((id, token.clone()));
+        (id, token)
     }
 
-    /// Cancel the pending attempt, if any.
-    fn cancel(&self) {
-        if let Some(token) = self
-            .0
+    fn remove(&self, id: u64) {
+        self.slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+            .retain(|(slot_id, _)| *slot_id != id);
+    }
+
+    fn cancel_all(&self) {
+        let drained: Vec<_> = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        for (_, token) in drained {
             token.cancel();
         }
     }
 }
 
-static PENDING_LOGIN: PendingLoginSlot = PendingLoginSlot::new();
+static PENDING_LOGINS: PendingLoginRegistry = PendingLoginRegistry::new();
 
-fn register_pending_login() -> tokio_util::sync::CancellationToken {
-    PENDING_LOGIN.register()
+/// RAII registration of one login attempt (queued or active). Dropping it
+/// deregisters the attempt; a logout cancels every live registration.
+pub(crate) struct LoginAttemptGuard {
+    id: u64,
+    token: tokio_util::sync::CancellationToken,
 }
 
-fn take_pending_login() {
-    PENDING_LOGIN.take()
+impl LoginAttemptGuard {
+    /// Whether a logout has already invalidated this attempt.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    fn token(&self) -> tokio_util::sync::CancellationToken {
+        self.token.clone()
+    }
 }
 
-/// Cancel a pending interactive login's callback wait, if any. Called when a
-/// logout begins — including before the extension layer's login/logout
-/// serialization lock is taken, so the logout is never stuck behind a
-/// browser window the user has already abandoned.
+impl Drop for LoginAttemptGuard {
+    fn drop(&mut self) {
+        PENDING_LOGINS.remove(self.id);
+    }
+}
+
+/// Register a login attempt as cancellable by a logout. Called at enqueue
+/// time by the extension layer (before its FIFO operation lock) and by the
+/// login flows themselves for their callback wait.
+pub(crate) fn register_login_attempt() -> LoginAttemptGuard {
+    let (id, token) = PENDING_LOGINS.register();
+    LoginAttemptGuard { id, token }
+}
+
+/// Cancel every pending login attempt — active callback waits AND attempts
+/// still queued behind the operation lock. Called when a logout begins,
+/// including before the extension layer's serialization lock is taken, so
+/// the logout is never stuck behind a browser window the user has already
+/// abandoned nor behind a login that had not even started yet.
 pub(crate) fn cancel_pending_login() {
-    PENDING_LOGIN.cancel();
+    PENDING_LOGINS.cancel_all();
 }
 
 pub fn auth_file_path() -> PathBuf {
@@ -781,21 +871,28 @@ async fn exchange_code(
         .context("Codex OAuth token response was invalid")
 }
 
-/// [`persist_token_response`] fenced on the logout generation captured when
-/// the login flow started. The caller must hold the auth lock; the same lock
-/// guards the generation bump in [`logout_at`], so "no logout happened since
-/// this login began" and the write are atomic within the process. A moved
-/// generation means the user's latest completed intent is "logged out": the
-/// finished browser callback is discarded instead of resurrecting
-/// credentials.
+/// [`persist_token_response`] fenced on the [`LoginFence`] captured when the
+/// login flow started. The caller must hold the auth lock; the same lock
+/// guards the generation bump AND the persisted-epoch bump in [`logout_at`],
+/// so "no logout happened since this login began" and the write are atomic —
+/// within the process via the static generation, across processes via the
+/// on-disk epoch re-read here under the lock. A moved fence means the user's
+/// latest completed intent is "logged out": the finished browser callback is
+/// discarded instead of resurrecting credentials.
 fn persist_token_response_fenced(
     path: &Path,
     response: TokenResponse,
-    logout_fence: u64,
+    logout_fence: LoginFence,
 ) -> Result<CodexCredentials> {
-    if logout_generation() != logout_fence {
+    if logout_generation() != logout_fence.generation {
         bail!(
             "Codex login was superseded by a logout while waiting for its callback; \
+             discarding the completed login"
+        );
+    }
+    if read_disk_logout_epoch(path) != logout_fence.disk_epoch {
+        bail!(
+            "Codex login was superseded by a logout completed by another process; \
              discarding the completed login"
         );
     }
@@ -848,8 +945,9 @@ async fn run_browser_login_at(
     endpoints: &CodexEndpoints,
     announce: bool,
 ) -> Result<CodexCredentials> {
-    let logout_fence = logout_generation();
-    let cancelled_by_logout = register_pending_login();
+    let logout_fence = capture_login_fence(path);
+    let attempt = register_login_attempt();
+    let cancelled_by_logout = attempt.token();
     let listener = bind_callback_listener()
         .await
         .context("could not bind Codex OAuth callback on ports 1455 or 1457")?;
@@ -901,13 +999,11 @@ async fn run_browser_login_at(
     let callback_result = tokio::select! {
         () = cancelled_by_logout.cancelled() => {
             server.abort();
-            take_pending_login();
             bail!("Codex login was cancelled by a logout");
         }
         result = tokio::time::timeout(CALLBACK_TIMEOUT, result_rx) => result,
     };
     server.abort();
-    take_pending_login();
     let callback = callback_result
         .context("timed out waiting for the Codex OAuth callback")?
         .context("Codex OAuth callback server stopped")?;
@@ -918,8 +1014,9 @@ async fn run_browser_login_at(
 }
 
 async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<CodexCredentials> {
-    let logout_fence = logout_generation();
-    let cancelled_by_logout = register_pending_login();
+    let logout_fence = capture_login_fence(path);
+    let attempt = register_login_attempt();
+    let cancelled_by_logout = attempt.token();
     let client = reqwest::Client::new();
     let issuer = endpoints.issuer.trim_end_matches('/');
     let response = client
@@ -974,13 +1071,11 @@ async fn run_device_login_at(path: &Path, endpoints: &CodexEndpoints) -> Result<
         }
         tokio::select! {
             () = cancelled_by_logout.cancelled() => {
-                take_pending_login();
                 bail!("Codex login was cancelled by a logout");
             }
             () = tokio::time::sleep(Duration::from_secs(device.interval.max(1))) => {}
         }
     };
-    take_pending_login();
     let redirect_uri = format!("{issuer}/deviceauth/callback");
     let response = exchange_code(
         endpoints,
@@ -1205,8 +1300,12 @@ async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
     };
     clear_permanent_refresh_failure(path);
     // Still under the auth lock: any login that started before this logout
-    // now fails its persist fence instead of resurrecting credentials.
+    // now fails its persist fence instead of resurrecting credentials. The
+    // in-process generation fences logins in this process; the persisted
+    // epoch beside the auth file fences logins running in OTHER processes,
+    // whose statics cannot see this bump.
     LOGOUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    bump_disk_logout_epoch(path);
     Ok(removed)
 }
 
@@ -2005,12 +2104,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CODEX_AUTH_FILE_NAME);
         // The login flow captured its fence before opening the browser.
-        let fence = logout_generation();
+        let fence = capture_login_fence(&path);
         // Logout completes while the callback is still pending (no store on
         // disk, so no revocation traffic leaves the machine).
         let removed = logout_at(&path, &endpoints("http://127.0.0.1:9")).await.unwrap();
         assert!(!removed);
-        assert!(logout_generation() > fence, "logout must advance the fence");
+        assert!(
+            logout_generation() > fence.generation,
+            "logout must advance the fence"
+        );
+        assert!(
+            read_disk_logout_epoch(&path) > fence.disk_epoch,
+            "logout must advance the persisted epoch"
+        );
         // The stale callback now completes and tries to persist under the
         // same lock the logout used.
         let response = TokenResponse {
@@ -2043,10 +2149,10 @@ mod tests {
         // The generation is process-global and sibling tests log out
         // concurrently; retry until the capture-persist pair was atomic.
         let credentials = loop {
-            let fence = logout_generation();
+            let fence = capture_login_fence(&path);
             match persist_token_response_fenced(&path, make_response(), fence) {
                 Ok(credentials) => break credentials,
-                Err(_) if logout_generation() != fence => continue,
+                Err(_) if logout_generation() != fence.generation => continue,
                 Err(error) => panic!("unexpected persist failure: {error}"),
             }
         };
@@ -2054,29 +2160,113 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// The pending-login slot: a logout cancels the registered attempt, a
-    /// newer registration supersedes (and cancels) an older one, and a
-    /// finished attempt detaches without being cancelled.
+    /// The pending-login registry: a logout cancels EVERY registered attempt
+    /// — the one actively waiting on its callback AND those still queued
+    /// behind the extension layer's FIFO operation lock (the login-A-active
+    /// + login-B-queued + logout-C scenario: C invalidates both A and B).
+    /// A finished (dropped) attempt detaches without being cancelled.
     #[test]
-    fn pending_login_slot_cancels_and_replaces() {
-        let slot = PendingLoginSlot::new();
-        let token = slot.register();
-        assert!(!token.is_cancelled());
-        slot.cancel();
-        assert!(token.is_cancelled(), "logout must wake the pending wait");
-
-        let first = slot.register();
-        let second = slot.register();
+    fn logout_cancels_active_and_queued_login_attempts() {
+        let registry = PendingLoginRegistry::new();
+        let (a_id, a_token) = registry.register(); // login A: active
+        let (_b_id, b_token) = registry.register(); // login B: queued
+        assert!(!a_token.is_cancelled());
+        assert!(!b_token.is_cancelled());
+        registry.cancel_all(); // logout C
         assert!(
-            first.is_cancelled(),
-            "re-registration cancels the older attempt"
+            a_token.is_cancelled(),
+            "logout must cancel the ACTIVE login's callback wait"
         );
-        assert!(!second.is_cancelled());
-        slot.take();
-        slot.cancel();
         assert!(
-            !second.is_cancelled(),
-            "a finished attempt must not be cancelled retroactively"
+            b_token.is_cancelled(),
+            "logout must also invalidate the login still QUEUED behind it"
+        );
+        // Attempts registered after the logout are a fresh intent.
+        let (_c_id, c_token) = registry.register();
+        assert!(!c_token.is_cancelled());
+        // A finished attempt deregisters; a later logout must not touch it.
+        registry.remove(a_id);
+        let (_d_id, d_token) = registry.register();
+        registry.cancel_all();
+        assert!(c_token.is_cancelled());
+        assert!(d_token.is_cancelled());
+    }
+
+    /// The public guard wires the same semantics end to end: enqueue-time
+    /// registration, logout cancellation, Drop deregistration. The registry
+    /// is process-global and sibling tests run logouts concurrently, so the
+    /// pre-cancellation state is (re)established with a retry.
+    #[test]
+    fn login_attempt_guard_registers_and_deregisters() {
+        let (active, queued) = loop {
+            let active = register_login_attempt();
+            let queued = register_login_attempt();
+            if !active.is_cancelled() && !queued.is_cancelled() {
+                break (active, queued);
+            }
+            // A sibling test's logout raced the registration; try again.
+        };
+        cancel_pending_login();
+        assert!(active.is_cancelled(), "active attempt invalidated");
+        assert!(queued.is_cancelled(), "queued attempt invalidated");
+        drop(active);
+        drop(queued);
+        // A fresh attempt after the logout is a new intent (bounded retry —
+        // sibling logouts may keep racing).
+        assert!(
+            (0..100).any(|_| !register_login_attempt().is_cancelled()),
+            "a fresh attempt after the logout must start uncancelled"
+        );
+    }
+
+    /// Two-process simulation over one shared disk state: process 1 captured
+    /// its login fence, process 2 completes a logout (bumping only the
+    /// on-disk epoch as far as process 1 can see — its in-process generation
+    /// static is invisible across processes). Process 1's late callback must
+    /// be refused by the persisted epoch check even though its own
+    /// generation appears unmoved.
+    #[tokio::test]
+    async fn cross_process_logout_epoch_fences_stale_login_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        // Process 1: login begins, fence captured from shared disk state.
+        let process1_fence = capture_login_fence(&path);
+        // Process 2: logout completes against the same auth path (bumps the
+        // shared on-disk epoch; its own static generation is per-process).
+        let removed = logout_at(&path, &endpoints("http://127.0.0.1:9"))
+            .await
+            .unwrap();
+        assert!(!removed);
+        // Process 1's view: its process-local generation never moved (model
+        // that by stamping the CURRENT generation into the fence), but the
+        // shared disk epoch did.
+        let make_response = || TokenResponse {
+            id_token: jwt(serde_json::json!({ "email": "a@example.com" })),
+            access_token: "acc".to_owned(),
+            refresh_token: "ref".to_owned(),
+        };
+        let _lock = acquire_auth_lock(&path).unwrap();
+        // The generation static is process-global and sibling tests log out
+        // concurrently; retry until this pair was atomic so the failure seen
+        // is attributable to the DISK epoch alone.
+        let error = loop {
+            let stale_cross_process_fence = LoginFence {
+                generation: logout_generation(),
+                disk_epoch: process1_fence.disk_epoch,
+            };
+            let error = persist_token_response_fenced(&path, make_response(), stale_cross_process_fence)
+                .unwrap_err();
+            if logout_generation() == stale_cross_process_fence.generation {
+                break error;
+            }
+        };
+        assert!(
+            error.to_string().contains("another process"),
+            "the persisted epoch must fence the cross-process stale login: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "the other process's logout must remain the final credential state"
         );
     }
 }

@@ -65,12 +65,31 @@ impl CodexUsageResponse {
 
 /// Serializes Codex login/logout end-to-end (each handler holds the guard
 /// for its full duration, browser wait included) so interleaved operations
-/// cannot reverse the user's final intent. A logout first cancels a pending
-/// login's callback wait (`codex_auth::cancel_pending_login`) *before*
-/// queueing here, so it never waits out the 10-minute browser window; the
-/// logout-generation fence inside `codex_auth` is the in-lock backstop that
-/// keeps a completed stale callback from resurrecting credentials.
+/// cannot reverse the user's final intent. Cancellation is allocated at
+/// ENQUEUE time: a login registers its `LoginAttemptGuard` *before* queueing
+/// here, and a logout cancels every registered attempt (active AND queued)
+/// *before* queueing — so with login A active, login B queued, and logout C
+/// queued, C invalidates both A and B instead of letting B start a fresh
+/// callback wait ahead of C. The logout fence inside `codex_auth` (process
+/// generation + persisted on-disk epoch, both checked under the auth file
+/// lock) is the backstop that keeps a completed stale callback — from this
+/// process or another one — from resurrecting credentials.
 static CODEX_AUTH_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The enqueue-time fence, checked right after the FIFO lock is acquired: a
+/// queued login that a logout invalidated while it waited reports itself as
+/// superseded instead of opening a browser the user no longer wants.
+fn queued_login_superseded(
+    attempt: &crate::codex_auth::LoginAttemptGuard,
+) -> Option<CodexAuthActionResponse> {
+    attempt.is_cancelled().then(|| CodexAuthActionResponse {
+        ok: false,
+        email: None,
+        plan_type: None,
+        was_logged_in: None,
+        error: Some("Codex login was superseded by a logout".to_string()),
+    })
+}
 
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
@@ -89,7 +108,14 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 /// admits Codex entries) and a background Codex catalog refresh is spawned so
 /// live GPT models appear in the picker without a restart.
 async fn handle_login(agent: &MvpAgent) -> ExtResult {
+    // Register BEFORE queueing on the operation lock: a logout issued while
+    // this login is still queued cancels the attempt at its enqueue
+    // generation, and the check below aborts it without a callback wait.
+    let attempt = crate::codex_auth::register_login_attempt();
     let _op = CODEX_AUTH_OP_LOCK.lock().await;
+    if let Some(response) = queued_login_superseded(&attempt) {
+        return to_raw_response(&response);
+    }
     match crate::codex_auth::run_tui_login().await {
         Ok(summary) => {
             tracing::info_span!("auth.lifecycle", action = "codex_login", success = true)
@@ -269,6 +295,46 @@ mod tests {
             .await
             .expect("logout proceeds once the login operation completes")
             .unwrap();
+    }
+
+    /// Enqueue-time fence: with login A active and login B queued, a logout
+    /// C cancels BOTH registrations; when B finally acquires the operation
+    /// lock it reports itself superseded instead of opening a browser. An
+    /// attempt registered after the logout proceeds normally.
+    #[test]
+    fn queued_login_invalidated_by_logout_reports_superseded() {
+        // The registry is process-global and sibling tests run logouts
+        // concurrently, so establish the pre-logout state with a retry.
+        let (login_a, login_b) = loop {
+            let a = crate::codex_auth::register_login_attempt(); // active
+            let b = crate::codex_auth::register_login_attempt(); // queued
+            if queued_login_superseded(&a).is_none() && queued_login_superseded(&b).is_none() {
+                break (a, b);
+            }
+        };
+        // Logout C runs its up-front cancellation (see handle_logout).
+        crate::codex_auth::cancel_pending_login();
+        let response = queued_login_superseded(&login_b)
+            .expect("queued login B must be invalidated by logout C");
+        assert!(!response.ok);
+        assert!(
+            response.error.as_deref().unwrap_or_default().contains("superseded"),
+            "{response:?}"
+        );
+        assert!(
+            queued_login_superseded(&login_a).is_some(),
+            "the active login A is invalidated too"
+        );
+        drop(login_a);
+        drop(login_b);
+        // A login enqueued after the logout is a new intent (bounded retry —
+        // sibling logouts may keep racing).
+        assert!(
+            (0..100).any(|_| {
+                queued_login_superseded(&crate::codex_auth::register_login_attempt()).is_none()
+            }),
+            "a login enqueued after the logout must proceed"
+        );
     }
 
     #[test]

@@ -302,6 +302,13 @@ pub enum ChatStateCommand {
     /// Get credential secrets.
     GetCredentials { reply: oneshot::Sender<Credentials> },
 
+    /// Monotonically mark that the session has sampled through the Codex
+    /// provider. There is deliberately no command to clear it.
+    MarkEverUsedCodex,
+
+    /// Whether the session has ever sampled through the Codex provider.
+    GetEverUsedCodex { reply: oneshot::Sender<bool> },
+
     GetLastModelMetadata {
         reply: oneshot::Sender<ModelMetadata>,
     },

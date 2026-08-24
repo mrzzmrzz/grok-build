@@ -526,6 +526,16 @@ impl SessionActor {
                 &mut self.codex_turn_state.borrow_mut(),
                 turn_state,
             );
+            // Only Codex responses carry the header, so this is the
+            // response-driven "session touched Codex" signal: monotonically
+            // mark chat-state (rides snapshots/forks) and the persisted
+            // summary (rides resume), and drop xAI-only remote/relay sync.
+            // Idempotent, so re-marking every Codex response is harmless.
+            self.chat_state_handle.mark_ever_used_codex();
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(crate::session::persistence::PersistenceMsg::MarkEverUsedCodex);
         }
         if let Some(ref etag) = metadata.models_etag {
             self.models_manager.refresh_if_new_etag(etag.clone()).await;

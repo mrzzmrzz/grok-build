@@ -25,11 +25,16 @@ pub(crate) const SUPPRESS_UNTIL_SUCCESS: u8 = 3;
 /// (waiting for a sample deadlocks when context is already over the window).
 pub(crate) const SUPPRESS_AUTH: u8 = 4;
 
-/// Model slug and context window from the previous turn.
+/// Model slug, context window, and Codex compaction-compatibility hash from
+/// the previous turn.
 #[derive(Clone, Debug)]
 pub(crate) struct PreviousModelInfo {
     pub model_slug: String,
     pub context_window: u64,
+    /// Opaque Codex catalog `comp_hash` snapshotted with the turn's model.
+    /// `None` means "no signal" (xAI models, or catalog metadata not yet
+    /// plumbed) — see `comp_hash_changed` in `session/compaction.rs`.
+    pub comp_hash: Option<String>,
 }
 
 /// Cached result of an **async** (background / prefire) pass-1 sample for

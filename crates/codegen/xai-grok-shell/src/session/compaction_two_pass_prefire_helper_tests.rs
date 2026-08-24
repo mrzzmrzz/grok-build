@@ -44,3 +44,15 @@ fn prefire_lead_percent_defaults_to_10() {
     unsafe { std::env::remove_var("GROK_PREFIRE_LEAD_PERCENT") };
     assert_eq!(prefire_lead_percent(), 10);
 }
+
+/// `comp_hash` semantics: only a change between two present values fires;
+/// `None` on either side is "no signal", and equal hashes are stable.
+#[test]
+fn comp_hash_changed_requires_two_present_differing_values() {
+    use super::comp_hash_changed;
+    assert!(comp_hash_changed(Some("h1"), Some("h2")));
+    assert!(!comp_hash_changed(Some("h1"), Some("h1")));
+    assert!(!comp_hash_changed(None, Some("h1")));
+    assert!(!comp_hash_changed(Some("h1"), None));
+    assert!(!comp_hash_changed(None, None));
+}

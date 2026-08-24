@@ -2962,3 +2962,47 @@ fn fit_counts_encrypted_reasoning_against_budget() {
         "recent turn must survive"
     );
 }
+
+/// Wire-level: compaction's lossy budget fitting truncates tool-result text
+/// through the single edit helper, so the ordered `parts` cannot keep the
+/// truncated text alive on the wire.
+#[test]
+fn budget_truncation_removes_text_from_ordered_parts_on_the_wire() {
+    let long_tail = format!("HEAD {} COMPACTION-SECRET-TAIL", "z".repeat(4000));
+    let truncated = truncate_item_to_tokens(
+        ConversationItem::tool_result_with_parts(
+            "call-1",
+            vec![
+                ContentPart::Text {
+                    text: long_tail.into(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,KEEP".into(),
+                },
+            ],
+        ),
+        8,
+    );
+
+    let ConversationItem::ToolResult(t) = &truncated else {
+        panic!("expected ToolResult");
+    };
+    assert!(t.content.contains("truncated"), "marker missing: {:?}", t.content);
+    for part in &t.parts {
+        if let ContentPart::Text { text } = part {
+            assert!(
+                t.content.contains(text.as_ref()),
+                "text part drifted from the content mirror"
+            );
+        }
+    }
+
+    let req = xai_grok_sampling_types::ConversationRequest::from_items(vec![truncated]);
+    let responses: rs::CreateResponse = (&req).into();
+    let body = serde_json::to_string(&responses).unwrap();
+    assert!(
+        !body.contains("COMPACTION-SECRET-TAIL"),
+        "truncated text leaked to the wire: {body}"
+    );
+    assert!(body.contains("KEEP"), "the image part must survive truncation");
+}

@@ -13,10 +13,7 @@ use std::path::Path;
 
 use agent_client_protocol as acp;
 
-use crate::sampling::{
-    ConversationItem, conversation_truncate_for_prompt, fork_filter_chat,
-    transform_conversation_cwd,
-};
+use crate::sampling::{ConversationItem, conversation_truncate_for_prompt, fork_filter_chat};
 use crate::session::info::Info;
 use crate::session::persistence::{CHAT_FORMAT_VERSION, Summary};
 use crate::session::storage::jsonl::{JsonlStorageAdapter, transform_session_id_in_update};
@@ -333,7 +330,13 @@ impl JsonlStorageAdapter {
         // shows the model the original project path, and rewritten
         // conversation paths would contradict it.
         if !options.skip_cwd_transform && source_info.cwd != target_info.cwd {
-            transform_conversation_cwd(&mut chat_to_copy, &source_info.cwd, &target_info.cwd);
+            // The `_synced` variant also rewrites the ordered tool-result
+            // `parts`, which the plain transform leaves stale.
+            xai_chat_state::transform_conversation_cwd_synced(
+                &mut chat_to_copy,
+                &source_info.cwd,
+                &target_info.cwd,
+            );
         }
 
         if options.strip_reasoning {
@@ -567,6 +570,10 @@ fn fork_summary(
         } else {
             source.last_recap
         },
+        // Monotonic and unconditional: even a partial fork inherits the
+        // parent's Codex-derived history (any retained prefix may contain
+        // Codex output), so the mark must ride every fork shape.
+        ever_used_codex: source.ever_used_codex,
     }
 }
 

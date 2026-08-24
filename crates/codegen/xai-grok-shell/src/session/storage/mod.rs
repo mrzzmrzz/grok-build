@@ -1097,6 +1097,13 @@ pub trait StorageAdapter: Send + Sync {
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
 
+    /// Monotonically persist `Summary::ever_used_codex` (the session has
+    /// sampled through the Codex provider at least once). Never cleared.
+    /// Default: no-op for adapters without a persisted summary.
+    async fn mark_ever_used_codex(&self, _info: &Info) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Update the collection ID for telemetry tracing
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()>;
 

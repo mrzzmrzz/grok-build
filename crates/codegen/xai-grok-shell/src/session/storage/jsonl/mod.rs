@@ -1170,6 +1170,16 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn mark_ever_used_codex(&self, info: &Info) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                ever_used_codex: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn update_collection_id(&self, info: &Info, collection_id: &str) -> io::Result<()> {
         self.apply_summary_patch(
             info,
@@ -1745,9 +1755,10 @@ pub(crate) fn strip_invalid_images(items: &mut [ConversationItem]) -> usize {
                 }
             }
             ConversationItem::ToolResult(t) => {
-                let before = t.images.len();
-                t.images.retain(|part| !invalid(part));
-                stripped += before - t.images.len();
+                // Removes from the legacy `images` mirror AND the ordered
+                // `parts` atomically — an invalid image left in `parts` would
+                // still be replayed on the wire and 400 every turn.
+                stripped += xai_chat_state::retain_tool_result_images(t, |part| !invalid(part));
             }
             _ => {}
         }

@@ -157,10 +157,12 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
             continue;
         }
 
-        // Hard clear: very old tool results → replace entirely.
+        // Hard clear: very old tool results → replace entirely. Routed through
+        // the tool-result edit helper so the ordered `parts` cannot keep the
+        // cleared text alive on the wire.
         if turn_from_end >= config.hard_clear_age_turns {
             if tool_result.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                tool_result.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                crate::tool_result_edit::set_tool_result_text(tool_result, HARD_CLEAR_PLACEHOLDER);
             }
             continue;
         }
@@ -170,8 +172,10 @@ pub(crate) fn prune_conversation(conversation: &mut [ConversationItem], config: 
         if content_len > config.soft_trim_threshold {
             let head = safe_char_slice(&tool_result.content, 0, config.soft_trim_head);
             let tail = safe_char_slice_tail(&tool_result.content, config.soft_trim_tail);
-            tool_result.content =
-                std::sync::Arc::<str>::from(format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"));
+            crate::tool_result_edit::set_tool_result_text(
+                tool_result,
+                format!("{head}{SOFT_TRIM_SEPARATOR}{tail}"),
+            );
         }
     }
 }

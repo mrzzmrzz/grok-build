@@ -2404,6 +2404,155 @@ async fn read_parent_sampling_config_fallback_resolves_backend_search_from_catal
     assert!(config.supports_backend_search);
     assert_eq!(config.extra_response_includes, ["no_inline_citations"]);
 }
+fn live_codex_model_entry(slug: &str) -> crate::agent::config::ModelEntry {
+    let mut entry = test_model_entry(slug);
+    entry.info.model_family = Some("codex".to_string());
+    entry.info.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    entry
+}
+fn codex_identity_anchor_headers() -> indexmap::IndexMap<String, String> {
+    let credentials = crate::codex_auth::CodexCredentials {
+        access_token: "codex-access".to_string(),
+        account_id: Some("acct-123".to_string()),
+        chatgpt_user_id: Some("user-123".to_string()),
+        email: Some("dev@example.com".to_string()),
+        plan_type: Some("pro".to_string()),
+        is_workspace_account: false,
+        account_is_fedramp: false,
+    };
+    let mut headers = indexmap::IndexMap::new();
+    crate::codex_auth::set_oauth_identity_anchor(&mut headers, Some(&credentials));
+    headers
+}
+/// Finding regression: a Codex model present ONLY in the live account catalog
+/// (absent from static config) must keep its Codex identity when inherited by
+/// a subagent — provider profile, OAuth bearer resolver, and endpoint. The
+/// old static-config-only resolve reconstructed such a child as xAI.
+#[tokio::test]
+async fn read_parent_sampling_config_inherits_live_only_codex_identity() {
+    let slug = "gpt-6-live-only-test";
+    let mut models = indexmap::IndexMap::new();
+    models.insert(slug.to_string(), live_codex_model_entry(slug));
+    let ctx = ctx_with_parent_chat_state(slug, slug, slug, models);
+    // The parent turn runs under the Codex OAuth identity anchor.
+    let mut sampling = test_sampling_config(slug);
+    sampling.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    sampling.extra_headers = codex_identity_anchor_headers();
+    ctx.parent_chat_state
+        .as_ref()
+        .unwrap()
+        .update_sampling_config(sampling);
+    let (config, model_id) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(model_id.0.as_ref(), slug);
+    assert_eq!(
+        config.provider_profile.provider,
+        xai_grok_sampling_types::ModelProvider::Codex,
+        "live-only Codex slug must resolve to the Codex provider profile"
+    );
+    assert_eq!(
+        config.base_url, "https://chatgpt.com/backend-api/codex",
+        "child must inherit the parent's Codex endpoint"
+    );
+    assert!(
+        config.bearer_resolver.is_some(),
+        "child must mount the Codex bearer resolver"
+    );
+    assert!(
+        config.api_key.is_none(),
+        "OAuth Codex child must not carry a static api key"
+    );
+    assert!(config.user_id.is_none());
+}
+/// The spawn-context fallback path (parent chat state unavailable) must not
+/// downgrade an already-correct Codex baseline: the provider profile and the
+/// Codex bearer resolver survive, and the xAI session-token resolver is
+/// never swapped in.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_preserves_codex_profile_and_resolver() {
+    let slug = "gpt-6-live-only-test";
+    let mut models = indexmap::IndexMap::new();
+    models.insert(slug.to_string(), live_codex_model_entry(slug));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models.clone(),
+        acp::ModelId::new(slug),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new(slug);
+    ctx.sampling_config.model = slug.to_string();
+    ctx.sampling_config.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    ctx.sampling_config.extra_headers = codex_identity_anchor_headers();
+    ctx.sampling_config.provider_profile = xai_grok_sampling_types::ProviderProfile::CODEX;
+    ctx.sampling_config.api_key = None;
+    let codex_resolver: xai_grok_sampler::SharedBearerResolver = std::sync::Arc::new(
+        crate::codex_auth::CodexBearerResolver::from_headers(
+            &ctx.sampling_config.extra_headers,
+        ),
+    );
+    ctx.sampling_config.bearer_resolver = Some(codex_resolver.clone());
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.provider_profile.provider,
+        xai_grok_sampling_types::ModelProvider::Codex
+    );
+    let preserved = config
+        .bearer_resolver
+        .as_ref()
+        .expect("Codex resolver must survive the fallback path");
+    assert!(
+        std::sync::Arc::ptr_eq(preserved, &codex_resolver),
+        "fallback must preserve the already-correct Codex resolver, \
+         not rewire it through the xAI session-token path"
+    );
+    assert!(config.api_key.is_none());
+    assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex");
+}
+/// The fallback path also recovers Codex identity from the merged catalog
+/// when the baseline was built before the provider profile was known (e.g.
+/// a stale spawn snapshot): a live-only Codex slug still mounts the Codex
+/// resolver from the identity anchor instead of an xAI session resolver.
+#[tokio::test]
+async fn read_parent_sampling_config_fallback_resolves_live_only_codex_from_catalog() {
+    let slug = "gpt-6-live-only-test";
+    let mut models = indexmap::IndexMap::new();
+    models.insert(slug.to_string(), live_codex_model_entry(slug));
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.auth_method_id = acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    );
+    ctx.models_manager = crate::agent::models::ModelsManager::new(
+        None,
+        models.clone(),
+        acp::ModelId::new(slug),
+        ctx.auth_manager.clone(),
+        crate::agent::config::Config::default(),
+    );
+    ctx.available_models = models;
+    ctx.model_id = acp::ModelId::new(slug);
+    ctx.sampling_config.model = slug.to_string();
+    ctx.sampling_config.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    ctx.sampling_config.extra_headers = codex_identity_anchor_headers();
+    ctx.sampling_config.bearer_resolver = None;
+    let (config, _) = read_parent_sampling_config(&ctx).await;
+    assert_eq!(
+        config.provider_profile.provider,
+        xai_grok_sampling_types::ModelProvider::Codex,
+        "catalog identity must promote the baseline to Codex"
+    );
+    assert!(
+        config.bearer_resolver.is_some(),
+        "the Codex resolver must be mounted from the identity anchor"
+    );
+    assert!(config.api_key.is_none());
+}
 #[tokio::test]
 async fn read_parent_sampling_config_resolves_compactions_remaining_from_catalog() {
     use xai_grok_sampling_types::CompactionsRemaining;
@@ -3260,4 +3409,65 @@ async fn progress_publisher_delivers_ticks_to_parent_cmd_channel() {
             assert_eq!(tool_call_count, 1);
         })
         .await;
+}
+/// Finding regression: a Codex child's monotonic provenance must taint the
+/// parent chat state the moment it is recorded — before the completion
+/// envelope leaves the worker — and must ride the envelope for the
+/// coordinator-side persistence mark, on success, failure, and cancellation
+/// alike.
+#[tokio::test]
+async fn child_codex_provenance_taints_parent_and_rides_all_completion_envelopes() {
+    let request = auto_wake_test_request("sa-codex-prov");
+    let results = [
+        SubagentResult {
+            success: true,
+            subagent_id: request.id.clone(),
+            child_session_id: request.id.clone(),
+            ..Default::default()
+        },
+        failure_result(&request, "boom"),
+        cancelled_result(&request, "Subagent was cancelled"),
+    ];
+    for result in results {
+        let mut ctx = ctx_with_toggle(HashMap::new());
+        let parent_chat = spawn_test_parent_chat_state("grok-4.5");
+        ctx.parent_chat_state = Some(parent_chat.clone());
+        let mut completion_data = ShellCompletionData::from_context(&ctx);
+        assert!(
+            !parent_chat.ever_used_codex().await,
+            "parent must start unmarked"
+        );
+        // A non-Codex child never taints the parent.
+        completion_data.record_child_codex_provenance(false);
+        assert!(!completion_data.child_ever_used_codex());
+        assert!(!parent_chat.ever_used_codex().await);
+        // Codex use marks the parent immediately (before envelope delivery).
+        completion_data.record_child_codex_provenance(true);
+        assert!(completion_data.child_ever_used_codex());
+        assert!(
+            parent_chat.ever_used_codex().await,
+            "parent chat state must be tainted before the envelope is returned"
+        );
+        // Monotonic: a later false observation cannot clear it.
+        completion_data.record_child_codex_provenance(false);
+        assert!(completion_data.child_ever_used_codex());
+        // The envelope carries the provenance for the coordinator-side
+        // (persistence) mark, for every completion kind.
+        let status = result.status().to_string();
+        let output = child_run_output(result, completion_data, None);
+        assert!(
+            output.completion_data.child_ever_used_codex(),
+            "envelope for `{status}` completion must carry the provenance"
+        );
+    }
+}
+/// The spawn-time hint a fresh child inherits: `StartupHints.ever_used_codex`
+/// deserializes with a safe default and round-trips.
+#[test]
+fn startup_hints_ever_used_codex_defaults_false_and_deserializes() {
+    let hints: crate::session::StartupHints = serde_json::from_str("{}").unwrap();
+    assert!(!hints.ever_used_codex);
+    let hints: crate::session::StartupHints =
+        serde_json::from_str(r#"{"everUsedCodex":true}"#).unwrap();
+    assert!(hints.ever_used_codex);
 }

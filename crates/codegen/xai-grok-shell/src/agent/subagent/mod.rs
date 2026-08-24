@@ -478,6 +478,18 @@ pub(crate) struct ShellCompletionData {
     telemetry_tokens: u64,
     spawned_notification_emitted: bool,
     persisted_output_dir: Option<PathBuf>,
+    /// Monotonic provider provenance of the child: `true` once the child was
+    /// spawned on a Codex provider profile or its chat state reports it ever
+    /// sampled through Codex. Carried on the completion envelope so the
+    /// parent is tainted on all three completion paths (success, failure,
+    /// cancellation) before the child's output is merged or persisted.
+    child_ever_used_codex: bool,
+    /// Parent session's chat-state handle, kept so the provenance mark can be
+    /// applied the moment the child's Codex use is known — before the
+    /// completion envelope (and the child output it carries) reaches any
+    /// parent-side merge or persistence. `None` when the parent actor is
+    /// unavailable.
+    parent_chat_state: Option<xai_chat_state::ChatStateHandle>,
 }
 impl ShellCompletionData {
     fn from_context(ctx: &SubagentSpawnContext) -> Self {
@@ -491,6 +503,8 @@ impl ShellCompletionData {
             telemetry_tokens: 0,
             spawned_notification_emitted: false,
             persisted_output_dir: None,
+            child_ever_used_codex: false,
+            parent_chat_state: ctx.parent_chat_state.clone(),
         }
     }
     pub(crate) fn persisted_output_dir(&self) -> Option<&Path> {
@@ -498,6 +512,25 @@ impl ShellCompletionData {
     }
     fn set_persisted_output_dir(&mut self, path: Option<PathBuf>) {
         self.persisted_output_dir = path;
+    }
+    /// Whether the child ever used the Codex provider (monotonic).
+    pub(crate) fn child_ever_used_codex(&self) -> bool {
+        self.child_ever_used_codex
+    }
+    /// Record the child's monotonic Codex provenance and, when set, taint
+    /// the parent chat state immediately. Called on every completion path;
+    /// the flag never clears, and the parent mark happens before the
+    /// completion envelope is returned to the coordinator, so no parent-side
+    /// merge or persist of this child's output can precede it. (The
+    /// coordinator seam repeats the mark — plus the persistence-actor mark —
+    /// as a belt-and-braces chokepoint in `on_completed`.)
+    fn record_child_codex_provenance(&mut self, child_used_codex: bool) {
+        self.child_ever_used_codex |= child_used_codex;
+        if self.child_ever_used_codex
+            && let Some(chat) = &self.parent_chat_state
+        {
+            chat.mark_ever_used_codex();
+        }
     }
 }
 pub(crate) struct SubagentPresentation {
@@ -682,16 +715,31 @@ fn session_bearer_resolver(
         crate::auth::credential_provider::WireValidBearerResolver::shared(ctx.auth_manager.clone())
     })
 }
+/// Auth facts for an inherited model, resolved from the parent's merged,
+/// account-scoped catalog first — the same source that supplied live-only
+/// Codex entries to the parent turn — with the static-config resolve as the
+/// fallback for models the manager does not know. A live-discovered Codex
+/// slug must never default to xAI merely because static config lacks it.
+fn inherited_model_auth_facts(
+    ctx: &SubagentSpawnContext,
+    model: &str,
+) -> crate::agent::config::ModelAuthFacts {
+    ctx.models_manager
+        .model_auth_state(model)
+        .map(|(facts, _)| facts)
+        .unwrap_or_else(|| {
+            crate::agent::config::resolve_model_auth_facts_and_provider(model).0
+        })
+}
 /// [`session_bearer_resolver`] for an inherited config, where only the model
-/// string is known: BYOK comes from the catalog memo.
+/// string is known: BYOK comes from the live catalog (static config as
+/// fallback, see [`inherited_model_auth_facts`]).
 fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
     base_url: &str,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
-        .0
-        .byok;
+    let byok = inherited_model_auth_facts(ctx, model).byok;
     session_bearer_resolver(ctx, byok, base_url)
 }
 fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> acp::ModelId {
@@ -718,15 +766,14 @@ async fn read_parent_sampling_config(
                 creds.alpha_test_key.as_deref(),
                 &cfg.base_url,
             );
-            let auth_scheme = crate::agent::config::try_resolve_model_credentials(&cfg.model, None)
-                .map(|r| r.auth_scheme)
-                .unwrap_or_default();
-            // Same catalog-driven provider identity as the parent turn path.
+            // Same catalog-driven provider identity as the parent turn path:
+            // the merged, account-scoped catalog (live Codex entries included)
+            // first, static config only as fallback. A static-only resolve
+            // here reconstructed live-only Codex parents as xAI children.
+            let auth_facts = inherited_model_auth_facts(ctx, &cfg.model);
+            let auth_scheme = auth_facts.auth_scheme;
             let is_codex =
-                crate::agent::config::resolve_model_auth_facts_and_provider(&cfg.model)
-                    .0
-                    .model_provider
-                    == xai_grok_sampling_types::ModelProvider::Codex;
+                auth_facts.model_provider == xai_grok_sampling_types::ModelProvider::Codex;
             let inherited_base_url = cfg.base_url.clone();
             let strip_guard = ctx.would_strip_fallback_key(creds.api_key.as_deref());
             let catalog_model_id = parent_catalog_model_id(ctx, &cfg.model);
@@ -824,11 +871,35 @@ async fn read_parent_sampling_config(
         })),
     );
     let mut fallback = ctx.sampling_config.clone();
-    fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
-        None
+    // Provider identity of the baseline: what the spawn context already says,
+    // or what the merged catalog says about its model (a live-only Codex slug
+    // is invisible to a static-config resolve). A Codex baseline keeps its
+    // already-correct provider profile and bearer resolver — rewiring it with
+    // the xAI session-token resolver would silently downgrade the child.
+    let fallback_is_codex = fallback.provider_profile.provider
+        == xai_grok_sampling_types::ModelProvider::Codex
+        || inherited_model_auth_facts(ctx, &fallback.model).model_provider
+            == xai_grok_sampling_types::ModelProvider::Codex;
+    if fallback_is_codex {
+        fallback.provider_profile = xai_grok_sampling_types::ProviderProfile::CODEX;
+        fallback.user_id = None;
+        if crate::codex_auth::has_oauth_identity_anchor(&fallback.extra_headers) {
+            fallback.api_key = None;
+            if fallback.bearer_resolver.is_none() {
+                fallback.bearer_resolver = Some(std::sync::Arc::new(
+                    crate::codex_auth::CodexBearerResolver::from_headers(
+                        &fallback.extra_headers,
+                    ),
+                ));
+            }
+        }
     } else {
-        inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
-    };
+        fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
+            None
+        } else {
+            inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
+        };
+    }
     let catalog_model_id = parent_catalog_model_id(ctx, &fallback.model);
     fallback.supports_backend_search = ctx
         .models_manager

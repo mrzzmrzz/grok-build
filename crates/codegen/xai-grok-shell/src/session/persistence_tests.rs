@@ -57,6 +57,7 @@ fn test_actor_inner(
             registry_title_sync: None,
             gateway: None,
             search_index: crate::session::storage::search::SharedSearchIndex::never_indexed(),
+            ever_used_codex: false,
             disk_full_tx,
             disk_full_notified: false,
         }

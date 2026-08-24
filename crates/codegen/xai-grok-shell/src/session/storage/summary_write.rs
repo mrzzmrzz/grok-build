@@ -109,6 +109,10 @@ pub(crate) struct SummaryPatch {
     /// `Some(None)` clears it (rewind removed the described turns). Persisted so
     /// listing surfaces can show a recap when available.
     pub last_recap: Option<Option<String>>,
+    /// Monotonic OR-merge into `Summary::ever_used_codex`. `false` here is a
+    /// no-op (there is deliberately no way to clear the mark), so a stale
+    /// concurrent writer can never un-set it.
+    pub ever_used_codex: bool,
 }
 
 impl Summary {
@@ -129,6 +133,9 @@ impl Summary {
                     .map_or(now, |existing| existing.max(now)),
             );
         }
+        // Monotonic, and merged before any early return below so it can
+        // never be dropped by an unrelated patch shape.
+        self.ever_used_codex |= patch.ever_used_codex;
         if let Some(op) = &patch.messages {
             self.num_messages = op.apply(self.num_messages);
         }
@@ -284,6 +291,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Whether the session in `session_dir` has ever sampled through the Codex
+/// provider, per its persisted summary. Missing/unreadable summaries report
+/// `false` (a brand-new session has no summary yet).
+pub(crate) fn ever_used_codex_in_dir(session_dir: &Path) -> bool {
+    read_summary(&session_dir.join(crate::session::storage::SUMMARY_FILE))
+        .map(|s| s.ever_used_codex)
+        .unwrap_or(false)
+}
+
 fn read_summary(path: &Path) -> io::Result<Summary> {
     let bytes = std::fs::read(path)?;
     if bytes.is_empty() {
@@ -317,6 +333,38 @@ mod tests {
             id: acp::SessionId::new("concurrent-summary-test"),
             cwd: "/test".into(),
         }
+    }
+
+    /// `ever_used_codex` is a monotonic OR-merge: a marking patch latches it,
+    /// any later patch (which defaults the field to `false`) preserves it, and
+    /// the storage-adapter entry point persists it through `summary.json`.
+    #[tokio::test]
+    async fn ever_used_codex_patch_is_monotonic_and_persisted() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("session");
+        let info = test_info();
+        let adapter = JsonlStorageAdapter::with_explicit_session_dir(session_dir.clone());
+        let summary = adapter
+            .init_session(&info, acp::ModelId::new("test-model"))
+            .await
+            .unwrap();
+        assert!(!summary.ever_used_codex, "fresh session is unmarked");
+
+        adapter.mark_ever_used_codex(&info).await.unwrap();
+        // An unrelated later patch must not clear the mark.
+        adapter
+            .update_current_model(&info, &acp::ModelId::new("other-model"))
+            .await
+            .unwrap();
+
+        let reloaded = adapter
+            .init_session(&info, acp::ModelId::new("other-model"))
+            .await
+            .unwrap();
+        assert!(
+            reloaded.ever_used_codex,
+            "mark must persist monotonically across later patches and reloads"
+        );
     }
 
     /// Regression guard for the `/resume` "frozen `last_active_at`" lost-update

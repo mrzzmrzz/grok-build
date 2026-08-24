@@ -441,6 +441,7 @@ async fn model_switch_clears_sticky_suppression() {
                 actor.compaction.previous_model.set(Some(PreviousModelInfo {
                     model_slug: "old-small-model".to_string(),
                     context_window: 100_000,
+                    comp_hash: None,
                 }));
                 actor
                     .maybe_compact_on_model_switch()
@@ -482,6 +483,7 @@ async fn model_switch_keeps_account_state_suppression() {
                 actor.compaction.previous_model.set(Some(PreviousModelInfo {
                     model_slug: "old-big-model".to_string(),
                     context_window: 400_000,
+                    comp_hash: None,
                 }));
                 actor
                     .maybe_compact_on_model_switch()
@@ -914,6 +916,7 @@ async fn e2e_model_switch_compact_401_surfaces_reauth() {
             actor.compaction.previous_model.set(Some(PreviousModelInfo {
                 model_slug: "old-big-model".to_string(),
                 context_window: 400_000,
+                comp_hash: None,
             }));
             let err = actor
                 .maybe_compact_on_model_switch()
@@ -980,6 +983,7 @@ async fn e2e_model_switch_compact_non_auth_failure_does_not_abort() {
             actor.compaction.previous_model.set(Some(PreviousModelInfo {
                 model_slug: "old-big-model".to_string(),
                 context_window: 400_000,
+                comp_hash: None,
             }));
             actor
                 .maybe_compact_on_model_switch()
@@ -1015,6 +1019,7 @@ async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
             actor.compaction.previous_model.set(Some(PreviousModelInfo {
                 model_slug: "old-big-model".to_string(),
                 context_window: 400_000,
+                comp_hash: None,
             }));
             actor
                 .maybe_compact_on_model_switch()
@@ -1032,6 +1037,7 @@ async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
             actor.compaction.previous_model.set(Some(PreviousModelInfo {
                 model_slug: "old-big-model".to_string(),
                 context_window: 400_000,
+                comp_hash: None,
             }));
             let base_url = spawn_deterministic_400_server().await;
             let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
@@ -1652,6 +1658,7 @@ async fn test_model_switch_compaction_triggers_on_downgrade() {
                 crate::session::compaction_config::PreviousModelInfo {
                     model_slug: "large-model".to_string(),
                     context_window: 200_000,
+                    comp_hash: None,
                 },
             ));
             let prev = actor.compaction.previous_model.take();
@@ -1667,6 +1674,7 @@ async fn test_model_switch_compaction_triggers_on_downgrade() {
                 crate::session::compaction_config::PreviousModelInfo {
                     model_slug: "small-model".to_string(),
                     context_window: 50_000,
+                    comp_hash: None,
                 },
             ));
             let prev = actor.compaction.previous_model.take().unwrap();

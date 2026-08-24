@@ -574,6 +574,29 @@ pub(crate) async fn spawn_session_actor(
         chat_state_handle.restore_snapshot(snap);
     }
     chat_state_handle.update_credentials(credentials);
+    // ever_used_codex: monotonic provider mark. Seed the in-memory flag from
+    // the persisted summary (so resume/fork inherit it) and from the initial
+    // provider; persist the mark when the session starts out on Codex so a
+    // later resume under xAI still knows.
+    {
+        let session_dir = crate::session::persistence::session_dir(&session_info);
+        let initial_provider_is_codex = sampling_config.provider_profile.provider
+            == xai_grok_sampling_types::ModelProvider::Codex;
+        let persisted =
+            crate::session::storage::summary_write::ever_used_codex_in_dir(&session_dir);
+        // A subagent spawned fresh from a marked parent inherits the boundary
+        // through the startup hint even though its own dir has no summary yet.
+        let inherited = startup_hints.ever_used_codex;
+        if persisted || initial_provider_is_codex || inherited {
+            chat_state_handle.mark_ever_used_codex();
+        }
+        if (initial_provider_is_codex || inherited) && !persisted {
+            // Routes through the persistence actor so the summary write is
+            // serialized with other summary.json mutations AND any live
+            // remote/relay sync built before this point is dropped.
+            persistence.mark_ever_used_codex();
+        }
+    }
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),

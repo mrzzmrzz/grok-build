@@ -635,6 +635,14 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
+    /// Monotonic Codex provenance inherited at spawn: `true` when the parent
+    /// session ever sampled through the Codex provider, so a fresh subagent
+    /// child (whose forked/summarized context derives from Codex output)
+    /// starts marked too. The session spawn path must apply it exactly like
+    /// a spawn-time Codex provider profile: mark the child's chat state, and
+    /// mark its persistence so remote/relay sync stays off.
+    #[serde(default)]
+    pub ever_used_codex: bool,
     /// Tool names (as the model sees them, e.g. `server__tool`) through which
     /// this session delivers user-visible output. Declared by headless
     /// surfaces whose users never see the model's plain-text responses —

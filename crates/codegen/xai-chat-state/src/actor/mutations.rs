@@ -379,8 +379,21 @@ impl ChatStateActor {
                     continue;
                 }
 
-                if tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER {
-                    tr.content = std::sync::Arc::<str>::from(HARD_CLEAR_PLACEHOLDER);
+                // Routed through the tool-result edit helper so the ordered
+                // `parts` cannot keep the cleared text alive in persisted
+                // state or on the wire (Responses serialization treats
+                // non-empty `parts` as authoritative). The parts scan also
+                // repairs items whose legacy `content` mirror was cleared by
+                // an older build while `parts` retained the full text.
+                let needs_clear = tr.content.as_ref() != HARD_CLEAR_PLACEHOLDER
+                    || tr.parts.iter().any(|part| {
+                        matches!(
+                            part,
+                            ContentPart::Text { text } if text.as_ref() != HARD_CLEAR_PLACEHOLDER
+                        )
+                    });
+                if needs_clear {
+                    crate::tool_result_edit::set_tool_result_text(tr, HARD_CLEAR_PLACEHOLDER);
                     cleared += 1;
                 }
             }
@@ -606,6 +619,9 @@ impl ChatStateActor {
         self.state.turn_start_ms = snap.turn_start_ms;
         self.state.last_compaction_prompt_index = snap.last_compaction_prompt_index;
         self.state.credentials = snap.credentials;
+        // Monotonic: a snapshot taken before the first Codex turn must not
+        // clear the mark on restore (e.g. rewind across a provider switch).
+        self.state.ever_used_codex |= snap.ever_used_codex;
         // Drop abandoned prompt billing; session ledger is lifetime.
         self.state.prompt_usage = None;
     }

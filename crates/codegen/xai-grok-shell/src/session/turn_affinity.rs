@@ -74,6 +74,48 @@ pub(crate) fn clear_turn_state(slot: &mut Option<String>) {
     slot.take();
 }
 
+/// Operation-scoped Codex turn-state for out-of-turn operations — manual
+/// `/compact` and (once ported) remote compaction v2 requests.
+///
+/// A manual compaction is its own routing scope: it must **not** consume the
+/// last model turn's token (that token belongs to the interactive prompt's
+/// continuation chain) and must **not** seed a future turn with the compact
+/// response's token. This cell therefore starts empty, binds the *first*
+/// non-empty observation (first-wins — retries of the same operation echo
+/// the value the operation's first successful response returned, matching
+/// the upstream `OnceLock` semantics), and is simply dropped when the
+/// operation ends. Contrast with the per-prompt slot above, which is
+/// latest-wins across a prompt's continuations.
+///
+/// `Send + Sync` (an `OnceLock` inside an `Arc`-able struct) so a retry loop
+/// crossing `spawn_blocking`/tasks can share one scope.
+// Staged port: consumed by the remote-compaction-v2 install path once the
+// opaque-history carrier lands (see the phase-8 design notes); exercised by
+// the tests below until then.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct OperationTurnState(std::sync::OnceLock<String>);
+
+impl OperationTurnState {
+    /// A fresh, unbound operation scope.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind the first non-empty observed token; later observations are
+    /// ignored (first-wins within the operation).
+    pub(crate) fn observe(&self, observed: String) {
+        if !observed.is_empty() {
+            let _ = self.0.set(observed);
+        }
+    }
+
+    /// The operation's bound token, if any.
+    pub(crate) fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +221,31 @@ mod tests {
         // Idempotent: queue-accept + turn-start double clear is fine.
         clear_turn_state(&mut slot);
         assert_eq!(slot, None);
+    }
+
+    /// Operation scope: first non-empty observation wins, empties ignored,
+    /// and the scope is fully isolated from the per-prompt slot.
+    #[test]
+    fn operation_scope_is_first_wins_and_isolated_from_the_prompt_slot() {
+        let op = OperationTurnState::new();
+        assert_eq!(op.get(), None, "a fresh operation never inherits a token");
+        op.observe(String::new());
+        assert_eq!(op.get(), None, "empty header values never bind");
+        op.observe("op-ts-1".to_owned());
+        op.observe("op-ts-2".to_owned());
+        assert_eq!(
+            op.get(),
+            Some("op-ts-1"),
+            "first-wins within the operation (retries echo the first binding)"
+        );
+
+        // The session's per-prompt slot is untouched by the operation scope:
+        // they are separate storage by construction, so a manual compaction
+        // can neither consume nor pollute the interactive prompt's token.
+        let mut prompt_slot = Some("prompt-ts".to_owned());
+        assert_eq!(prompt_slot.as_deref(), Some("prompt-ts"));
+        drop(op);
+        assert_eq!(prompt_slot.as_deref(), Some("prompt-ts"));
+        clear_turn_state(&mut prompt_slot);
     }
 }

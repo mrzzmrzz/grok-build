@@ -156,6 +156,12 @@ pub(crate) struct ChatState {
     /// Opaque credential secrets (api key, optional extra auth, client version).
     /// Stored opaquely — the actor never interprets them.
     pub credentials: Credentials,
+    /// Monotonic: `true` once this session has ever sampled through the
+    /// Codex provider. Never cleared — not by model switches back to xAI,
+    /// not by rewind, not by snapshot restore. Consumers use it to keep
+    /// Codex-derived session data off xAI-only egress paths (remote sync,
+    /// prompt traces, cross-provider aux helpers).
+    pub ever_used_codex: bool,
     /// Bytes/4 estimate of tokens added since the last `record_token_usage`.
     /// Used by `check_preflight_overflow` to detect context window overflows
     /// between model responses.
@@ -256,6 +262,7 @@ impl ChatState {
             agent_edited_paths: BTreeSet::new(),
             last_compaction_prompt_index: None,
             credentials: Credentials::default(),
+            ever_used_codex: false,
             estimated_tokens_since_model: 0,
             estimate_at_last_response: initial_tokens,
             last_turn_usage: None,

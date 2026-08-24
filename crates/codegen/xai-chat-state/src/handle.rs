@@ -526,6 +526,29 @@ impl ChatStateHandle {
         .unwrap_or_default()
     }
 
+    /// Monotonically mark that the session has sampled through the Codex
+    /// provider. Fire-and-forget; there is deliberately no way to clear it.
+    pub fn mark_ever_used_codex(&self) {
+        let _ = self.cmd_tx.send(ChatStateCommand::MarkEverUsedCodex);
+    }
+
+    /// Whether the session has ever sampled through the Codex provider.
+    /// Defaults to `true` (fail-closed) if the actor is gone.
+    pub async fn ever_used_codex(&self) -> bool {
+        self.try_ever_used_codex().await.unwrap_or(true)
+    }
+
+    /// [`Self::ever_used_codex`] without the fail-closed default: `None`
+    /// when the actor is gone. For callers that already hold independent
+    /// provenance (e.g. the spawn-time provider profile) and must not taint
+    /// an unrelated session merely because this actor shut down first.
+    pub async fn try_ever_used_codex(&self) -> Option<bool> {
+        self.query("GetEverUsedCodex", |reply| {
+            ChatStateCommand::GetEverUsedCodex { reply }
+        })
+        .await
+    }
+
     pub async fn get_last_model_metadata(&self) -> crate::commands::ModelMetadata {
         self.query("GetLastModelMetadata", |reply| {
             ChatStateCommand::GetLastModelMetadata { reply }

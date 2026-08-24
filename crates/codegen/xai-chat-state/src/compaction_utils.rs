@@ -233,7 +233,9 @@ fn truncate_item_to_tokens(item: ConversationItem, max_tokens: u64) -> Conversat
     match item {
         ConversationItem::ToolResult(mut t) => {
             if let Some(s) = truncate_text_to_bytes(&t.content, max_bytes) {
-                t.content = s;
+                // Routed through the tool-result edit helper so the ordered
+                // `parts` cannot keep the truncated text alive on the wire.
+                crate::tool_result_edit::set_tool_result_text(&mut t, s);
             }
             ConversationItem::ToolResult(t)
         }

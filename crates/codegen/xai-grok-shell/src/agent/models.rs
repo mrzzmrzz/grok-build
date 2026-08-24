@@ -159,8 +159,17 @@ struct Inner {
     cache: ModelsCacheManager,
     endpoint: Arc<dyn ModelsEndpoint>,
     /// Probe for the current Codex OAuth account fingerprint (`None` when
-    /// logged out); production reads the credential file.
+    /// logged out OR when valid credentials carry no stable identity claims);
+    /// production reads the credential file. Used ONLY for account-scoped
+    /// cache publication/reuse — never as the logged-in predicate (see
+    /// `codex_logged_in`).
     codex_account: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// Probe for whether usable Codex credentials exist at all. Distinct from
+    /// `codex_account`: a valid bearer/refresh-token file without account,
+    /// user, or email claims is logged in (models stay visible, live refresh
+    /// runs) but has no fingerprint, so account-scoped cache publication and
+    /// reuse are conservatively disabled.
+    codex_logged_in: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
@@ -216,6 +225,22 @@ fn default_codex_account_probe() -> Option<String> {
     #[cfg(test)]
     {
         None
+    }
+}
+
+/// Codex logged-in probe: credential availability, NOT fingerprint presence.
+/// Identity-less but valid credentials must keep authenticated visibility.
+/// The test build returns `false` so unit tests never consult the
+/// developer's real credential file; tests inject a probe via
+/// `ModelsManagerBuilder`.
+fn default_codex_logged_in_probe() -> bool {
+    #[cfg(not(test))]
+    {
+        crate::codex_auth::is_logged_in()
+    }
+    #[cfg(test)]
+    {
+        false
     }
 }
 
@@ -290,6 +315,7 @@ pub(crate) struct ModelsManagerBuilder {
     endpoint: Arc<dyn ModelsEndpoint>,
     cache: ModelsCacheManager,
     codex_account: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    codex_logged_in: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl ModelsManagerBuilder {
@@ -309,6 +335,7 @@ impl ModelsManagerBuilder {
             endpoint: Arc::new(HttpModelsEndpoint),
             cache: ModelsCacheManager::new(),
             codex_account: Arc::new(default_codex_account_probe),
+            codex_logged_in: Arc::new(default_codex_logged_in_probe),
         }
     }
 
@@ -333,6 +360,15 @@ impl ModelsManagerBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn codex_logged_in(
+        mut self,
+        probe: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.codex_logged_in = probe;
+        self
+    }
+
     pub(crate) fn build(self) -> ModelsManager {
         let has_session = self.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&self.cfg.endpoints, has_session);
@@ -353,6 +389,7 @@ impl ModelsManagerBuilder {
                 cache: self.cache,
                 endpoint: self.endpoint,
                 codex_account: self.codex_account,
+                codex_logged_in: self.codex_logged_in,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
                 codex_refresh_in_flight: AtomicBool::new(false),
@@ -397,7 +434,9 @@ impl ModelsManager {
             auth_manager
                 .current_or_expired()
                 .is_some_and(|a| a.is_session_auth()),
-            default_codex_account_probe().is_some(),
+            // Credential availability, not fingerprint presence: identity-less
+            // valid credentials must not be treated as logged out.
+            default_codex_logged_in_probe() || default_codex_account_probe().is_some(),
         );
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let mut cached_etag = None;
@@ -561,10 +600,22 @@ impl ModelsManager {
             .is_some_and(|a| a.is_session_auth())
     }
 
+    /// Whether usable Codex credentials exist: the dedicated logged-in probe,
+    /// OR a present account fingerprint (a fingerprint can only be derived
+    /// from loaded credentials, so its presence implies login — but its
+    /// ABSENCE implies nothing, which is exactly the identity-less case the
+    /// dedicated probe covers).
+    fn codex_credentials_present(&self) -> bool {
+        (self.inner.codex_logged_in)() || (self.inner.codex_account)().is_some()
+    }
+
     /// One snapshot of both auth facts the visibility filters consume, taken
-    /// at the manager boundary so the filters themselves stay pure.
+    /// at the manager boundary so the filters themselves stay pure. Codex
+    /// visibility keys on credential availability, not on the optional
+    /// account fingerprint: identity-less valid credentials keep
+    /// authenticated visibility while account-scoped caching stays disabled.
     fn auth_visibility(&self) -> config::AuthVisibility {
-        config::AuthVisibility::new(self.is_session_auth(), (self.inner.codex_account)().is_some())
+        config::AuthVisibility::new(self.is_session_auth(), self.codex_credentials_present())
     }
 
     /// ACP-visible (non-hidden) projection of the catalog.
@@ -1077,7 +1128,10 @@ impl ModelsManager {
     /// and a discarded in-flight refresh reschedules itself so the account
     /// that is current afterwards is not starved by the stale request.
     fn spawn_codex_catalog_refresh(&self) {
-        if (self.inner.codex_account)().is_none() {
+        // Gate on credential availability, not the optional fingerprint:
+        // identity-less credentials still refresh (publication of the result
+        // stays fingerprint-fenced downstream).
+        if !self.codex_credentials_present() {
             return;
         }
         let client = crate::codex_models::CodexModelsClient::new();
@@ -1147,12 +1201,22 @@ impl ModelsManager {
         catalog: crate::codex_models::CodexModelsCatalog,
         generation: u64,
     ) {
+        let Some(fingerprint) = catalog.account_fingerprint() else {
+            // Identity-less credentials: the live catalog was fetchable, but
+            // with no stable account fingerprint the account-scoped in-memory
+            // publication (like the disk cache) is conservatively skipped.
+            tracing::info!(
+                "Codex credentials carry no stable account identity; \
+                 live catalog not published to the account-scoped cache"
+            );
+            return;
+        };
         if !client.catalog_matches_current_account(&catalog) {
             tracing::info!("discarding Codex catalog fetched for a different account");
             client.invalidate_cache();
             return;
         }
-        let fingerprint = catalog.account_fingerprint().to_owned();
+        let fingerprint = fingerprint.to_owned();
         self.set_codex_models_fenced(codex_catalog_entries(&catalog), fingerprint, generation);
     }
 

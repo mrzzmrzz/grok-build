@@ -23,6 +23,7 @@ xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-token-estimation = { workspace = true }
 
 [dev-dependencies]
+async-openai = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [lints]

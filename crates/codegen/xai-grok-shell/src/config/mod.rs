@@ -485,6 +485,16 @@ pub(crate) struct ModelOverrideConfig {
     /// NOT fill a compiled default — see [`PromptSuggestModelPin`].
     #[serde(skip)]
     pub prompt_suggestion: PromptSuggestModelPin,
+    /// Provenance of `web_search`: whether the resolved slug came from an
+    /// explicit source (CLI/env/toml/remote) or the compiled default.
+    #[serde(skip)]
+    pub web_search_pin: AuxModelPin,
+    /// Provenance of `session_summary` — see [`AuxModelPin`].
+    #[serde(skip)]
+    pub session_summary_pin: AuxModelPin,
+    /// Provenance of `image_description` — see [`AuxModelPin`].
+    #[serde(skip)]
+    pub image_description_pin: AuxModelPin,
 }
 impl Default for ModelOverrideConfig {
     fn default() -> Self {
@@ -493,6 +503,46 @@ impl Default for ModelOverrideConfig {
             session_summary: None,
             image_description: None,
             prompt_suggestion: PromptSuggestModelPin::Unpinned,
+            web_search_pin: AuxModelPin::Unpinned,
+            session_summary_pin: AuxModelPin::Unpinned,
+            image_description_pin: AuxModelPin::Unpinned,
+        }
+    }
+}
+/// Provenance-preserving pin for the legacy auxiliary model overrides
+/// (`web_search` / `session_summary` / `image_description`), mirroring the
+/// three-state shape of [`PromptSuggestModelPin`].
+///
+/// The legacy `String`/`Option<String>` fields collapse "user explicitly
+/// configured this model" and "the compiled default applied" into the same
+/// resolved slug, which makes it impossible for a consumer to ask for user
+/// consent. That distinction is a provider-isolation boundary: a Codex
+/// session must not route its content to an xAI auxiliary helper unless the
+/// user *explicitly* pinned a cross-provider model (spec §12.2). The pin runs
+/// alongside the legacy fields (which keep their historical resolution and
+/// default-filling) so existing consumers are untouched; provenance-aware
+/// consumers read the pin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AuxModelPin {
+    /// Explicit via the env escape hatch (`GROK_*_MODEL`) — used verbatim.
+    Env(String),
+    /// Explicit via CLI flag, `[models]` in config.toml, or remote settings.
+    Pinned(String),
+    /// No explicit source anywhere: the compiled default applies.
+    #[default]
+    Unpinned,
+}
+impl AuxModelPin {
+    /// Whether the user explicitly chose this model (any non-default source).
+    pub fn is_explicit(&self) -> bool {
+        !matches!(self, Self::Unpinned)
+    }
+
+    /// The explicitly pinned slug, if any.
+    pub fn explicit_model(&self) -> Option<&str> {
+        match self {
+            Self::Env(m) | Self::Pinned(m) => Some(m.as_str()),
+            Self::Unpinned => None,
         }
     }
 }
@@ -552,15 +602,24 @@ impl ModelOverrideConfig {
         let parsed_models: crate::agent::config::ModelsConfig = models_table
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
+        let pin_of = |value: Option<&str>| {
+            non_empty_model_override(value)
+                .map(AuxModelPin::Pinned)
+                .unwrap_or_default()
+        };
         let mut result = Self {
             web_search: parsed_models
                 .web_search
+                .clone()
                 .unwrap_or_else(|| crate::models::default_web_search_model().to_owned()),
             session_summary: non_empty_model_override(parsed_models.session_summary.as_deref()),
             image_description: non_empty_model_override(parsed_models.image_description.as_deref()),
             prompt_suggestion: non_empty_model_override(parsed_models.prompt_suggestion.as_deref())
                 .map(PromptSuggestModelPin::Pinned)
                 .unwrap_or_default(),
+            web_search_pin: pin_of(parsed_models.web_search.as_deref()),
+            session_summary_pin: pin_of(parsed_models.session_summary.as_deref()),
+            image_description_pin: pin_of(parsed_models.image_description.as_deref()),
         };
         let has_local_ws = models_table.and_then(|m| m.get("web_search")).is_some();
         let has_local_ss = models_table
@@ -572,14 +631,17 @@ impl ModelOverrideConfig {
         if let Some(remote) = remote {
             if !has_local_ws && let Some(ref v) = remote.web_search_model {
                 result.web_search = v.clone();
+                result.web_search_pin = pin_of(Some(v.as_str()));
             }
             if !has_local_ss {
                 result.session_summary =
                     non_empty_model_override(remote.session_summary_model.as_deref());
+                result.session_summary_pin = pin_of(remote.session_summary_model.as_deref());
             }
             if !has_local_id {
                 result.image_description =
                     non_empty_model_override(remote.image_description_model.as_deref());
+                result.image_description_pin = pin_of(remote.image_description_model.as_deref());
             }
             if result.prompt_suggestion == PromptSuggestModelPin::Unpinned
                 && let Some(v) = non_empty_model_override(remote.prompt_suggestion_model.as_deref())
@@ -591,13 +653,26 @@ impl ModelOverrideConfig {
             let v = v.trim();
             if !v.is_empty() {
                 result.web_search = v.to_owned();
+                result.web_search_pin = AuxModelPin::Env(v.to_owned());
             }
         }
         if let Ok(v) = std::env::var("GROK_SESSION_SUMMARY_MODEL") {
             result.session_summary = non_empty_model_override(Some(v.as_str()));
+            // A blank env value clears any earlier pin (the value falls back
+            // to the compiled default, so the provenance must fall back too).
+            result.session_summary_pin = result
+                .session_summary
+                .clone()
+                .map(AuxModelPin::Env)
+                .unwrap_or_default();
         }
         if let Ok(v) = std::env::var("GROK_IMAGE_DESCRIPTION_MODEL") {
             result.image_description = non_empty_model_override(Some(v.as_str()));
+            result.image_description_pin = result
+                .image_description
+                .clone()
+                .map(AuxModelPin::Env)
+                .unwrap_or_default();
         }
         if let Ok(v) = std::env::var("GROK_PROMPT_SUGGESTIONS_MODEL")
             && let Some(v) = non_empty_model_override(Some(v.as_str()))
@@ -606,9 +681,11 @@ impl ModelOverrideConfig {
         }
         if let Some(v) = cli_web_search_model {
             result.web_search = v.to_owned();
+            result.web_search_pin = pin_of(Some(v));
         }
         if let Some(v) = cli_session_summary_model {
             result.session_summary = non_empty_model_override(Some(v));
+            result.session_summary_pin = pin_of(Some(v));
         }
         if result.session_summary.is_none() {
             result.session_summary =

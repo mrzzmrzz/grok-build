@@ -53,6 +53,11 @@ pub struct ChatStateSnapshot {
     /// Opaque credential secrets (API key, optional extra auth, client version).
     #[serde(default)]
     pub credentials: Credentials,
+    /// Monotonic: `true` once the session has ever sampled through the Codex
+    /// provider. Restore ORs this in rather than assigning, so a snapshot
+    /// taken before the first Codex turn can never clear the mark.
+    #[serde(default)]
+    pub ever_used_codex: bool,
 }
 
 /// Metadata for session notifications (timing info).
@@ -196,6 +201,7 @@ mod tests {
             turn_start_ms: None,
             last_compaction_prompt_index: None,
             credentials: Credentials::default(),
+            ever_used_codex: false,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -244,6 +250,7 @@ mod tests {
             turn_start_ms: Some(1234567800),
             last_compaction_prompt_index: Some(2),
             credentials: Credentials::default(),
+            ever_used_codex: false,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

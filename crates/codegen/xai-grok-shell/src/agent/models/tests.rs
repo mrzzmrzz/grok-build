@@ -2059,6 +2059,7 @@ fn make_entry_config_with_id(
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        tool_mode: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -2413,6 +2414,10 @@ mod codex_catalog {
         let tmp = tempfile::TempDir::new().unwrap();
         let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
         let cfg = config::Config::default();
+        // These scenarios model identity-carrying accounts: fingerprint
+        // presence implies credentials exist (the identity-less split is
+        // covered by the dedicated identity_less_* tests).
+        let login_probe = Arc::clone(&probe);
         let mgr = ModelsManagerBuilder::new(
             None,
             resolve_model_catalog(&cfg, None),
@@ -2422,6 +2427,7 @@ mod codex_catalog {
         )
         .cache(test_cache_manager(tmp.path()))
         .codex_account(probe)
+        .codex_logged_in(Arc::new(move || login_probe().is_some()))
         .build();
         (mgr, tmp)
     }
@@ -2738,4 +2744,78 @@ mod codex_catalog {
         mgr.on_codex_auth_changed();
         assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.6");
     }
+}
+
+/// Finding regression: identity-less but valid Codex credentials are logged
+/// in. Visibility keys on the `codex_logged_in` probe, not on the optional
+/// account fingerprint, so bundled Codex models stay visible while
+/// account-scoped cache publication remains fingerprint-fenced.
+#[test]
+fn identity_less_codex_login_keeps_codex_models_visible() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mut codex_entry = make_model_entry("gpt-codex-visible");
+    codex_entry.info.model_family = Some("codex".to_string());
+    let mut models = IndexMap::new();
+    models.insert("gpt-codex-visible".to_string(), codex_entry);
+
+    let build = |logged_in: bool| {
+        ModelsManagerBuilder::new(
+            None,
+            models.clone(),
+            acp::ModelId::new("gpt-codex-visible"),
+            auth_manager.clone(),
+            config::Config::default(),
+        )
+        .cache(test_cache_manager(tmp.path()))
+        // Identity-less: no fingerprint even while logged in.
+        .codex_account(Arc::new(|| None))
+        .codex_logged_in(Arc::new(move || logged_in))
+        .build()
+    };
+
+    let logged_in_mgr = build(true);
+    assert!(
+        logged_in_mgr
+            .available()
+            .contains_key(&acp::ModelId::new("gpt-codex-visible")),
+        "identity-less credentials must keep bundled Codex models visible"
+    );
+
+    let logged_out_mgr = build(false);
+    assert!(
+        !logged_out_mgr
+            .available()
+            .contains_key(&acp::ModelId::new("gpt-codex-visible")),
+        "without credentials the Codex entry stays hidden"
+    );
+}
+
+/// With no account fingerprint, a fenced live-catalog publication is refused:
+/// the account-scoped in-memory cache never holds identity-less results.
+#[test]
+fn identity_less_codex_login_blocks_account_scoped_publication() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("default"),
+        auth_manager,
+        config::Config::default(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .codex_account(Arc::new(|| None))
+    .codex_logged_in(Arc::new(|| true))
+    .build();
+
+    let mut live_entry = make_model_entry("gpt-live-anon");
+    live_entry.info.model_family = Some("codex".to_string());
+    let mut entries = IndexMap::new();
+    entries.insert("gpt-live-anon".to_string(), live_entry);
+    assert!(
+        !mgr.publish_codex_models_for_test(entries, "some-fingerprint".to_string()),
+        "publication must be refused while the current account has no fingerprint"
+    );
+    assert!(!mgr.models().contains_key("gpt-live-anon"));
 }
