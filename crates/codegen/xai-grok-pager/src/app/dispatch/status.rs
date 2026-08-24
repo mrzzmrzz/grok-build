@@ -97,6 +97,12 @@ pub(super) fn open_usage_info_modal(
             nonce,
         });
     }
+    // Codex usage is account-level: fetched regardless of session state, and
+    // independent of the xAI fetches above so either side can fail alone.
+    effects.push(Effect::FetchCodexUsage {
+        agent_id: id,
+        nonce,
+    });
     // Silent refresh of the cached billing mirrors the modal renders from.
     if billing_reachable {
         state.billing_loading = true;
@@ -349,7 +355,14 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
         };
         agent.session.session_id.clone()
     };
-    match session_id {
+    // Codex usage is account-level (no session needed) and fetched
+    // independently: a Codex failure renders as its own block and never
+    // suppresses the xAI session/billing output (or vice versa).
+    let codex_effect = Effect::FetchCodexUsage {
+        agent_id: id,
+        nonce: Default::default(),
+    };
+    let mut effects = match session_id {
         Some(session_id) => vec![Effect::FetchSessionUsage {
             agent_id: id,
             session_id,
@@ -366,7 +379,34 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
             }
             append_consumer_billing_surface(app, id)
         }
+    };
+    effects.push(codex_effect);
+    effects
+}
+
+/// Route a Codex usage result (already formatted text) into the open usage
+/// modal, or into scrollback in minimal mode. Stale modal results (nonce
+/// mismatch, modal closed) are dropped.
+pub(super) fn handle_codex_usage_loaded(
+    app: &mut AppView,
+    agent_id: AgentId,
+    text: String,
+    nonce: u64,
+) -> Vec<Effect> {
+    let minimal = app.screen_mode.is_minimal();
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if !minimal {
+        if let Some(state) = usage_modal_state_mut(agent)
+            && state.fetch_nonce == nonce
+        {
+            state.codex_usage_text = Some(text);
+        }
+        return vec![];
     }
+    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    vec![]
 }
 
 /// Route a session-usage result (success or failure text) into the open

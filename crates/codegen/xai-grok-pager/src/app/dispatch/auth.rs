@@ -20,6 +20,60 @@ pub(super) fn dispatch_logout(_app: &mut AppView) -> Vec<Effect> {
     vec![Effect::Logout]
 }
 
+/// Agent a Codex login/logout result routes back to. `AgentId(0)` is a
+/// synthetic stand-in when no agent exists yet; the result handler falls
+/// back to a toast for agents it can't find (or that aren't in view).
+fn codex_feedback_agent_id(app: &AppView) -> AgentId {
+    match app.active_view {
+        ActiveView::Agent(id) => id,
+        _ => app.agents.keys().next().copied().unwrap_or(AgentId(0)),
+    }
+}
+
+/// `/login codex` — run the shell's Codex browser OAuth flow. Provider-
+/// isolated: xAI auth state and the welcome-screen login UI are untouched.
+/// The shell replies when the OAuth callback lands (or fails), and pushes a
+/// `x.ai/models/update` on success so GPT models appear without a restart.
+pub(super) fn dispatch_codex_login(app: &mut AppView) -> Vec<Effect> {
+    let agent_id = codex_feedback_agent_id(app);
+    let notice = "Connecting OpenAI Codex: finish signing in via your browser\u{2026}";
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get_mut(&id)
+    {
+        super::queue::push_and_page_flip(
+            &mut agent.scrollback,
+            RenderBlock::system(notice.to_string()),
+        );
+    } else {
+        app.show_toast(notice);
+    }
+    vec![Effect::CodexLogin { agent_id }]
+}
+
+/// `/logout codex` — remove only the Codex credential; xAI auth is kept and
+/// no view change happens (unlike the bare `/logout` welcome-screen flow).
+pub(super) fn dispatch_codex_logout(app: &mut AppView) -> Vec<Effect> {
+    let agent_id = codex_feedback_agent_id(app);
+    vec![Effect::CodexLogout { agent_id }]
+}
+
+/// Route a Codex login/logout result message: scrollback when the owning
+/// agent is still in view, otherwise a toast (first line only).
+pub(super) fn handle_codex_auth_result(
+    app: &mut AppView,
+    agent_id: AgentId,
+    message: String,
+) -> Vec<Effect> {
+    let on_agent_view = matches!(app.active_view, ActiveView::Agent(id) if id == agent_id);
+    if on_agent_view && let Some(agent) = app.agents.get_mut(&agent_id) {
+        super::queue::push_and_page_flip(&mut agent.scrollback, RenderBlock::system(message));
+    } else {
+        let first_line = message.lines().next().unwrap_or_default().to_string();
+        app.show_toast(&first_line);
+    }
+    vec![]
+}
+
 /// Ensure `login_method_id` is populated from stored auth methods.
 /// On the eager-auth path (cached token), login_method_id is never set
 /// because the user skipped the login screen.

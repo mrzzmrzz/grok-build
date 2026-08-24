@@ -627,6 +627,79 @@ mod tests {
         ));
     }
     #[test]
+    fn login_codex_arg_routes_to_codex_login() {
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        assert!(matches!(
+            login::LoginCommand.run(&mut ctx, ""),
+            CommandResult::Action(Action::Login)
+        ));
+        assert!(matches!(
+            login::LoginCommand.run(&mut ctx, "  codex  "),
+            CommandResult::Action(Action::CodexLogin)
+        ));
+        assert!(matches!(
+            login::LoginCommand.run(&mut ctx, "openai"),
+            CommandResult::Error(msg) if msg.contains("/login codex")
+        ));
+    }
+    #[test]
+    fn logout_codex_arg_routes_to_codex_logout() {
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        assert!(matches!(
+            logout::LogoutCommand.run(&mut ctx, ""),
+            CommandResult::Action(Action::Logout)
+        ));
+        assert!(matches!(
+            logout::LogoutCommand.run(&mut ctx, "codex"),
+            CommandResult::Action(Action::CodexLogout)
+        ));
+        assert!(matches!(
+            logout::LogoutCommand.run(&mut ctx, "everything"),
+            CommandResult::Error(msg) if msg.contains("/logout codex")
+        ));
+    }
+    #[test]
+    fn login_and_logout_suggest_codex_but_do_not_chain_args() {
+        let models = ModelState::default();
+        let ctx = crate::slash::command::AppCtx {
+            models: &models,
+            cwd: std::path::Path::new("."),
+            has_session_announcements: false,
+            billing_surface_visible: true,
+            usage_command_visible: true,
+            workflows_available: false,
+            saved_workflows: &[],
+            workflow_runs: &[],
+            screen_mode: crate::app::ScreenMode::Fullscreen,
+            current_title: None,
+        };
+        let login_items = login::LoginCommand.suggest_args(&ctx, "").unwrap();
+        assert_eq!(
+            login_items
+                .iter()
+                .map(|i| i.display.as_str())
+                .collect::<Vec<_>>(),
+            ["codex"]
+        );
+        let logout_items = logout::LogoutCommand.suggest_args(&ctx, "").unwrap();
+        assert_eq!(
+            logout_items
+                .iter()
+                .map(|i| i.display.as_str())
+                .collect::<Vec<_>>(),
+            ["codex"]
+        );
+        // Bare Enter must still execute (no args chaining).
+        assert!(login::LoginCommand.takes_args());
+        assert!(!login::LoginCommand.takes_args_now(&ctx));
+        assert!(!login::LoginCommand.args_required());
+        assert!(logout::LogoutCommand.takes_args());
+        assert!(!logout::LogoutCommand.takes_args_now(&ctx));
+        assert!(!logout::LogoutCommand.args_required());
+    }
+    #[test]
     fn cd_registered_in_builtin_commands() {
         let reg = CommandRegistry::new(builtin_commands());
         assert!(

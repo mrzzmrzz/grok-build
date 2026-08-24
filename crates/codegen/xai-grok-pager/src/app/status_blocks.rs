@@ -236,6 +236,138 @@ pub(crate) fn session_usage_block_text(
     )
 }
 
+/// `/usage` Codex section — account-level OpenAI Codex usage as plain text.
+/// First line is a header (the usage modal styles it bold; minimal mode
+/// commits the whole block to scrollback). "Not connected" and fetch errors
+/// are rendered here too, so a Codex failure never hides the xAI sections.
+pub(crate) fn codex_usage_block_text(
+    resp: &xai_grok_shell::extensions::codex::CodexUsageResponse,
+) -> String {
+    let header = "OpenAI Codex usage:".to_string();
+    if !resp.logged_in {
+        return join_header_rows(
+            header,
+            vec!["  Not connected. Run /login codex (or grok login --codex).".to_string()],
+        );
+    }
+    if let Some(error) = &resp.error {
+        return join_header_rows(header, vec![format!("  Couldn't load Codex usage: {error}")]);
+    }
+    let mut rows: Vec<String> = Vec::new();
+    if let Some(email) = resp.email.as_deref().filter(|s| !s.is_empty()) {
+        rows.push(format!("  Account:  {email}"));
+    }
+    if let Some(plan) = resp.plan_type.as_deref().filter(|s| !s.is_empty()) {
+        rows.push(format!("  Plan:     {plan}"));
+    }
+    if let Some(rl) = &resp.rate_limit {
+        if let Some(w) = &rl.primary_window {
+            rows.push(codex_window_row(w));
+        }
+        if let Some(w) = &rl.secondary_window {
+            rows.push(codex_window_row(w));
+        }
+        if rl.limit_reached {
+            rows.push("  Rate limit reached.".to_string());
+        }
+    }
+    if let Some(credits) = &resp.credits {
+        rows.push(format!("  Credits:  {}", codex_credits_cell(credits)));
+    }
+    if rows.is_empty() {
+        rows.push("  No usage data reported.".to_string());
+    }
+    join_header_rows(header, rows)
+}
+
+/// One rate-limit window row: `  5h limit: 34% used · resets in 2h 10m`.
+fn codex_window_row(w: &xai_grok_shell::codex_auth::CodexRateLimitWindow) -> String {
+    let used = w.used_percent.clamp(0.0, 100.0).floor() as i64;
+    let reset = format_duration(std::time::Duration::from_secs(
+        w.reset_after_seconds.max(0) as u64,
+    ));
+    format!(
+        "  {}: {used}% used \u{b7} resets in {reset}",
+        codex_window_label(w.limit_window_seconds)
+    )
+}
+
+/// Human label for a rate-limit window length in seconds.
+fn codex_window_label(secs: i64) -> String {
+    const HOUR: i64 = 3_600;
+    const DAY: i64 = 24 * HOUR;
+    if secs == 7 * DAY {
+        "Weekly limit".to_string()
+    } else if secs > 0 && secs % DAY == 0 {
+        format!("{}d limit", secs / DAY)
+    } else if secs > 0 && secs % HOUR == 0 {
+        format!("{}h limit", secs / HOUR)
+    } else {
+        format!("{}m limit", secs.max(0) / 60)
+    }
+}
+
+/// Credits cell: unlimited > explicit balance > available/none.
+fn codex_credits_cell(c: &xai_grok_shell::codex_auth::CodexCredits) -> String {
+    if c.unlimited {
+        return "unlimited".to_string();
+    }
+    if let Some(balance) = &c.balance {
+        return match balance {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    }
+    if c.has_credits {
+        "available".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+/// `/login codex` result line(s) for scrollback (or toast fallback).
+pub(crate) fn codex_login_result_text(
+    result: &Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
+) -> String {
+    const DEVICE_AUTH_HINT: &str =
+        "No browser on this machine? Run: grok login --codex --device-auth";
+    match result {
+        Ok(resp) if resp.ok => {
+            let account = resp
+                .email
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("your ChatGPT account");
+            match resp.plan_type.as_deref().filter(|s| !s.is_empty()) {
+                Some(plan) => format!("Connected to OpenAI Codex as {account} (plan: {plan})."),
+                None => format!("Connected to OpenAI Codex as {account}."),
+            }
+        }
+        Ok(resp) => {
+            let error = resp.error.as_deref().unwrap_or("unknown error");
+            format!("Codex login failed: {error}\n{DEVICE_AUTH_HINT}")
+        }
+        Err(error) => format!("Codex login failed: {error}\n{DEVICE_AUTH_HINT}"),
+    }
+}
+
+/// `/logout codex` result line for scrollback (or toast fallback).
+pub(crate) fn codex_logout_result_text(
+    result: &Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
+) -> String {
+    match result {
+        Ok(resp) if resp.ok => match resp.was_logged_in {
+            Some(false) => "OpenAI Codex was not connected.".to_string(),
+            _ => "Disconnected OpenAI Codex.".to_string(),
+        },
+        Ok(resp) => format!(
+            "Codex logout failed: {}",
+            resp.error.as_deref().unwrap_or("unknown error")
+        ),
+        Err(error) => format!("Codex logout failed: {error}"),
+    }
+}
+
 /// Cost cell. Ticks are 1e10 per USD; partial sums are scrubbed to absent.
 fn format_cost(m: &xai_grok_shell::extensions::notification::PromptUsageModel) -> String {
     use xai_grok_shell::extensions::notification::ticks_to_usd;
@@ -406,6 +538,182 @@ mod tests {
         assert_eq!(
             format_queue_row(3, "first\nsecond\nthird"),
             "  #3  first  (+2 more lines)"
+        );
+    }
+
+    // ── Codex usage / auth text ─────────────────────────────────────
+
+    use xai_grok_shell::codex_auth::{CodexCredits, CodexRateLimit, CodexRateLimitWindow};
+    use xai_grok_shell::extensions::codex::{CodexAuthActionResponse, CodexUsageResponse};
+
+    fn codex_usage(logged_in: bool) -> CodexUsageResponse {
+        CodexUsageResponse {
+            logged_in,
+            email: None,
+            plan_type: None,
+            rate_limit: None,
+            credits: None,
+            error: None,
+        }
+    }
+
+    fn window(window_secs: i64, used: f64, reset_secs: i64) -> CodexRateLimitWindow {
+        CodexRateLimitWindow {
+            used_percent: used,
+            limit_window_seconds: window_secs,
+            reset_after_seconds: reset_secs,
+            reset_at: 0,
+        }
+    }
+
+    #[test]
+    fn codex_usage_block_not_connected() {
+        let text = codex_usage_block_text(&codex_usage(false));
+        assert_eq!(
+            text,
+            "OpenAI Codex usage:\n  Not connected. Run /login codex (or grok login --codex)."
+        );
+    }
+
+    #[test]
+    fn codex_usage_block_error_is_isolated_to_one_line() {
+        let mut resp = codex_usage(true);
+        resp.error = Some("Codex usage request returned 500".to_string());
+        let text = codex_usage_block_text(&resp);
+        assert_eq!(
+            text,
+            "OpenAI Codex usage:\n  Couldn't load Codex usage: Codex usage request returned 500"
+        );
+    }
+
+    #[test]
+    fn codex_usage_block_full_snapshot() {
+        let mut resp = codex_usage(true);
+        resp.email = Some("dev@example.com".to_string());
+        resp.plan_type = Some("plus".to_string());
+        resp.rate_limit = Some(CodexRateLimit {
+            allowed: true,
+            limit_reached: false,
+            primary_window: Some(window(18_000, 34.9, 7_800)),
+            secondary_window: Some(window(604_800, 12.0, 3 * 86_400)),
+        });
+        resp.credits = Some(CodexCredits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some(serde_json::json!("4.20")),
+        });
+        let text = codex_usage_block_text(&resp);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "OpenAI Codex usage:");
+        assert_eq!(lines[1], "  Account:  dev@example.com");
+        assert_eq!(lines[2], "  Plan:     plus");
+        assert!(
+            lines[3].starts_with("  5h limit: 34% used \u{b7} resets in "),
+            "{:?}",
+            lines[3]
+        );
+        assert!(
+            lines[4].starts_with("  Weekly limit: 12% used \u{b7} resets in "),
+            "{:?}",
+            lines[4]
+        );
+        assert_eq!(lines[5], "  Credits:  4.20");
+    }
+
+    #[test]
+    fn codex_usage_block_limit_reached_and_unlimited_credits() {
+        let mut resp = codex_usage(true);
+        resp.rate_limit = Some(CodexRateLimit {
+            allowed: false,
+            limit_reached: true,
+            primary_window: None,
+            secondary_window: None,
+        });
+        resp.credits = Some(CodexCredits {
+            has_credits: false,
+            unlimited: true,
+            balance: None,
+        });
+        let text = codex_usage_block_text(&resp);
+        assert!(text.contains("  Rate limit reached."), "{text}");
+        assert!(text.contains("  Credits:  unlimited"), "{text}");
+    }
+
+    #[test]
+    fn codex_usage_block_empty_snapshot_has_placeholder() {
+        let text = codex_usage_block_text(&codex_usage(true));
+        assert_eq!(text, "OpenAI Codex usage:\n  No usage data reported.");
+    }
+
+    #[test]
+    fn codex_window_labels() {
+        assert_eq!(codex_window_label(18_000), "5h limit");
+        assert_eq!(codex_window_label(604_800), "Weekly limit");
+        assert_eq!(codex_window_label(2 * 86_400), "2d limit");
+        assert_eq!(codex_window_label(1_800), "30m limit");
+        assert_eq!(codex_window_label(-5), "0m limit");
+    }
+
+    fn auth_resp(ok: bool) -> CodexAuthActionResponse {
+        CodexAuthActionResponse {
+            ok,
+            email: None,
+            plan_type: None,
+            was_logged_in: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn codex_login_text_success_includes_email_and_plan() {
+        let mut resp = auth_resp(true);
+        resp.email = Some("dev@example.com".to_string());
+        resp.plan_type = Some("pro".to_string());
+        assert_eq!(
+            codex_login_result_text(&Ok(Box::new(resp))),
+            "Connected to OpenAI Codex as dev@example.com (plan: pro)."
+        );
+        assert_eq!(
+            codex_login_result_text(&Ok(Box::new(auth_resp(true)))),
+            "Connected to OpenAI Codex as your ChatGPT account."
+        );
+    }
+
+    #[test]
+    fn codex_login_text_failure_hints_device_auth() {
+        let mut resp = auth_resp(false);
+        resp.error = Some("could not open a browser".to_string());
+        let text = codex_login_result_text(&Ok(Box::new(resp)));
+        assert!(text.starts_with("Codex login failed: could not open a browser"));
+        assert!(text.contains("grok login --codex --device-auth"), "{text}");
+        let text = codex_login_result_text(&Err("agent unreachable".to_string()));
+        assert!(text.contains("agent unreachable"), "{text}");
+        assert!(text.contains("grok login --codex --device-auth"), "{text}");
+    }
+
+    #[test]
+    fn codex_logout_text_variants() {
+        let mut resp = auth_resp(true);
+        resp.was_logged_in = Some(true);
+        assert_eq!(
+            codex_logout_result_text(&Ok(Box::new(resp))),
+            "Disconnected OpenAI Codex."
+        );
+        let mut resp = auth_resp(true);
+        resp.was_logged_in = Some(false);
+        assert_eq!(
+            codex_logout_result_text(&Ok(Box::new(resp))),
+            "OpenAI Codex was not connected."
+        );
+        let mut resp = auth_resp(false);
+        resp.error = Some("revoke failed".to_string());
+        assert_eq!(
+            codex_logout_result_text(&Ok(Box::new(resp))),
+            "Codex logout failed: revoke failed"
+        );
+        assert_eq!(
+            codex_logout_result_text(&Err("agent unreachable".to_string())),
+            "Codex logout failed: agent unreachable"
         );
     }
 }

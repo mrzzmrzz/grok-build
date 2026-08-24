@@ -1,7 +1,7 @@
 //! Async task-result application: routes task results into state.
 use super::auth::{
-    ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
-    handle_mcp_setup_submit_done,
+    ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_codex_auth_result,
+    handle_mcp_auth_trigger_done, handle_mcp_setup_submit_done,
 };
 use super::billing::{
     PAYWALL_AUTO_CHECK_TIMEOUT, apply_auto_topup, handle_billing_fetched,
@@ -42,9 +42,9 @@ use super::session::load::{
 use super::session::modal::remove_agent_and_cleanup;
 use super::settings::ui::apply_setting_rollback;
 use super::status::{
-    handle_coding_data_sharing_failed, handle_coding_data_sharing_updated,
-    handle_context_info_complete, handle_session_usage_result, scrub_error_for_toast,
-    usage_modal_state_mut,
+    handle_codex_usage_loaded, handle_coding_data_sharing_failed,
+    handle_coding_data_sharing_updated, handle_context_info_complete,
+    handle_session_usage_result, scrub_error_for_toast, usage_modal_state_mut,
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
@@ -1182,6 +1182,26 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             &session_id,
             format!("Couldn't load session usage: {error}"),
             nonce,
+        ),
+        TaskResult::CodexUsageLoaded {
+            agent_id,
+            usage,
+            nonce,
+        } => handle_codex_usage_loaded(
+            app,
+            agent_id,
+            crate::app::status_blocks::codex_usage_block_text(&usage),
+            nonce,
+        ),
+        TaskResult::CodexLoginFinished { agent_id, result } => handle_codex_auth_result(
+            app,
+            agent_id,
+            crate::app::status_blocks::codex_login_result_text(&result),
+        ),
+        TaskResult::CodexLogoutFinished { agent_id, result } => handle_codex_auth_result(
+            app,
+            agent_id,
+            crate::app::status_blocks::codex_logout_result_text(&result),
         ),
         TaskResult::FeedbackComplete { .. } => vec![],
         TaskResult::FeedbackFailed { agent_id, error } => {

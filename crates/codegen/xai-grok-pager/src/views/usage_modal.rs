@@ -92,6 +92,10 @@ pub struct UsageInfoModalState {
     pub session_error: Option<String>,
     /// Pre-formatted session token/cost summary (`session_usage_block_text`).
     pub session_usage_text: Option<String>,
+    /// Pre-formatted OpenAI Codex account usage (`codex_usage_block_text`).
+    /// Populated independently of the xAI sections — either provider can
+    /// fail (or be logged out) without hiding the other.
+    pub codex_usage_text: Option<String>,
     pub billing_loading: bool,
     pub billing_error: Option<String>,
     /// Fetch generation stamped at open; results from an earlier open (same
@@ -176,6 +180,7 @@ impl UsageInfoModalState {
             context_error: None,
             session_error: None,
             session_usage_text: None,
+            codex_usage_text: None,
             billing_loading: false,
             billing_error: None,
             fetch_nonce: Default::default(),
@@ -846,6 +851,24 @@ fn usage_limit_lines(
         }
         lines.push(muted_line(theme, "Loading session usage\u{2026}"));
     }
+
+    // OpenAI Codex account usage — its own section, fetched and failing
+    // independently of the xAI billing/session sections above.
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    match &state.codex_usage_text {
+        Some(text) => {
+            for (i, row) in text.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::styled(row.to_string(), header_style(theme)));
+                } else {
+                    lines.push(plain(theme, row));
+                }
+            }
+        }
+        None => lines.push(muted_line(theme, "Loading Codex usage\u{2026}")),
+    }
     lines
 }
 
@@ -1102,6 +1125,66 @@ mod tests {
         state.ctx.chat_kind = true;
         let lines = usage_limit_lines(&state, None, &theme);
         assert!(lines[0].to_string().contains("Loading session usage"));
+    }
+
+    #[test]
+    fn usage_limit_tab_codex_section_fails_independently() {
+        let theme = Theme::current();
+        let mut state = state_with_session();
+
+        // xAI side failed; Codex side loaded — both render their own lines.
+        state.billing_error = Some("billing down".to_string());
+        state.session_usage_text = Some("Couldn't load session usage: boom".to_string());
+        state.codex_usage_text = Some("OpenAI Codex usage:\n  Plan:     plus".to_string());
+        let text: Vec<String> = usage_limit_lines(&state, None, &theme)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("Couldn't load usage: billing down")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Couldn't load session usage: boom")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|l| l == "OpenAI Codex usage:"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("Plan:     plus")), "{text:?}");
+
+        // Reverse: Codex failed, xAI session usage loaded — both still shown.
+        state.billing_error = None;
+        state.session_usage_text =
+            Some("Session usage (since start or last resume):\n  Total tokens:   5".to_string());
+        state.codex_usage_text =
+            Some("OpenAI Codex usage:\n  Couldn't load Codex usage: 500".to_string());
+        let text: Vec<String> = usage_limit_lines(&state, None, &theme)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("Total tokens:   5")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Couldn't load Codex usage: 500")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn usage_limit_tab_codex_loading_placeholder() {
+        let theme = Theme::current();
+        let state = state_with_session();
+        let text: Vec<String> = usage_limit_lines(&state, None, &theme)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("Loading Codex usage")),
+            "{text:?}"
+        );
     }
 
     #[test]

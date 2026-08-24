@@ -495,9 +495,14 @@ fn upsell_max_tier_not_idempotent_pushes_multiple_cards() {
 // ── ShowUsage / session usage ───────────────────────────────────────
 
 fn is_session_usage_fetch(effects: &[Effect]) -> bool {
+    // `/usage` always adds the independent Codex account fetch after the
+    // session ledger fetch.
     matches!(
         effects,
-        [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
+        [
+            Effect::FetchSessionUsage { agent_id, .. },
+            Effect::FetchCodexUsage { .. },
+        ] if *agent_id == AgentId(0)
     )
 }
 
@@ -505,6 +510,16 @@ fn is_nonsilent_billing(effects: &[Effect]) -> bool {
     matches!(
         effects,
         [Effect::FetchBilling { agent_id, silent, .. }] if *agent_id == AgentId(0) && !*silent
+    )
+}
+
+fn is_nonsilent_billing_then_codex(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [
+            Effect::FetchBilling { agent_id, silent, .. },
+            Effect::FetchCodexUsage { .. },
+        ] if *agent_id == AgentId(0) && !*silent
     )
 }
 
@@ -562,7 +577,7 @@ fn show_usage_without_session_still_surfaces_credits() {
     let effects = dispatch(Action::ShowUsage, &mut app);
     assert!(last_system_text(&app, AgentId(0)).contains("unavailable"));
     assert_eq!(agent_scrollback_len(&app), before + 1);
-    assert!(is_nonsilent_billing(&effects));
+    assert!(is_nonsilent_billing_then_codex(&effects));
 }
 
 #[test]

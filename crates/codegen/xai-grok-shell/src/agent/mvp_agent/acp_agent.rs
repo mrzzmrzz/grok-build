@@ -2265,6 +2265,9 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
+            "x.ai/codex/login" | "x.ai/codex/logout" | "x.ai/usage/codex" => {
+                crate::extensions::codex::handle(self, &args).await
+            }
             "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
                 crate::extensions::memory::handle(self, &args).await
             }

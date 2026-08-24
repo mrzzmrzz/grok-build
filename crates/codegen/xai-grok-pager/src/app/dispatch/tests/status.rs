@@ -1589,7 +1589,10 @@ fn show_usage_with_redirect_url_fetches_session_only() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::FetchSessionUsage { agent_id, .. }] if *agent_id == AgentId(0)
+            [
+                Effect::FetchSessionUsage { agent_id, .. },
+                Effect::FetchCodexUsage { .. },
+            ] if *agent_id == AgentId(0)
         ),
         "got: {effects:?}"
     );
@@ -1659,6 +1662,7 @@ fn show_usage_opens_modal_on_usage_limit_tab_with_fetches() {
                 Effect::ShowContextInfo { .. },
                 Effect::ShowSessionInfo { .. },
                 Effect::FetchSessionUsage { .. },
+                Effect::FetchCodexUsage { .. },
                 Effect::FetchBilling { silent: true, .. },
             ]
         ),
@@ -1836,4 +1840,117 @@ fn fetch_failures_surface_in_open_modal() {
     let state = usage_modal_state(&app);
     assert_eq!(state.session_error.as_deref(), Some("info boom"));
     assert_eq!(state.context_error.as_deref(), Some("ctx boom"));
+}
+
+// ── Codex usage routing tests ────────────────────────────────────────
+
+fn codex_usage_result(nonce: u64, error: Option<&str>) -> TaskResult {
+    TaskResult::CodexUsageLoaded {
+        agent_id: AgentId(0),
+        usage: Box::new(xai_grok_shell::extensions::codex::CodexUsageResponse {
+            logged_in: true,
+            email: None,
+            plan_type: Some("plus".to_string()),
+            rate_limit: None,
+            credits: None,
+            error: error.map(String::from),
+        }),
+        nonce,
+    }
+}
+
+/// One provider failing must not hide the other: the modal keeps the xAI
+/// session-usage failure text AND the Codex snapshot (and vice versa).
+#[test]
+fn codex_and_session_usage_fail_independently_in_modal() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let nonce = current_usage_nonce(&app);
+    let before = agent_scrollback_len(&app);
+
+    // xAI session fetch fails; Codex loads.
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionUsageFailed {
+            agent_id: AgentId(0),
+            session_id: "test-session".to_string().into(),
+            error: "xai boom".to_string(),
+            nonce,
+        }),
+        &mut app,
+    );
+    dispatch(Action::TaskComplete(codex_usage_result(nonce, None)), &mut app);
+    {
+        let state = usage_modal_state(&app);
+        let session = state.session_usage_text.as_deref().unwrap();
+        assert!(session.contains("xai boom"), "got: {session}");
+        let codex = state.codex_usage_text.as_deref().unwrap();
+        assert!(codex.contains("Plan:     plus"), "got: {codex}");
+    }
+
+    // Reverse direction: Codex fails; the session text stays intact.
+    dispatch(
+        Action::TaskComplete(codex_usage_result(nonce, Some("codex boom"))),
+        &mut app,
+    );
+    let state = usage_modal_state(&app);
+    assert!(
+        state
+            .codex_usage_text
+            .as_deref()
+            .unwrap()
+            .contains("Couldn't load Codex usage: codex boom")
+    );
+    assert!(state.session_usage_text.as_deref().unwrap().contains("xai boom"));
+    assert_eq!(agent_scrollback_len(&app), before, "modal mode: no scrollback");
+}
+
+#[test]
+fn codex_usage_stale_nonce_is_dropped_in_full_mode() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::ShowUsage, &mut app);
+    let nonce = current_usage_nonce(&app);
+    dispatch(
+        Action::TaskComplete(codex_usage_result(nonce.wrapping_add(7), None)),
+        &mut app,
+    );
+    assert!(usage_modal_state(&app).codex_usage_text.is_none());
+}
+
+#[test]
+fn codex_usage_minimal_mode_pushes_scrollback_block() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(codex_usage_result(Default::default(), None)),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("OpenAI Codex usage:"), "got: {text}");
+    assert!(text.contains("Plan:     plus"), "got: {text}");
+}
+
+#[test]
+fn codex_usage_not_connected_renders_login_hint_in_minimal_mode() {
+    let mut app = test_app_with_agent();
+    app.screen_mode = crate::app::ScreenMode::Minimal;
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexUsageLoaded {
+            agent_id: AgentId(0),
+            usage: Box::new(xai_grok_shell::extensions::codex::CodexUsageResponse {
+                logged_in: false,
+                email: None,
+                plan_type: None,
+                rate_limit: None,
+                credits: None,
+                error: None,
+            }),
+            nonce: Default::default(),
+        }),
+        &mut app,
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("Not connected"), "got: {text}");
+    assert!(text.contains("grok login --codex"), "got: {text}");
 }

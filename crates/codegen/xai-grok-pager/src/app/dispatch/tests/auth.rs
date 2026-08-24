@@ -811,3 +811,132 @@ fn auth_complete_preserves_show_resolved_model_when_absent() {
 
     assert!(!app.show_resolved_model);
 }
+
+// ── Codex login/logout dispatch tests ────────────────────────────────
+
+fn codex_auth_ok(email: Option<&str>, plan: Option<&str>) -> TaskResult {
+    TaskResult::CodexLoginFinished {
+        agent_id: AgentId(0),
+        result: Ok(Box::new(
+            xai_grok_shell::extensions::codex::CodexAuthActionResponse {
+                ok: true,
+                email: email.map(String::from),
+                plan_type: plan.map(String::from),
+                was_logged_in: None,
+                error: None,
+            },
+        )),
+    }
+}
+
+#[test]
+fn codex_login_from_agent_view_pushes_notice_and_effect() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = dispatch(Action::CodexLogin, &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CodexLogin { agent_id }] if *agent_id == AgentId(0)
+        ),
+        "got: {effects:?}"
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    assert!(
+        last_system_text(&app, AgentId(0)).contains("Connecting OpenAI Codex"),
+        "notice block expected"
+    );
+    // xAI auth state is untouched — no welcome-screen switch.
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+    assert!(matches!(app.auth_state, AuthState::Done));
+}
+
+#[test]
+fn codex_login_result_lands_in_active_agent_scrollback() {
+    let mut app = test_app_with_agent();
+    let before = agent_scrollback_len(&app);
+    let effects = dispatch(
+        Action::TaskComplete(codex_auth_ok(Some("dev@example.com"), Some("plus"))),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    let text = last_system_text(&app, AgentId(0));
+    assert!(
+        text.contains("Connected to OpenAI Codex as dev@example.com (plan: plus)."),
+        "got: {text}"
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+}
+
+#[test]
+fn codex_login_result_toasts_when_agent_not_in_view() {
+    let mut app = test_app_with_agent();
+    app.active_view = ActiveView::Welcome;
+    let before = agent_scrollback_len(&app);
+    dispatch(
+        Action::TaskComplete(codex_auth_ok(Some("dev@example.com"), None)),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before, "no scrollback push");
+    let toast = app
+        .welcome_toast
+        .as_ref()
+        .map(|(m, _)| m.clone())
+        .expect("welcome toast should be set");
+    assert!(
+        toast.contains("Connected to OpenAI Codex"),
+        "toast fallback expected, got: {toast}"
+    );
+}
+
+#[test]
+fn codex_login_failure_hints_device_auth_flow() {
+    let mut app = test_app_with_agent();
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLoginFinished {
+            agent_id: AgentId(0),
+            result: Err("could not open a browser".to_string()),
+        }),
+        &mut app,
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("Codex login failed"), "got: {text}");
+    assert!(
+        text.contains("grok login --codex --device-auth"),
+        "headless hint expected, got: {text}"
+    );
+}
+
+#[test]
+fn codex_logout_dispatches_effect_and_reports_result() {
+    let mut app = test_app_with_agent();
+    let effects = dispatch(Action::CodexLogout, &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CodexLogout { agent_id }] if *agent_id == AgentId(0)
+        ),
+        "got: {effects:?}"
+    );
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexLogoutFinished {
+            agent_id: AgentId(0),
+            result: Ok(Box::new(
+                xai_grok_shell::extensions::codex::CodexAuthActionResponse {
+                    ok: true,
+                    email: None,
+                    plan_type: None,
+                    was_logged_in: Some(true),
+                    error: None,
+                },
+            )),
+        }),
+        &mut app,
+    );
+    assert!(
+        last_system_text(&app, AgentId(0)).contains("Disconnected OpenAI Codex."),
+        "logout confirmation expected"
+    );
+    // Bare-logout welcome flow must not trigger.
+    assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+}

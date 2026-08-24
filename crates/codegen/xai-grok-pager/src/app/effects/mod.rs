@@ -3547,6 +3547,38 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchCodexUsage { agent_id, nonce } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let usage = fetch_codex_usage(&tx).await;
+                    TaskResult::CodexUsageLoaded {
+                        agent_id,
+                        usage: Box::new(usage),
+                        nonce,
+                    }
+                });
+        }
+        Effect::CodexLogin { agent_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    TaskResult::CodexLoginFinished {
+                        agent_id,
+                        result: codex_auth_rpc("x.ai/codex/login", &tx).await,
+                    }
+                });
+        }
+        Effect::CodexLogout { agent_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    TaskResult::CodexLogoutFinished {
+                        agent_id,
+                        result: codex_auth_rpc("x.ai/codex/logout", &tx).await,
+                    }
+                });
+        }
         Effect::SendFeedback { agent_id, session_id, feedback_text, images } => {
             use xai_grok_shell::session::ClientType;
             use xai_grok_shell::session::acp_types::ClientFeedbackInput;
@@ -4631,6 +4663,64 @@ async fn fetch_session_usage(
             "invalid session usage response".to_string()
         })?;
     Ok(parsed.usage)
+}
+/// `x.ai/usage/codex` → Codex account usage. Transport/decode failures are
+/// folded into the response's `error` field so every outcome flows through
+/// the single `codex_usage_block_text` formatter (and never suppresses the
+/// independent xAI usage fetches).
+async fn fetch_codex_usage(
+    tx: &AcpAgentTx,
+) -> xai_grok_shell::extensions::codex::CodexUsageResponse {
+    use xai_grok_shell::extensions::codex::CodexUsageResponse;
+    fn failed(msg: String) -> CodexUsageResponse {
+        CodexUsageResponse {
+            logged_in: true,
+            email: None,
+            plan_type: None,
+            rate_limit: None,
+            credits: None,
+            error: Some(msg),
+        }
+    }
+    let request = acp::ExtRequest::new(
+        "x.ai/usage/codex",
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize usage/codex params")
+            .into(),
+    );
+    match acp_send(request, tx).await {
+        Ok(resp) => serde_json::from_str(resp.0.get()).unwrap_or_else(|e| {
+            tracing::debug!("codex usage deser failed: {e}");
+            failed("invalid Codex usage response".to_string())
+        }),
+        Err(e) if i32::from(e.code) == i32::from(acp::Error::method_not_found().code) => {
+            failed("not supported by this agent version".to_string())
+        }
+        Err(e) => failed(sanitize_user_error(&e.to_string())),
+    }
+}
+/// Shared `x.ai/codex/login` / `x.ai/codex/logout` RPC. `Err` is transport
+/// only; OAuth failures ride inside the (Ok) response envelope.
+async fn codex_auth_rpc(
+    method: &'static str,
+    tx: &AcpAgentTx,
+) -> Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String> {
+    let request = acp::ExtRequest::new(
+        method,
+        serde_json::value::to_raw_value(&serde_json::json!({}))
+            .expect("serialize codex auth params")
+            .into(),
+    );
+    match acp_send(request, tx).await {
+        Ok(resp) => serde_json::from_str(resp.0.get()).map(Box::new).map_err(|e| {
+            tracing::debug!("codex auth deser failed: {e}");
+            "invalid response from the agent".to_string()
+        }),
+        Err(e) if i32::from(e.code) == i32::from(acp::Error::method_not_found().code) => {
+            Err("not supported by this agent version".to_string())
+        }
+        Err(e) => Err(sanitize_user_error(&e.to_string())),
+    }
 }
 /// Shared `x.ai/session/rename` RPC for rename and `/rename --auto`.
 async fn session_rename_rpc(

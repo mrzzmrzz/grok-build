@@ -665,6 +665,11 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// `/login codex` — connect the OpenAI Codex (ChatGPT OAuth) account via
+    /// the shell's browser flow. Independent of xAI auth.
+    CodexLogin,
+    /// `/logout codex` — remove only the Codex credential (xAI auth is kept).
+    CodexLogout,
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -2180,6 +2185,17 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
+    /// Fetch OpenAI Codex account usage via `x.ai/usage/codex`. Fired
+    /// alongside the xAI usage fetches; each side fails independently.
+    FetchCodexUsage {
+        agent_id: AgentId,
+        /// Usage-modal fetch generation; echoed back on the task result.
+        nonce: u64,
+    },
+    /// Run the shell's Codex browser login (`x.ai/codex/login`).
+    CodexLogin { agent_id: AgentId },
+    /// Remove the Codex credential (`x.ai/codex/logout`).
+    CodexLogout { agent_id: AgentId },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions. `agent_id` rides
@@ -2828,6 +2844,25 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         error: String,
         nonce: u64,
+    },
+    /// `/usage` Codex account usage fetched (any outcome — "not connected"
+    /// and fetch errors ride in the response so one provider's failure never
+    /// hides the other's data).
+    CodexUsageLoaded {
+        agent_id: AgentId,
+        usage: Box<xai_grok_shell::extensions::codex::CodexUsageResponse>,
+        nonce: u64,
+    },
+    /// `/login codex` finished. `Err` is a transport-level failure; an OAuth
+    /// failure arrives as `Ok(resp)` with `resp.ok == false`.
+    CodexLoginFinished {
+        agent_id: AgentId,
+        result: Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
+    },
+    /// `/logout codex` finished.
+    CodexLogoutFinished {
+        agent_id: AgentId,
+        result: Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
     },
     /// Feedback submitted successfully (fire-and-forget).
     FeedbackComplete {
