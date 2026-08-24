@@ -204,7 +204,7 @@ SPEC §19 的链路定义与硬约束清单其余部分**原样采纳**。
 阶段 0-8 的主体与前两轮外部评审整改（docs/codex-review-update.md）已落地；第三轮评审的整改与阶段 9 收尾进行中。"落地"不含下列显式延后项——在它们关闭前，本移植不应描述为完整达到 SPEC §19 验收：
 
 - **remote compaction v2 主体延后**：wire 分析、beta header/comp_hash/body 塑形管道、operation-scoped turn-state 已落地并测试，但端到端请求路径与 catalog 能力插线未完成（评审发现 14 的处置＝显式延后，不宣称已实现；设计文档与剩余清单见会话 scratchpad 的 remote-compaction-v2-design）。
-- **Code Mode 的两处已记录限制**：客户端 reverse-request PreToolUse hooks 未在 nested 路径消费（其 deny 会推配对 tool_result，需先参数化副作用）；deferred nested tools 机制已接线但当前全量投影。
+- **Code Mode 的两处已记录限制**：客户端 reverse-request PreToolUse 的 **deny** 已在 nested 路径消费（决策/效果拆分后共享同一门）；仍不可表达的是客户端侧 **rewrite**——`ClientHookResponse` 无 `updatedInput` 字段，扩展协议后两个调用点即可直接消费。deferred nested tools 机制已接线但当前全量投影。
 - **V8 feature 边界未实施**（评审 lower 项）：方案已成文（shell 的 code-mode 依赖 optional + feature 门控），涉及 default/CI feature 集变更，留待构建策略决策。
 - **跨进程 login/logout**：进程内代次 + 磁盘 logout epoch 已闭环；同机双进程并发交错由文件锁 + epoch 双检兜底。
 - Code Mode 能力默认全域关闭：无任何内置模型声明 tool_mode，仅 live catalog 显式声明才激活（fail closed）。

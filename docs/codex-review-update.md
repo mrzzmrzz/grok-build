@@ -2,547 +2,417 @@
 
 ## Review conclusion
 
-Review range:
+Review snapshot:
 
-- Committed history: 4b12cf6f..1c28bf9d (21 commits).
-- Current uncommitted Stage 7/8 working tree inspected at
-  2026-08-24 17:48 +0800: 76 tracked files changed and 4 untracked files.
+- Branch: `codex/sync-open-grok-codex`.
+- HEAD: `48386052a80cbd33ecbcb8624be06f9f74194243`.
+- Committed range: `4b12cf6f..48386052` (28 commits).
+- Uncommitted implementation inspected at 2026-08-24 20:28 +0800:
+  25 tracked `xai-grok-shell` files and no untracked files.
+- The implementation worktree was changing concurrently. Findings below are
+  tied to the snapshot and paths stated here, not to later edits.
 
-The fixes in 0169a51d and 1c28bf9d correctly address most findings from the
-previous review: main-session live catalog identity, proactive refresh,
-the simple one-login/one-logout race, sampler-internal turn-state propagation,
-durable stream recovery, account-scoped catalog publication, logout model
-selection, terminal theme resync, announcement visibility, unknown-event
-logging, and the documented custom-call ID namespace.
+The latest commits are a substantial improvement. Live-only Codex identity,
+live `tool_mode`, retained ordered output, logical nested failures, Pager
+decoding, per-call output limits, same-path nested locking, model-switch
+provenance ordering, child-to-parent provenance, bounded persistent-401 replay,
+identity-less login visibility, the PR workflow, macOS 15, and the crossterm
+vendor record are now implemented in reasonable locations with focused tests.
+Those fixed findings have been removed rather than retained as historical
+noise.
 
-The current Stage 7/8 work is not ready to merge. Code Mode is not activated by
-the live Codex catalog, its nested-call path bypasses existing policy hooks and
-misreports logical failures to JavaScript, and the new Codex provenance gate
-does not cover every xAI egress path.
+The current implementation is still not ready to merge as complete. The new
+auxiliary-provider gate is snapshot-based and can leak Codex-derived web-search
+queries to xAI after a model switch or child override. Code Mode still bypasses
+ACP client policy, does not invalidate every rewind/stale-work path, and does
+not preserve the structured result contract it advertises. Prompt-trace and
+logout fencing also retain smaller but real race/fail-open boundaries.
 
 Recommended disposition: **changes requested**.
 
 ## Blocking findings
 
-### 1. Live catalog-only Codex identity is still lost by subagents
+### 1. Web search remains bound to the old or parent provider
 
 Severity: **High**
 
 Evidence:
 
-- The main session now resolves provider identity through ModelsManager, but
-  crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs:721-729 still uses
-  static-config-only credential/provider resolution for the inherited model.
-- A live-only slug therefore reaches is_codex == false; lines 766-792 do not
-  install the Codex provider profile and bearer resolver.
-- The fallback path at lines 826-831 can overwrite a correctly inherited
-  resolver using the same incomplete model lookup.
-- There is no regression test that spawns a subagent from a parent using a
-  Codex model present only in the live account catalog.
+- `agent/mvp_agent/agent_ops.rs:4665-4666` resolves the web-search sampler once
+  from the provider active when the session is created.
+- `session/acp_session_impl/spawn.rs:474-504` converts that snapshot into the
+  session's persistent `WebSearchConfig`.
+- `session/acp_session_impl/model_switch.rs:5-128` updates sampling identity,
+  Codex provenance, and Code Mode, but never replaces or disables the existing
+  web-search config.
+- `agent/mvp_agent/subagent_spawn.rs:220-257` similarly precomputes child web
+  search from the parent/global provider.
+- The child's actual provider is resolved later at
+  `agent/subagent/handle_request.rs:408-414`, after which line 1134 passes the
+  parent-gated config through unchanged.
+- `session/acp_session_impl/spawn.rs:481-489` enables the helper whenever the
+  supplied config has a key; it does not re-check the effective child provider.
+- The new test at `agent/mvp_agent/agent_ops.rs:5464-5492` tests only the pure
+  resolver truth table. It does not exercise model switch, child override, or
+  final ToolBridge wiring.
 
 Impact:
 
-A live-discovered Codex model can work in the parent while its child is
-reconstructed as xAI or loses the Codex bearer resolver.
+Two direct failure scenarios remain:
+
+1. Start an unpinned xAI session, switch it to Codex, then call `web_search`.
+   The session retains the xAI endpoint/key captured at spawn, so a
+   Codex-derived query is sent to xAI.
+2. Spawn a Codex child from an xAI parent through a role/persona/model override.
+   The child receives the parent's enabled xAI helper. The reverse direction,
+   Codex parent to explicit xAI child, is incorrectly disabled.
 
 Recommendation:
 
-- Resolve child provider/auth facts from ctx.models_manager, using the same
-  account-scoped catalog entry as the parent turn.
-- Preserve an already-correct provider profile and bearer resolver in the
-  fallback path.
-- Add an end-to-end live-only Codex parent-to-child test.
+- Make web-search availability follow the effective provider on every model
+  change, or enforce the provider gate again at dispatch time.
+- Resolve child web search only after `effective_sampling_config` is known.
+- Add end-to-end xAI-to-Codex switch and cross-provider child-override tests.
 
-### 2. Live Codex tool_mode is discarded, so Code Mode never activates
+### 2. Auxiliary-model provenance still treats server configuration as consent
 
 Severity: **High**
 
 Evidence:
 
-- crates/codegen/xai-grok-shell/src/codex_models.rs:91 and 656-659 retain the
-  server's tool_mode string.
-- The only live-catalog-to-model-manager mapping,
-  crates/codegen/xai-grok-shell/src/agent/models/codex.rs:36-56, never copies
-  it into ModelInfo.tool_mode; its comment still says no Code Mode is declared.
-- crates/codegen/xai-grok-shell/src/agent/config.rs:3866-3872 treats a missing
-  tool_mode as Classic.
-- session/acp_session_impl/session_mode.rs:447-451 reads only that mapped
-  ModelInfo field.
-- Bundled models intentionally declare no Code Mode. Current tests activate it
-  only by manually constructing model entries or plans.
+- The specification requires a *user-explicit* cross-provider choice at
+  `docs/codex-subscription-port-spec.md:850-857`.
+- `config/mod.rs:512-544` documents the same rule, but `AuxModelPin::Pinned`
+  combines CLI, local TOML, and remote settings.
+- `config/mod.rs:642-656` turns remote `web_search_model`,
+  `session_summary_model`, and `image_description_model` values into an
+  explicit pin; `AuxModelPin::is_explicit()` therefore treats server-delivered
+  settings as user consent.
+- The new test at `config/tests.rs:4014-4083` explicitly asserts that remote
+  settings are an explicit source.
+- The spec also calls out the auto-mode classifier. `agent/config.rs:4741-4763`
+  allows its model to come from remote settings, while
+  `session/acp_session_impl/sampler_turn.rs:751-851,941-968` resolves and calls
+  that auxiliary model without checking the current session provider or any
+  user-consent provenance.
 
 Impact:
 
-Even when /models returns tool_mode: code_mode_only, the model runs with the
-Classic manifest. The new V8 runtime, native custom exec transport, nested
-tools, and Pager rendering are unreachable through the real live-catalog path.
+A remote setting controlled by the service can authorize an xAI helper for a
+Codex session without a user choosing that cross-provider route. Auto-mode can
+also send the user's command/context to a remotely configured xAI classifier.
+This contradicts the port's explicit privacy contract even when the stale
+snapshot bug in finding 1 is fixed.
 
 Recommendation:
 
-- Parse known live values into ToolMode at the single catalog mapping site;
-  warn and fail closed for unknown values.
-- Test the complete wire-catalog -> ModelsManager -> effective turn plan ->
-  native custom exec path.
+- Distinguish local user pins (CLI/env/TOML) from remote defaults.
+- Treat remote settings as unpinned for cross-provider consent unless a
+  separately authenticated user/organization policy is intentionally defined
+  and documented.
+- Apply the same provider-provenance rule to classifier, title, recap, memory,
+  summary, and every other auxiliary request enumerated by the spec.
 
-### 3. Code Mode nested calls bypass PreToolUse/PostToolUse policy hooks
+### 3. Code Mode nested calls bypass ACP client `PreToolUse` policy
 
 Severity: **High**
 
 Evidence:
 
-- The normal tool path executes server/client PreToolUse hooks, honors deny,
-  reparses rewritten input, and then executes post-use/failure hooks at
-  crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs:
-  1116-1187 and the surrounding execution path.
-- The nested path at session/acp_session_impl/session_mode.rs:595-701 performs
-  parse, plan-mode, and permission checks and calls dispatch_tool directly.
-- The nested projection excludes only exec and wait, so apply_patch,
-  exit_plan_mode, and other special tools remain callable from JavaScript.
+- `session/acp_session_impl/session_mode.rs:610-626` explicitly states that the
+  nested path does not consult reverse-request client hooks.
+- The path runs registry hooks, permission checks, and then dispatches at
+  `session_mode.rs:646-874`.
+- The normal top-level path calls the ACP client gate at
+  `session/acp_session_impl/tool_calls.rs:1181-1186` and honors its deny result.
+- `docs/fable_review.md:204-210` records this as a deferred limitation even
+  though the older review classified it as a blocking policy bypass.
 
 Impact:
 
-A repository policy that denies or rewrites a write through PreToolUse can be
-bypassed by invoking the same tool inside exec. Post-use/failure automation
-does not run, and special tools can miss their required lifecycle handling.
+An ACP client can deny or rewrite a top-level `apply_patch`, shell, edit, or MCP
+call, while the same operation invoked through `exec` and `tools.*` proceeds
+without that client policy. Server hooks and the permission layer do not imply
+that the client's separate policy is redundant.
 
 Recommendation:
 
-- Route nested calls through one shared preparation/execution funnel with the
-  normal path, including hooks, rewritten-input parsing, special lifecycle
-  handling, telemetry, and completion hooks.
-- Test a hook-denied write, rewritten input, failure hook, and exit_plan_mode
-  from inside exec.
+- Parameterize the client-hook path so nested calls can consume the decision
+  without emitting an invalid paired top-level `tool_result`.
+- Test client deny and rewrite behavior through real `exec` calls.
 
-### 4. Logical nested-tool failures resolve the JavaScript promise
+### 4. Code Mode invalidation is incomplete and has a generation TOCTOU
 
 Severity: **High**
 
 Evidence:
 
-- session/acp_session_impl/session_mode.rs:703-709 computes
-  run_result.output.is_error() and marks the ACP row failed, but unconditionally
-  returns Ok(String(prompt_text)) to the runtime.
-- Only a dispatch-level Err reaches the rejection branch at lines 710-714.
-- xai-grok-tools/src/types/output.rs:668-700 classifies ordinary results such
-  as missing files, failed edits, non-zero shell exits, and MCP errors as
-  logical failures.
+- `session_mode.rs:563-589` checks runtime generation once when a bridge message
+  is dequeued and then spawns a separate local task.
+- That task may wait in a server hook, permission prompt, or path lock before
+  reaching `dispatch_tool` at `session_mode.rs:781-804`; it does not re-check
+  generation immediately before dispatch.
+- `tools/code_mode.rs:230-250` bumps generation synchronously but tears the
+  runtime down asynchronously.
+- The explicit `SessionCommand::Rewind` path at
+  `session/acp_session_impl/run_loop.rs:1088-1093` calls
+  `rewind.rs:163-541`, which contains no Code Mode shutdown/generation reset.
+- The named cancel-history branch resets Code Mode at
+  `tasks_cancel.rs:419-429`, but the legacy rewind branch at lines 622-640 only
+  aborts the turn/terminates live cells and retains the runtime/store.
+- Existing generation tests verify only that the counter increases, not the
+  dequeue-to-dispatch race or explicit/legacy rewind behavior.
 
 Impact:
 
-For example, await tools.read_file(...) on a missing file resolves with an
-error string rather than throwing. JavaScript can continue with later writes
-and store-state commits while the UI simultaneously reports failure.
+A write accepted from the old generation can still dispatch after a model
+switch, cancellation, or rewind if invalidation happens while it is waiting.
+Separately, a yielded cell and `store()` state created in discarded history can
+remain visible and callable after explicit or legacy rewind.
 
 Recommendation:
 
-- Return Err(prompt_text) for a logical failure, or define and consistently
-  implement a structured success/error contract.
-- Test the actual bridge with a logical error result, not only a transport Err.
+- Carry the generation into `run_code_mode_nested_call` and check it again at
+  the final dispatch boundary.
+- Make every history rewind synchronously invalidate Code Mode and drop its
+  store before the rewind is committed.
+- Add barrier tests for dequeue -> wait -> invalidate -> dispatch and for
+  yielded/store state across both rewind entry points.
 
-### 5. Nested results are flattened to strings despite a structured contract
+### 5. Prompt-trace gating retains a model-switch TOCTOU
 
 Severity: **High**
 
 Evidence:
 
-- The Code Mode description says nested tools can return objects or strings and
-  demonstrates accessing result.content[0].
-- session/acp_session_impl/session_mode.rs:703-709 returns only
-  Value::String(run_result.prompt_text), even though ToolRunResult.output is a
-  serializable typed value.
+- `agent/mvp_agent/agent_ops.rs:3800-3816` checks Codex provenance when it
+  creates `PromptTraceContext`.
+- The context at lines 3907-3916 carries no provenance generation or live gate.
+- ACP prompt handling obtains it at
+  `agent/mvp_agent/acp_agent.rs:1084-1114` while holding the prompt dispatch
+  lock.
+- `set_session_model` at `acp_agent.rs:2163-2199` does not take that lock, so it
+  can switch to Codex after the context has been created.
+- Model switch marks chat state and persistence at
+  `session/acp_session_impl/model_switch.rs:40-50`, but does not revoke an
+  already-created trace context or upload queue.
+- `session/acp_session_impl/turn.rs:2310-2329` re-checks before attaching the
+  conversation trace, which is useful defense in depth, but tool-definition
+  upload already begins from the old context at lines 2103-2116. A switch after
+  the second check can also leave the request holding the old trace object.
 
 Impact:
 
-MCP, image, audio, and structured tool results lose their shape. A program that
-follows the advertised result.content[0] contract receives a string and fails
-with undefined/TypeError; image()/audio() forwarding cannot work as described.
+The following interleaving remains possible: an xAI session creates a trace
+context, a concurrent model switch marks it Codex, and the turn continues to
+upload through the previously admitted xAI-only trace pipeline. Sequential
+initial/switch/resume cases are fixed; the final egress boundary is not atomic
+with provenance.
 
 Recommendation:
 
-- Preserve the tool's raw/structured result shape and use a string only for
-  genuinely textual outputs.
-- Add bridge tests for MCP structured content and image/audio forwarding.
-
-### 6. Stale Code Mode cells are not fenced across model switch or rewind
-
-Severity: **High**
-
-Evidence:
-
-- Bridge messages have no runtime generation in
-  crates/codegen/xai-grok-shell/src/tools/code_mode.rs:29-41 or the consumer at
-  session_mode.rs:550-589.
-- shutdown_detached removes the runtime and schedules shutdown asynchronously
-  at tools/code_mode.rs:190-206; queued nested calls can race that shutdown.
-- Cancel uses detached termination. Rewind does not reset Code Mode at all, so
-  yielded cells and session store state can survive a history rewind.
-- There is no integration test for queued nested writes during cancel/model
-  switch or a yielded cell across rewind.
-
-Impact:
-
-A write from the previous model/turn can execute after switch, cancel, or
-rewind, and state created by a discarded future can remain visible later.
-
-Recommendation:
-
-- Fence bridge messages with the active runtime generation and reject stale
-  work synchronously before dispatch.
-- Define and test a synchronous invalidation boundary for switch, cancel,
-  close, and rewind.
-
-### 7. Retained-history pruning still leaves ordered tool output alive
-
-Severity: **High**
-
-Evidence:
-
-- The new tool_result_edit helpers synchronize request-copy pruning, image
-  eviction, image sanitation, CWD rewriting, and compaction truncation.
-- crates/codegen/xai-chat-state/src/actor/mutations.rs:374-385 still hard-clears
-  only ToolResultItem.content during retained-history pruning.
-- Responses serialization treats non-empty ToolResultItem.parts as
-  authoritative at xai-grok-sampling-types/src/conversation/responses.rs:
-  289-320.
-
-Impact:
-
-An aged Code Mode result can show the placeholder in content while retaining
-the complete old text/images in parts. That content remains persisted and is
-replayed on the next Responses request.
-
-Recommendation:
-
-- Route retained-history hard clear through set_tool_result_text.
-- Add an actor-level retained-prune test using tool_result_with_parts, then
-  assert both persisted state and wire JSON omit the old content.
-
-### 8. ever_used_codex is established after content can reach xAI sync
-
-Severity: **High**
-
-Evidence:
-
-- Initial Codex sessions are marked during spawn, but an xAI-to-Codex switch at
-  session/acp_session_impl/model_switch.rs:49-86 updates sampling state without
-  marking provenance.
-- The user message is emitted/persisted before sampling at
-  session/acp_session_impl/turn.rs:615-630 and 737-742.
-- Persistence continues queueing notifications to remote/relay while false at
-  session/persistence.rs:1443-1454.
-- The only runtime mark after spawn is session_setup.rs:524-538, conditional
-  on receiving a non-empty Codex turn-state response header.
-
-Impact:
-
-After switching an xAI-synced session to Codex, the Codex prompt can be queued
-to xAI remote/relay before the response. If the request fails or no turn-state
-header arrives, the session may never be marked.
-
-Recommendation:
-
-- Mark chat state and persistence synchronously when the effective turn
-  provider becomes Codex, before prompt persistence or sampling.
-- Use provider identity, not an optional response header, as the provenance
-  signal.
-- Test request failure and missing-header cases as well as success.
-
-### 9. Codex provenance does not gate prompt-trace uploads
-
-Severity: **High**
-
-Evidence:
-
-- Summary.ever_used_codex claims prompt traces are disabled, but the flag is
-  read only by chat-state snapshotting and persistence remote/relay setup.
-- crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs:3773-3814
-  decides whether to create a trace context without reading session provenance
-  or effective provider.
-- session/acp_session_impl/turn.rs:2304-2317 still attaches a
-  ConversationRequestTrace whenever trace upload is enabled.
-
-Impact:
-
-Even a session that starts on Codex and is correctly marked can upload
-Codex-derived prompts, history, images, and turn artifacts through the xAI
-trace pipeline. The implementation contradicts its own privacy contract.
-
-Recommendation:
-
-- Gate trace-context creation and turn upload on monotonic provenance before
-  capture begins.
-- Test initial Codex, xAI-to-Codex, resume, fork, and switch-back cases.
+- Re-check the monotonic mark at the final attach/upload boundary, or bind
+  trace contexts to a provider/provenance generation invalidated by switch.
+- Add a barrier-controlled context-created -> Codex-switch -> upload test.
 
 ## Other required findings
 
-### 10. Codex subagent output does not taint the parent session
+### 6. Nested structured results still do not match the advertised contract
 
 Severity: **Medium-High**
 
 Evidence:
 
-- A parent can select a different subagent model at
-  agent/subagent/handle_request.rs:394-403 and spawn it at 971-999.
-- The child completion envelope carries no provider/ever_used_codex provenance;
-  child_run_output at agent/subagent/mod.rs:1872-1881 forwards only result,
-  completion data, and a snapshot reference.
-- The parent marks itself only from its own initial provider or response
-  metadata.
+- `session_mode.rs:895-942` preserves only hand-built MCP text and ReadFile
+  image/PDF cases; every other `ToolOutput`, including `Dynamic`, falls back to
+  `prompt_text` as a string.
+- Dynamic tools preserve arbitrary JSON in `DynamicOutput.value` at
+  `xai-grok-tools/src/types/output.rs:46-56,653-654`, but that value is discarded
+  at the nested bridge.
+- Real `MCPOutput` stores only `OkayOutput(String)`/`Error(String)` plus
+  `extracted_images` at `xai-grok-tools/src/types/output.rs:1185-1207`; the
+  nested conversion at `session_mode.rs:908-916` emits one text block and drops
+  those images.
+- The MCP/tool description advertises `CallToolResult`, `structuredContent`,
+  image/audio/resource blocks, and `image(result.content[0])` at
+  `xai-grok-code-mode-protocol/src/description.rs:12-35,45-121`.
+- `session_mode.rs:526-544` also publishes every nested `output_schema` as
+  `None`.
+- Tests at `session_mode.rs:1031-1075` cover only artificial MCP text,
+  ReadFile image, and plain text, not real MCP media/resource or
+  `DynamicOutput.value`.
 
 Impact:
 
-An xAI parent can merge a Codex child's output and remain unmarked, making that
-derived content eligible for xAI remote/relay and prompt-trace egress.
+JavaScript cannot inspect fields of a dynamic structured result, and MCP image,
+audio, resource, or `structuredContent` output cannot be forwarded using the
+documented helpers. The original all-string behavior is improved but the public
+contract is still false for important result classes.
 
 Recommendation:
 
-- Propagate monotonic provider provenance through child completion and mark the
-  parent before merge/persistence.
-- Test successful, failed, and cancelled child paths.
+- Preserve the runtime/MCP `CallToolResult` value before prompt formatting.
+- Return `DynamicOutput.value` directly and propagate actual MCP content blocks,
+  `structuredContent`, `isError`, and metadata.
+- Derive/preserve output schemas and add real bridge integration tests.
 
-### 11. Pager parses the wrong serialized shape for Code Mode output
+### 7. The one-401 allowance is scoped to a whole prompt, not one HTTP request
 
 Severity: **Medium**
 
 Evidence:
 
-- ToolOutput is internally tagged with serde(tag = \"type\") at
-  xai-grok-tools/src/types/output.rs:623-624.
-- The shell sends serde_json::to_value(&result.output) at
-  session/acp_session_impl/tool_calls.rs:2462-2474, producing an object with
-  type: CodeMode and sibling fields.
-- Pager expects an externally tagged CodeMode child object at
-  xai-grok-pager/src/acp/tracker.rs:2155-2164.
-- Tests exercise the block directly, not tracker mapping from the shell value.
+- `turn.rs:2125-2127` clears `codex_401_recovery_spent` only once when the prompt
+  turn starts.
+- A successful sampler response resets `AuthRetrySchedule` at `turn.rs:2537`
+  but does not reset the Codex allowance.
+- The next independent continuation request consumes the same flag at
+  `sampler_turn.rs:467-486`.
+- Current tests directly exercise the claim helper or manually clear the flag;
+  they do not run two HTTP requests separated by a successful tool-call
+  response in one prompt.
 
 Impact:
 
-Parsing always falls back. The block loses cell_id, yielded/completed/
-terminated state, and detailed errors.
+If the first request gets 401, refreshes once, and returns a tool call, a later
+continuation request in the same prompt cannot perform its own single bounded
+refresh. A token expiring or rotating while a long tool runs turns a recoverable
+second request into a terminal failure. Persistent 401 replay is bounded now,
+but at too broad a scope.
 
 Recommendation:
 
-- Deserialize the internally tagged raw_output shape.
-- Add a shell-serialized-value-to-Pager-block regression test.
+- Reset the Codex allowance whenever a sampler HTTP request completes
+  successfully, alongside `AuthRetrySchedule::reset_on_success()`.
+- Test `401 -> refresh -> successful tool call -> second 401 -> one refresh`
+  and a persistent-401 request that still terminates after one replay.
 
-### 12. Advertised Code Mode output limits are ignored
+### 8. Cross-process logout fencing fails open when the epoch cannot persist
 
 Severity: **Medium**
 
 Evidence:
 
-- exec advertises/parses max_output_tokens, but the service conversion to
-  CreateCellRequest drops it and the runtime request has no matching field.
-- wait exposes max_tokens, but WaitTool::run ignores it and WaitRequest carries
-  no limit.
+- `codex_auth.rs:439-445` maps every unreadable/malformed logout epoch to zero.
+- `codex_auth.rs:448-464` treats an epoch write as best-effort and returns no
+  error.
+- `logout_at` removes credentials, bumps the in-process generation, calls that
+  best-effort write, and reports success at `codex_auth.rs:1295-1309`.
+- A stale login checks only generation plus the re-read epoch at lines 882-900.
 
 Impact:
 
-Calls requesting small caps can return unbounded output relative to their
-documented contract and consume much more context than requested.
+A deterministic reproduction is to create `auth.json.logout-epoch` as a
+directory. An old process records epoch zero; another process removes the auth
+file but cannot write the tombstone and still reports logout success; the old
+process re-reads zero and is allowed to recreate credentials. Normal
+enqueue-time and healthy-filesystem races are fixed, but the durable latest
+intent guarantee is fail-open.
 
 Recommendation:
 
-- Plumb both limits to the output collection/truncation point, or remove the
-  unsupported fields until implemented.
-- Test initial exec output and subsequent wait chunks at the boundary.
+- Make an unreadable/malformed epoch and failed epoch write fail closed for
+  stale login persistence.
+- At minimum, report logout failure when the cross-process fence could not be
+  established.
+- Add the deterministic directory/malformed-tombstone test.
 
-### 13. Concurrent nested writes bypass the normal same-path lock
+### 9. Remote compaction and `comp_hash` remain non-functional scaffolding
 
 Severity: **Medium**
 
 Evidence:
 
-- The normal batch path serializes non-read-only operations targeting the same
-  path at session/acp_session_impl/tool_calls.rs:593-653.
-- The Code Mode consumer spawns each nested call separately and dispatches it
-  directly at session_mode.rs:560-572 and 695-701.
-- Promise.all can therefore start multiple writes to the same file without the
-  existing per-path lock.
+- `session/compaction.rs:2067-2077` explicitly hardcodes
+  `current_codex_comp_hash()` to `None`.
+- Consequently the same-slug hash-change path at lines 1997-2023 cannot fire.
+- `shape_codex_remote_compaction_v2_body` and
+  `codex_remote_compaction_v2_headers` in `xai-grok-sampler/src/client.rs` are
+  still referenced only by their unit tests; no live compaction request calls
+  them.
+- The catalog correctly declares no compaction capability, and
+  `docs/fable_review.md:204-210` now calls this deferred.
 
 Impact:
 
-Two edits based on the same file version can race, lose one update, or fail
-nondeterministically.
+There is no false runtime advertisement, so this is not a user-facing blocker.
+It is still dead speculative surface under the repository's YAGNI rule and
+must not be described as an implemented phase-8 capability.
 
 Recommendation:
 
-- Reuse the normal path-lock mechanism for nested calls.
-- Add a Promise.all same-file edit regression test.
+- Either complete the catalog metadata and end-to-end request path, or remove
+  the unused helpers/state until that work is scheduled.
 
-### 14. Remote compaction and comp_hash handling are non-functional scaffolding
+## Validation and maintenance gaps
 
-Severity: **Medium**
-
-Evidence:
-
-- The new body-shaping and beta-header helpers in xai-grok-sampler/src/client.rs
-  are called only by unit tests; no compaction request invokes them.
-- session/compaction.rs:2067-2077 hardcodes current_codex_comp_hash() to None.
-- The same-slug hash-change branch can therefore never fire and no live model
-  capability enables remote compaction.
-
-Impact:
-
-The patch adds public surface and state fields but no runtime behavior. Unit
-tests prove isolated shaping helpers, not a real request or hash transition.
-
-Recommendation:
-
-- Complete the catalog capability/hash plumbing and an end-to-end request, or
-  remove/defer the unused scaffold under YAGNI.
-- Do not advertise remote compaction as implemented yet.
-
-### 15. Login/logout latest-intent still fails for queued and cross-process operations
-
-Severity: **Medium**
-
-Evidence:
-
-- extensions/codex.rs serializes operations through a FIFO mutex, but only a
-  logout cancels the login that is already registered as pending. A login
-  waiting behind the mutex has not registered its cancellation token yet.
-- With login A active, login B queued, and logout C queued, C cancels A; B then
-  acquires the mutex and starts a fresh callback wait before C can run. Pager
-  generation fencing hides stale UI results but does not change credential
-  state or queue latency.
-- The new auth mutex and LOGOUT_GENERATION fence in codex_auth.rs are
-  process-local statics.
-- The file lock serializes mutations but carries no persisted generation
-  between a TUI process and a separate CLI process.
-
-Impact:
-
-The user's final logout can be delayed behind a login that was requested
-earlier but had not started, potentially for the full callback timeout. Across
-processes, logout can complete and an older login can later acquire the file
-lock and recreate credentials.
-
-Recommendation:
-
-- Allocate operation generations/cancellation at enqueue time so a logout
-  invalidates active and queued older logins; add a real login-login-logout
-  concurrency test.
-- Persist a logout epoch/tombstone under the same cross-process lock and check
-  it immediately before login persistence, or explicitly prevent concurrent
-  cross-process flows.
-- Add a two-process auth-file regression test.
-
-### 16. Codex 401 recovery is not bounded to one replay
-
-Severity: **Medium**
-
-Evidence:
-
-- The Codex branch force-refreshes on each eligible failure in
-  session/acp_session_impl/sampler_turn.rs.
-- It then uses the shared AuthRetrySchedule, which allows several credentialed
-  retries rather than one replay for the logical request.
-- Tests cover low-level refresh and no-anchor failure, but not a successful
-  401 -> refreshed bearer -> one replay sequence or persistent-401 bound.
-
-Impact:
-
-A persistent 401 can trigger repeated OAuth refresh traffic and request
-replays, contrary to the comments and prior remediation requirement.
-
-Recommendation:
-
-- Track whether Codex recovery has already run for the logical request.
-- Add captured-wire tests for success and persistent-401 exhaustion.
-
-### 17. Identity-less valid Codex credentials are treated as logged out
-
-Severity: **Medium**
-
-Evidence:
-
-- account_fingerprint returns None when credentials have no account ID, user
-  ID, or email.
-- ModelsManager uses that optional fingerprint both for account scoping and as
-  its logged-in predicate.
-
-Impact:
-
-A usable bearer/refresh-token file without those optional claims hides bundled
-Codex models and suppresses live-catalog refresh.
-
-Recommendation:
-
-- Separate is_logged_in from optional account_fingerprint.
-- Keep authenticated visibility while conservatively disabling reusable
-  account-scoped cache publication when identity is unavailable.
-
-## Lower-priority maintenance issues
-
-- stored_entry_bytes claims to overcount serialized object size by one byte,
-  but it actually undercounts a non-empty JSON object by one: the real object
-  has two braces and one fewer comma. The global atomic merge fix is sound, but
-  an accounted 8 MiB map can serialize to 8 MiB + 1 byte.
-- xai-grok-shell and xai-grok-tools now pull the V8/ICU Code Mode dependency
-  graph into ordinary checks/tests unconditionally, even for Classic-only
-  builds. A code-mode feature boundary would avoid paying this compile cost
-  when the capability is disabled.
-- The workspace-wide vendored crossterm patch still needs a documented
-  upstream/upgrade path.
-- .github/workflows/build.yml still has no pull-request trigger or test job and
-  still uses macos-14.
+- `.github/workflows/build.yml:14-17,42-53` deliberately excludes the entire
+  `xai-grok-shell` test suite. `cargo check --workspace` does not compile
+  `#[cfg(test)]` code, so most new session/subagent/privacy tests neither compile
+  nor run in CI. Add at least deterministic shell library tests or a no-run test
+  compilation job before treating CI green as validation of this port.
+- `budgeted_parts` appends its truncation marker after consuming the requested
+  token budget at `xai-grok-tools/src/implementations/code_mode/mod.rs:301-313`.
+  A zero/small `max_tokens` request therefore returns a marker larger than its
+  advertised cap. The limits are no longer ignored, but are not hard caps.
+- Code Mode/V8/ICU dependencies remain unconditional in
+  `xai-grok-shell/Cargo.toml:158-159` and `xai-grok-tools/Cargo.toml:111`, so
+  Classic-only checks/builds still pay their compilation cost.
+- `docs/fable_review.md:204-210` says phases 0-8 and both review remediations are
+  complete while the same paragraph records the client-hook finding and remote
+  compaction as deferred. That end-state claim should be narrowed.
 
 ## Reviewed areas that now appear sound
 
-The following previous findings were rechecked and removed from the active
-list:
+The following old findings were rechecked and removed from the active list:
 
-- main-session live-catalog provider reconstruction;
-- proactive refresh startup and provider-isolated Codex 401 routing;
-- the single active-login followed by logout cancellation/mutation race (the
-  queued multi-operation and cross-process cases remain in finding 15);
-- sampler-internal x-codex-turn-state propagation;
-- durable recovery after retryable stream errors, idle timeout, and clean EOF;
-- account-fingerprinted catalog publication and stale-fetch fencing;
-- logout restoration of currentModelId to an available model;
-- child-process terminal theme resync and unified announcement visibility;
-- bounded unknown Responses-event logging and warning cleanup;
-- provider-gated hosted-search serialization;
-- session-global atomic stored-state merge enforcement;
-- custom-tool ID namespace documentation and regression coverage;
-- ordered result construction and the mutation paths now using
-  tool_result_edit, except retained-history pruning in finding 7.
+- live-catalog-only provider identity in parent and child sessions;
+- live Codex `tool_mode` mapping and unknown-value fail-closed behavior;
+- logical nested failures rejecting the JavaScript promise;
+- retained-history pruning synchronizing legacy `content` and ordered `parts`;
+- immediate model-switch provenance marking before the next prompt;
+- child Codex provenance tainting parent chat state and persistence before
+  completion presentation/merge;
+- Pager parsing the internally tagged `ToolOutput::CodeMode` shape;
+- per-exec/per-wait output budgeting (the marker edge case is noted above);
+- same-path serialization among concurrent nested writes;
+- identity-less valid credentials counting as logged in while account-scoped
+  catalog publication remains fingerprint-fenced;
+- account/generation fencing of live catalog publication and current-model
+  repair across logout/account change;
+- stored-state global atomic merge and conservative serialized-size accounting;
+- hosted-search provider gating, ordered tool results, custom-call IDs,
+  unknown-event logging, durable stream recovery, and turn-state propagation;
+- PR trigger/test job existence, macOS 15 migration, and the vendored crossterm
+  upgrade record.
 
 ## Validation evidence
 
-This was a read-only multi-agent code review. No production source file was
-modified by the review; only this document was updated.
+This was a read-only, three-subagent review of implementation code. The review
+did not edit, stage, or commit production files; only this document was updated.
 
-The following check completed successfully against the reviewed snapshot:
+Completed checks:
 
     git diff --check
+    git grep -iE 'opengrok|open-grok' -- ':!docs/' ':!.github/workflows/build.yml'
 
-Claude's concurrent xai-grok-shell and xai-grok-pager test processes were still
-running when the snapshot was taken, so this document does not claim those
-suites as completed evidence. Green unit tests would not resolve the catalog
-wiring, hook bypass, provenance ordering, or serialization-shape findings.
+The forbidden-naming command returned no matches. Cargo tests and rustfmt could
+not be run in this local environment because `cargo` is not installed. The
+configured remote toolchain was not used because the actively changing local
+worktree was not proven to be mirrored there. Existing unit tests therefore
+support, but do not replace, the static lifecycle/privacy findings above.
 
 ## Recommended remediation order
 
-Before enabling or merging Code Mode:
-
-1. Map live Codex tool_mode into the effective catalog.
-2. Route nested calls through the normal hook/policy/lifecycle and same-path
-   locking funnel.
-3. Preserve structured results and reject logical failures.
-4. Fence runtime generations and define cancel/switch/rewind semantics.
-5. Finish the retained-history ordered-parts mutation path.
-
-Before treating provider privacy as complete:
-
-6. Mark Codex provenance before prompt persistence or xAI sync.
-7. Gate prompt traces on monotonic provenance.
-8. Propagate Codex subagent provenance to parents.
-
-Before release:
-
-9. Fix live-only Codex provider reconstruction in subagents.
-10. Correct Pager raw-output parsing and implement/remove output caps.
-11. Wire remote compaction end to end or remove the unused scaffold.
-12. Bound Codex 401 recovery and decide the cross-process auth contract.
+1. Re-gate web search from the effective provider on switch and after child
+   model resolution.
+2. Separate real user auxiliary pins from remote defaults; gate classifier and
+   the remaining auxiliary paths.
+3. Make ACP client `PreToolUse` authoritative for nested calls.
+4. Close the Code Mode generation/rewind invalidation boundaries.
+5. Fence prompt traces at the final egress boundary.
+6. Preserve actual dynamic/MCP structured results.
+7. Scope one Codex refresh to each sampler request and fail closed on an
+   unpersistable logout epoch.
+8. Either finish or remove the remote-compaction scaffold, then compile/run the
+   shell test suite in CI.
