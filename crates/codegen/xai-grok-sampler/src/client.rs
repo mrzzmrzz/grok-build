@@ -375,6 +375,69 @@ fn splice_extra_tool_entries(
     }
 }
 
+/// The ChatGPT Codex backend rejects `system`-role input items outright
+/// ("System messages are not allowed"). Reshape a serialized Responses body
+/// for the Codex dialect: the contiguous leading run of system messages
+/// becomes the top-level `instructions` field (joined, unless instructions
+/// are already set), and any later system item — mid-conversation system
+/// reminders — is re-roled as `developer`, which the backend does accept.
+/// xAI bodies are never touched; the caller gates on the provider profile.
+fn patch_codex_instruction_roles(request_body: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(input) = request_body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut leading_instructions = Vec::new();
+    let mut in_leading_prefix = true;
+    let mut projected = Vec::with_capacity(input.len());
+    for mut item in std::mem::take(input) {
+        let is_system = item.get("role").and_then(Value::as_str) == Some("system");
+        if !is_system {
+            in_leading_prefix = false;
+            projected.push(item);
+            continue;
+        }
+        if in_leading_prefix
+            && let Some(text) =
+                responses_message_text(&item).filter(|text| !text.trim().is_empty())
+        {
+            leading_instructions.push(text);
+            continue;
+        }
+        item["role"] = Value::String("developer".to_owned());
+        projected.push(item);
+    }
+    *input = projected;
+
+    if leading_instructions.is_empty() {
+        return;
+    }
+    let leading = leading_instructions.join("\n\n");
+    let instructions = request_body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map_or(leading, str::to_owned);
+    request_body["instructions"] = serde_json::Value::String(instructions);
+}
+
+fn responses_message_text(item: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match item.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -1516,6 +1579,9 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        if self.defaults.provider_profile.provider == ModelProvider::Codex {
+            patch_codex_instruction_roles(&mut request_body);
+        }
         let SentRequest {
             builder,
             sent_bearer,
@@ -1657,6 +1723,9 @@ impl SamplingClient {
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        if self.defaults.provider_profile.provider == ModelProvider::Codex {
+            patch_codex_instruction_roles(&mut request_body);
+        }
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
@@ -2453,6 +2522,63 @@ mod tests {
         let mut body = serde_json::json!({ "tools": [{ "type": "function" }] });
         splice_extra_tool_entries(&mut body, vec![]);
         assert_eq!(body["tools"], serde_json::json!([{ "type": "function" }]));
+    }
+
+    #[test]
+    fn codex_leading_system_messages_become_instructions() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "role": "system", "content": "You are Grok." },
+                { "role": "system", "content": [{ "type": "input_text", "text": "Second block." }] },
+                { "role": "user", "content": "hi" },
+            ],
+        });
+        patch_codex_instruction_roles(&mut body);
+        assert_eq!(
+            body["instructions"],
+            serde_json::json!("You are Grok.\n\nSecond block.")
+        );
+        let roles: Vec<&str> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user"], "no system role may survive for Codex");
+    }
+
+    #[test]
+    fn codex_mid_conversation_system_reminders_become_developer() {
+        let mut body = serde_json::json!({
+            "input": [
+                { "role": "system", "content": "prompt" },
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": "<system_reminder>late</system_reminder>" },
+            ],
+        });
+        patch_codex_instruction_roles(&mut body);
+        let roles: Vec<&str> = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "developer"]);
+        assert_eq!(body["instructions"], serde_json::json!("prompt"));
+    }
+
+    #[test]
+    fn codex_instruction_patch_keeps_existing_instructions() {
+        let mut body = serde_json::json!({
+            "instructions": "already set",
+            "input": [
+                { "role": "system", "content": "prompt" },
+                { "role": "user", "content": "hi" },
+            ],
+        });
+        patch_codex_instruction_roles(&mut body);
+        assert_eq!(body["instructions"], serde_json::json!("already set"));
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
     }
 
     #[test]
