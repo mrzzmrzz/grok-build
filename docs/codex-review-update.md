@@ -2,451 +2,547 @@
 
 ## Review conclusion
 
-Review range: `4b12cf6f..f2d14471` (17 commits).
+Review range:
 
-The overall direction is reasonable, and substantial infrastructure is already
-in place for Codex authentication, provider-specific sampling, model catalog
-discovery, Responses streaming, Code Mode state, terminal theme updates, and
-release artifacts. However, the current implementation is not ready to merge or
-release as complete. Several cross-layer lifecycle and state-consistency gaps
-remain, including four issues on current user-facing paths.
+- Committed history: 4b12cf6f..1c28bf9d (21 commits).
+- Current uncommitted Stage 7/8 working tree inspected at
+  2026-08-24 17:48 +0800: 76 tracked files changed and 4 untracked files.
+
+The fixes in 0169a51d and 1c28bf9d correctly address most findings from the
+previous review: main-session live catalog identity, proactive refresh,
+the simple one-login/one-logout race, sampler-internal turn-state propagation,
+durable stream recovery, account-scoped catalog publication, logout model
+selection, terminal theme resync, announcement visibility, unknown-event
+logging, and the documented custom-call ID namespace.
+
+The current Stage 7/8 work is not ready to merge. Code Mode is not activated by
+the live Codex catalog, its nested-call path bypasses existing policy hooks and
+misreports logical failures to JavaScript, and the new Codex provenance gate
+does not cover every xAI egress path.
 
 Recommended disposition: **changes requested**.
 
 ## Blocking findings
 
-### 1. Live catalog-only Codex models lose their provider identity
+### 1. Live catalog-only Codex identity is still lost by subagents
 
 Severity: **High**
 
 Evidence:
 
-- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs:49`
-  stores a reduced sampling config without a provider/profile field.
-- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs:434`
-  re-derives provider facts from the model slug before inference.
-- `crates/codegen/xai-grok-shell/src/agent/config.rs:5124` resolves those facts
-  from the static/effective config using `resolve_model_list(&cfg, None)`, not
-  from the `ModelsManager` catalog containing live Codex models.
-- `crates/codegen/xai-grok-shell/src/agent/config.rs:5097` defaults an unknown
-  slug to `ModelProvider::Xai`.
-- `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs:498`
-  consequently retains `ProviderProfile::XAI`; the Codex bearer resolver is
-  installed only in the `is_codex` branch at lines 536-549.
+- The main session now resolves provider identity through ModelsManager, but
+  crates/codegen/xai-grok-shell/src/agent/subagent/mod.rs:721-729 still uses
+  static-config-only credential/provider resolution for the inherited model.
+- A live-only slug therefore reaches is_codex == false; lines 766-792 do not
+  install the Codex provider profile and bearer resolver.
+- The fallback path at lines 826-831 can overwrite a correctly inherited
+  resolver using the same incomplete model lookup.
+- There is no regression test that spawns a subagent from a parent using a
+  Codex model present only in the live account catalog.
 
 Impact:
 
-A model returned only by the authenticated Codex catalog can appear in the
-picker, but its inference request may be reconstructed as an xAI request. It
-then uses the wrong provider profile and header dialect and does not mount the
-Codex OAuth bearer resolver. The bundled static model can work while other
-live-discovered models fail.
+A live-discovered Codex model can work in the parent while its child is
+reconstructed as xAI or loses the Codex bearer resolver.
 
 Recommendation:
 
-- Preserve provider identity as part of the session/chat-state sampling config,
-  instead of re-inferring it from a different model source at request time.
-- Alternatively, make reconstruction query the same merged, account-scoped
-  catalog that supplied the picker entry. Do not default a selected live model
-  to xAI merely because it is absent from static config.
-- Add an end-to-end test that inserts a Codex-only slug into the live catalog,
-  selects it through the model manager, reconstructs the sampler config, and
-  asserts the Codex profile, bearer resolver, endpoint, and reserved headers.
+- Resolve child provider/auth facts from ctx.models_manager, using the same
+  account-scoped catalog entry as the parent turn.
+- Preserve an already-correct provider profile and bearer resolver in the
+  fallback path.
+- Add an end-to-end live-only Codex parent-to-child test.
 
-### 2. The Codex proactive refresh loop is never started
+### 2. Live Codex tool_mode is discarded, so Code Mode never activates
 
 Severity: **High**
 
 Evidence:
 
-- `crates/codegen/xai-grok-shell/src/codex_auth.rs:1204` defines an immediate
-  and four-minute proactive refresh loop.
-- No production path calls `codex_auth::start_proactive_refresh`.
-- `crates/codegen/xai-grok-shell/src/codex_auth.rs:1343` only reloads the current
-  access token from disk for requests.
-- The retry/401 path in
-  `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs:945-1028`
-  refreshes through the xAI `AuthManager`, not through Codex OAuth.
+- crates/codegen/xai-grok-shell/src/codex_models.rs:91 and 656-659 retain the
+  server's tool_mode string.
+- The only live-catalog-to-model-manager mapping,
+  crates/codegen/xai-grok-shell/src/agent/models/codex.rs:36-56, never copies
+  it into ModelInfo.tool_mode; its comment still says no Code Mode is declared.
+- crates/codegen/xai-grok-shell/src/agent/config.rs:3866-3872 treats a missing
+  tool_mode as Classic.
+- session/acp_session_impl/session_mode.rs:447-451 reads only that mapped
+  ModelInfo field.
+- Bundled models intentionally declare no Code Mode. Current tests activate it
+  only by manually constructing model entries or plans.
 
 Impact:
 
-A long-running Codex session eventually sends an expired token and has no
-Codex-specific 401 recovery. It starts working again only if another action,
-such as usage lookup, catalog refresh, or process restart, happens to refresh
-the credential store.
+Even when /models returns tool_mode: code_mode_only, the model runs with the
+Classic manifest. The new V8 runtime, native custom exec transport, nested
+tools, and Pager rendering are unreachable through the real live-catalog path.
 
 Recommendation:
 
-- Start the Codex refresh task from the same process lifecycle that owns its
-  cancellation token.
-- Add a Codex-specific forced-refresh path for an eligible 401, with a bounded
-  single replay and account-identity revalidation.
-- Test both proactive expiry rotation and `401 -> refresh -> one retry`, while
-  asserting that xAI credentials are never used on the Codex path.
+- Parse known live values into ToolMode at the single catalog mapping site;
+  warn and fail closed for unknown values.
+- Test the complete wire-catalog -> ModelsManager -> effective turn plan ->
+  native custom exec path.
 
-### 3. Codex login and logout do not preserve the user's latest intent
+### 3. Code Mode nested calls bypass PreToolUse/PostToolUse policy hooks
 
 Severity: **High**
 
 Evidence:
 
-- `crates/codegen/xai-grok-pager/src/app/dispatch/auth.rs:37-57` dispatches each
-  Codex login/logout independently.
-- `crates/codegen/xai-grok-pager/src/app/effects/mod.rs:3562-3580` spawns
-  independent asynchronous tasks without an operation generation or stale
-  result check.
-- Login persists credentials after its browser callback at
-  `crates/codegen/xai-grok-shell/src/codex_auth.rs:805-813`.
-- Logout revokes and deletes credentials at
-  `crates/codegen/xai-grok-shell/src/codex_auth.rs:1028-1086`.
+- The normal tool path executes server/client PreToolUse hooks, honors deny,
+  reparses rewritten input, and then executes post-use/failure hooks at
+  crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs:
+  1116-1187 and the surrounding execution path.
+- The nested path at session/acp_session_impl/session_mode.rs:595-701 performs
+  parse, plan-mode, and permission checks and calls dispatch_tool directly.
+- The nested projection excludes only exec and wait, so apply_patch,
+  exit_plan_mode, and other special tools remain callable from JavaScript.
 
 Impact:
 
-If `/login codex` is waiting for its browser callback and the user then runs
-`/logout codex`, the logout can complete first. Completing the older browser
-flow afterward writes credentials again and reverses the user's final logout
-intent. The reverse ordering is also unsafe because remote revocation occurs
-before the logout path takes its local auth lock.
+A repository policy that denies or rewrites a write through PreToolUse can be
+bypassed by invoking the same tool inside exec. Post-use/failure automation
+does not run, and special tools can miss their required lifecycle handling.
 
 Recommendation:
 
-- Assign an operation generation to Codex auth commands and discard completion
-  from any operation older than the current generation.
-- Cancel a pending login callback when logout begins, where practical.
-- Serialize credential mutation and make the ordering cover remote revoke plus
-  local persistence/deletion, not only the final file operation.
-- Add deterministic tests for `login -> logout -> old login callback` and
-  `logout in revoke -> new login -> old logout completes`.
+- Route nested calls through one shared preparation/execution funnel with the
+  normal path, including hooks, rewritten-input parsing, special lifecycle
+  handling, telemetry, and completion hooks.
+- Test a hook-denied write, rewritten input, failure hook, and exit_plan_mode
+  from inside exec.
 
-### 4. `x-codex-turn-state` is not propagated through sampler-internal retries
+### 4. Logical nested-tool failures resolve the JavaScript promise
 
 Severity: **High**
 
 Evidence:
 
-- `crates/codegen/xai-grok-sampler/src/actor/request_task.rs:128-155` retains a
-  local `ConversationRequest` and clones it for each attempt.
-- Handshake metadata is emitted to the shell at
-  `crates/codegen/xai-grok-sampler/src/actor/request_task.rs:734-743`.
-- The shell updates its session slot at
-  `crates/codegen/xai-grok-shell/src/session/acp_session_impl/session_setup.rs:517-529`,
-  but the already-running sampler retry loop does not read that slot again.
-- `crates/codegen/xai-grok-sampler/tests/codex_turn_state.rs:145-185`
-  manually rebuilds requests and does not execute the real retry loop.
+- session/acp_session_impl/session_mode.rs:703-709 computes
+  run_result.output.is_error() and marks the ACP row failed, but unconditionally
+  returns Ok(String(prompt_text)) to the runtime.
+- Only a dispatch-level Err reaches the rejection branch at lines 710-714.
+- xai-grok-tools/src/types/output.rs:668-700 classifies ordinary results such
+  as missing files, failed edits, non-zero shell exits, and MCP errors as
+  logical failures.
 
 Impact:
 
-When the first HTTP handshake returns a new turn-state and the body then fails
-before a usable response, the next internal attempt clones the original request
-and sends the old turn-state, commonly `None`. This violates the intended
-request-affinity lifecycle for retries of the same logical prompt.
+For example, await tools.read_file(...) on a missing file resolves with an
+error string rather than throwing. JavaScript can continue with later writes
+and store-state commits while the UI simultaneously reports failure.
 
 Recommendation:
 
-- Keep the latest turn-state inside the request task/retry state, and update the
-  next attempt directly from response metadata before deciding to retry.
-- Do not rely on an asynchronous shell notification as the only feedback path
-  for state required by the currently executing retry loop.
-- Replace or supplement the manual test with an actor-level test in which the
-  first mocked response returns a turn-state and then fails, and the second
-  captured request must echo that new value.
+- Return Err(prompt_text) for a logical failure, or define and consistently
+  implement a structured success/error contract.
+- Test the actual bridge with a logical error result, not only a transport Err.
 
-## High-risk latent findings for Code Mode
+### 5. Nested results are flattened to strings despite a structured contract
 
-These issues are not broadly user-facing yet because Code Mode ordered output
-is not fully wired into the product path. They should still be fixed before
-that integration is enabled.
-
-### 5. `ToolResultItem.parts` creates two drifting sources of truth
-
-Severity: **High when ordered tool output is enabled**
+Severity: **High**
 
 Evidence:
 
-- `crates/codegen/xai-grok-sampling-types/src/conversation/responses.rs:287-318`
-  treats non-empty `parts` as authoritative for Responses serialization.
-- Existing pruning still mutates only legacy `content` at
-  `crates/codegen/xai-chat-state/src/actor/request_builder.rs:151-175`.
-- Image accounting and eviction mutate only legacy `images` at
-  `crates/codegen/xai-chat-state/src/image_budget.rs:217-219,268-315`.
-- Persisted-image sanitation only clears legacy images at
-  `crates/codegen/xai-grok-shell/src/session/storage/jsonl/mod.rs:1747-1750`.
-- Workspace path rewriting and compaction similarly mutate only mirrors at
-  `crates/codegen/xai-grok-sampling-types/src/conversation.rs:2153-2156` and
-  `crates/codegen/xai-chat-state/src/compaction_utils.rs:230-239`.
+- The Code Mode description says nested tools can return objects or strings and
+  demonstrates accessing result.content[0].
+- session/acp_session_impl/session_mode.rs:703-709 returns only
+  Value::String(run_result.prompt_text), even though ToolRunResult.output is a
+  serializable typed value.
 
 Impact:
 
-Text or images removed from the legacy mirrors can remain in `parts` and still
-be sent on the wire. This can bypass old-result trimming and image budgets,
-retain stale workspace paths, and replay malformed persisted image data.
+MCP, image, audio, and structured tool results lose their shape. A program that
+follows the advertised result.content[0] contract receives a string and fails
+with undefined/TypeError; image()/audio() forwarding cannot work as described.
 
 Recommendation:
 
-- Use one canonical representation for ordered tool results. Derive legacy
-  views only at compatibility boundaries rather than persisting two mutable
-  representations.
-- Until that migration is complete, every mutation must update `parts` and its
-  mirrors atomically through one helper.
-- Add wire-level post-mutation tests for pruning, image eviction, persisted
-  history sanitation, path rewriting, and compaction.
+- Preserve the tool's raw/structured result shape and use a string only for
+  genuinely textual outputs.
+- Add bridge tests for MCP structured content and image/audio forwarding.
 
-### 6. The 8 MiB stored-state cap is cell-local, not session-wide
+### 6. Stale Code Mode cells are not fenced across model switch or rewind
 
-Severity: **High when concurrent Code Mode cells are enabled**
+Severity: **High**
 
 Evidence:
 
-- Each cell clones a state snapshot at
-  `crates/codegen/xai-grok-code-mode/src/session_runtime/mod.rs:156-178`.
-- `store()` checks only isolate-local accounting at
-  `crates/codegen/xai-grok-code-mode/src/runtime/callbacks.rs:211-229`.
-- Completion directly merges updates without a global size check at
-  `crates/codegen/xai-grok-code-mode/src/session_runtime/mod.rs:273-290`.
-- `stored_entry_bytes()` at
-  `crates/codegen/xai-grok-code-mode/src/runtime/mod.rs:36-38` also omits JSON
-  object punctuation and key escaping overhead.
+- Bridge messages have no runtime generation in
+  crates/codegen/xai-grok-shell/src/tools/code_mode.rs:29-41 or the consumer at
+  session_mode.rs:550-589.
+- shutdown_detached removes the runtime and schedules shutdown asynchronously
+  at tools/code_mode.rs:190-206; queued nested calls can race that shutdown.
+- Cancel uses detached termination. Rewind does not reset Code Mode at all, so
+  yielded cells and session store state can survive a history rewind.
+- There is no integration test for queued nested writes during cancel/model
+  switch or a yielded cell across rewind.
 
 Impact:
 
-Two cells starting from an empty snapshot can each store 5 MiB and independently
-pass the 8 MiB check. Their completion updates then merge into a roughly 10 MiB
-session state. Escaped keys can cause additional undercounting.
+A write from the previous model/turn can execute after switch, cancel, or
+rewind, and state created by a discarded future can remain visible later.
 
 Recommendation:
 
-- Enforce the limit atomically at the session merge/commit point against the
-  current global state.
-- Define whether a conflicting completion must fail entirely or whether only
-  its store delta is rejected, and surface that result explicitly to the cell.
-- Compute the size from the actual serialized representation, or document and
-  test a conservative accounting formula.
-- Add a concurrent two-cell regression test and escaped-key boundary tests.
+- Fence bridge messages with the active runtime generation and reject stale
+  work synchronously before dispatch.
+- Define and test a synchronous invalidation boundary for switch, cancel,
+  close, and rewind.
 
-## Non-blocking but required follow-ups
+### 7. Retained-history pruning still leaves ordered tool output alive
 
-### 7. Durable stream recovery does not cover normal transport failures
+Severity: **High**
+
+Evidence:
+
+- The new tool_result_edit helpers synchronize request-copy pruning, image
+  eviction, image sanitation, CWD rewriting, and compaction truncation.
+- crates/codegen/xai-chat-state/src/actor/mutations.rs:374-385 still hard-clears
+  only ToolResultItem.content during retained-history pruning.
+- Responses serialization treats non-empty ToolResultItem.parts as
+  authoritative at xai-grok-sampling-types/src/conversation/responses.rs:
+  289-320.
+
+Impact:
+
+An aged Code Mode result can show the placeholder in content while retaining
+the complete old text/images in parts. That content remains persisted and is
+replayed on the next Responses request.
+
+Recommendation:
+
+- Route retained-history hard clear through set_tool_result_text.
+- Add an actor-level retained-prune test using tool_result_with_parts, then
+  assert both persisted state and wire JSON omit the old content.
+
+### 8. ever_used_codex is established after content can reach xAI sync
+
+Severity: **High**
+
+Evidence:
+
+- Initial Codex sessions are marked during spawn, but an xAI-to-Codex switch at
+  session/acp_session_impl/model_switch.rs:49-86 updates sampling state without
+  marking provenance.
+- The user message is emitted/persisted before sampling at
+  session/acp_session_impl/turn.rs:615-630 and 737-742.
+- Persistence continues queueing notifications to remote/relay while false at
+  session/persistence.rs:1443-1454.
+- The only runtime mark after spawn is session_setup.rs:524-538, conditional
+  on receiving a non-empty Codex turn-state response header.
+
+Impact:
+
+After switching an xAI-synced session to Codex, the Codex prompt can be queued
+to xAI remote/relay before the response. If the request fails or no turn-state
+header arrives, the session may never be marked.
+
+Recommendation:
+
+- Mark chat state and persistence synchronously when the effective turn
+  provider becomes Codex, before prompt persistence or sampling.
+- Use provider identity, not an optional response header, as the provenance
+  signal.
+- Test request failure and missing-header cases as well as success.
+
+### 9. Codex provenance does not gate prompt-trace uploads
+
+Severity: **High**
+
+Evidence:
+
+- Summary.ever_used_codex claims prompt traces are disabled, but the flag is
+  read only by chat-state snapshotting and persistence remote/relay setup.
+- crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs:3773-3814
+  decides whether to create a trace context without reading session provenance
+  or effective provider.
+- session/acp_session_impl/turn.rs:2304-2317 still attaches a
+  ConversationRequestTrace whenever trace upload is enabled.
+
+Impact:
+
+Even a session that starts on Codex and is correctly marked can upload
+Codex-derived prompts, history, images, and turn artifacts through the xAI
+trace pipeline. The implementation contradicts its own privacy contract.
+
+Recommendation:
+
+- Gate trace-context creation and turn upload on monotonic provenance before
+  capture begins.
+- Test initial Codex, xAI-to-Codex, resume, fork, and switch-back cases.
+
+## Other required findings
+
+### 10. Codex subagent output does not taint the parent session
+
+Severity: **Medium-High**
+
+Evidence:
+
+- A parent can select a different subagent model at
+  agent/subagent/handle_request.rs:394-403 and spawn it at 971-999.
+- The child completion envelope carries no provider/ever_used_codex provenance;
+  child_run_output at agent/subagent/mod.rs:1872-1881 forwards only result,
+  completion data, and a snapshot reference.
+- The parent marks itself only from its own initial provider or response
+  metadata.
+
+Impact:
+
+An xAI parent can merge a Codex child's output and remain unmarked, making that
+derived content eligible for xAI remote/relay and prompt-trace egress.
+
+Recommendation:
+
+- Propagate monotonic provider provenance through child completion and mark the
+  parent before merge/persistence.
+- Test successful, failed, and cancelled child paths.
+
+### 11. Pager parses the wrong serialized shape for Code Mode output
 
 Severity: **Medium**
 
 Evidence:
 
-- Idle timeout returns failure immediately at
-  `crates/codegen/xai-grok-sampler/src/stream/responses.rs:350-362`.
-- Transport/serialization error returns failure immediately at lines 365-397.
-- Durable output is used only after clean EOF at lines 824-842.
-- Message-only incomplete recovery is converted to a truncation failure at
-  `crates/codegen/xai-grok-sampler/src/actor/request_task.rs:699-703`.
-
-Recommendation:
-
-- Run the same durable-output decision for clean EOF, retryable stream error,
-  and idle timeout after at least one complete output item.
-- Define a terminal status that lets a fully completed recovered message reach
-  the caller instead of being reclassified as max-token truncation.
-- Add actor-level tests for `done item -> socket error`, `done item -> timeout`,
-  and message-only recovery.
-
-### 8. The in-memory Codex model catalog is not account-scoped
-
-Severity: **Medium**
-
-Evidence:
-
-- `CatalogState.codex_models` has no account fingerprint at
-  `crates/codegen/xai-grok-shell/src/agent/models.rs:107`.
-- It is retained by the clear path at lines 1147-1159.
-- Login notifies listeners before background refresh at
-  `crates/codegen/xai-grok-shell/src/extensions/codex.rs:82-88`.
+- ToolOutput is internally tagged with serde(tag = \"type\") at
+  xai-grok-tools/src/types/output.rs:623-624.
+- The shell sends serde_json::to_value(&result.output) at
+  session/acp_session_impl/tool_calls.rs:2462-2474, producing an object with
+  type: CodeMode and sibling fields.
+- Pager expects an externally tagged CodeMode child object at
+  xai-grok-pager/src/acp/tracker.rs:2155-2164.
+- Tests exercise the block directly, not tracker mapping from the shell value.
 
 Impact:
 
-After account A logs out and account B logs in, A's retained catalog can become
-visible to B before refresh. It can remain visible if refresh is disabled,
-fails, or is skipped because an older request is still in flight.
+Parsing always falls back. The block loses cell_id, yielded/completed/
+terminated state, and detailed errors.
 
 Recommendation:
 
-- Store the account fingerprint with the in-memory catalog and require a match
-  before making entries visible.
-- Clear or quarantine account-scoped entries on logout and account transition.
-- Replace the process-wide in-flight boolean with refresh state keyed by account
-  generation, or schedule the new account refresh when an obsolete request
-  finishes.
-- Test account A logout followed by account B login under success, failure,
-  disabled-fetch, and old-refresh-in-flight conditions.
+- Deserialize the internally tagged raw_output shape.
+- Add a shell-serialized-value-to-Pager-block regression test.
 
-### 9. Logout can leave `currentModelId` outside `availableModels`
+### 12. Advertised Code Mode output limits are ignored
 
 Severity: **Medium**
 
 Evidence:
 
-- Logout only refreshes model visibility at
-  `crates/codegen/xai-grok-shell/src/extensions/codex.rs:107-116`.
-- `available()` removes unauthorized Codex models at
-  `crates/codegen/xai-grok-shell/src/agent/models.rs:515-543`.
-- `current_model_id()` independently returns the old model at lines 552-554.
-- The pager accepts that current ID at
-  `crates/codegen/xai-grok-pager/src/app/acp_handler/settings.rs:14-37`.
+- exec advertises/parses max_output_tokens, but the service conversion to
+  CreateCellRequest drops it and the runtime request has no matching field.
+- wait exposes max_tokens, but WaitTool::run ignores it and WaitRequest carries
+  no limit.
+
+Impact:
+
+Calls requesting small caps can return unbounded output relative to their
+documented contract and consume much more context than requested.
 
 Recommendation:
 
-- Define and enforce the invariant that the active model is usable under the
-  current authentication state.
-- On logout, either switch to a deterministic available fallback or mark the
-  session as requiring model selection before another turn.
-- Add a test that selects a Codex model, logs out, consumes the model update,
-  and verifies both UI state and the next-turn behavior.
+- Plumb both limits to the output collection/truncation point, or remove the
+  unsupported fields until implemented.
+- Test initial exec output and subsequent wait chunks at the boundary.
 
-### 10. Auto theme can remain stale after returning from a child process
+### 13. Concurrent nested writes bypass the normal same-path lock
 
 Severity: **Medium**
 
 Evidence:
 
-- Child startup disables terminal theme updates at
-  `crates/codegen/xai-grok-pager/src/app/event_loop.rs:457-462`.
-- Child exit only re-enables updates at lines 487-492, without requesting the
-  current mode.
-- Lines 497-501 then drain buffered crossterm events indiscriminately.
-- Initial setup correctly combines enable and one-shot request at
-  `crates/codegen/xai-grok-pager/src/app/mod.rs:1460-1471`.
-- The stored terminal report remains the highest-priority appearance source at
-  `crates/codegen/xai-grok-pager-render/src/theme/system_appearance.rs:160-171`.
+- The normal batch path serializes non-read-only operations targeting the same
+  path at session/acp_session_impl/tool_calls.rs:593-653.
+- The Code Mode consumer spawns each nested call separately and dispatches it
+  directly at session_mode.rs:560-572 and 695-701.
+- Promise.all can therefore start multiple writes to the same file without the
+  existing per-path lock.
+
+Impact:
+
+Two edits based on the same file version can race, lose one update, or fail
+nondeterministically.
 
 Recommendation:
 
-- After the child exits and stale input has been drained, issue a fresh
-  `RequestThemeMode` in addition to re-enabling notifications.
-- Alternatively, preserve and process `ThemeModeChanged` while draining instead
-  of discarding every buffered event.
-- Add a PTY-level regression test that changes the reported theme while a child
-  owns the terminal and verifies immediate reconciliation after resume.
+- Reuse the normal path-lock mechanism for nested calls.
+- Add a Promise.all same-file edit regression test.
 
-## Lower-priority issues
+### 14. Remote compaction and comp_hash handling are non-functional scaffolding
 
-### Announcement visibility
+Severity: **Medium**
 
-The Welcome fallback at
-`crates/codegen/xai-grok-pager/src/app/app_view.rs:4607-4619` only rechecks
-critical severity. It can redisplay a hidden, expired, or empty critical
-announcement that the primary selection path correctly filtered.
+Evidence:
 
-Recommendation: use one visibility predicate for both primary selection and
-fallback, covering severity, hidden IDs, expiry, and non-empty content.
+- The new body-shaping and beta-header helpers in xai-grok-sampler/src/client.rs
+  are called only by unit tests; no compaction request invokes them.
+- session/compaction.rs:2067-2077 hardcodes current_codex_comp_hash() to None.
+- The same-slug hash-change branch can therefore never fire and no live model
+  capability enables remote compaction.
 
-### Custom tool call ID namespace
+Impact:
 
-The v2 encoding in
-`crates/codegen/xai-grok-sampling-types/src/conversation.rs:528-583` correctly
-round-trips genuine custom IDs, including Unicode and colons. However, a normal
-function-call ID that happens to match the reserved v2 syntax is interpreted as
-a custom call.
-
-Recommendation: preserve call kind explicitly in persisted state rather than
-inferring it only from a string prefix. At minimum, document the reserved
-namespace and add a collision regression test.
-
-### Unknown Responses event logging
-
-Unknown top-level events are ignored by the stream layer, but the decoder logs
-the full raw frame at error level first:
-
-- `crates/codegen/xai-grok-sampler/src/client.rs:137-163`
-- `crates/codegen/xai-grok-sampler/src/stream/responses.rs:365-388`
-
-Recommendation: classify unknown event kinds before error logging, log them at
-debug/trace level with bounded metadata, and avoid logging an unbounded raw
-payload.
-
-### Warning and maintenance debt
-
-- `crates/codegen/xai-grok-shell/src/codex_models.rs` introduces 21
-  `unreachable_pub` warnings under the crate's existing lint policy.
-- The workspace-wide vendored crossterm patch introduces a large dependency
-  snapshot and six warnings for a narrowly scoped terminal protocol change.
-- `.github/workflows/build.yml` builds and smoke-tests artifacts but does not run
-  tests or trigger on pull requests.
-- The workflow uses the deprecated `macos-14` runner image, which GitHub plans to
-  remove on 2026-11-02.
+The patch adds public surface and state fields but no runtime behavior. Unit
+tests prove isolated shaping helpers, not a real request or hash transition.
 
 Recommendation:
 
-- Restrict internal Codex model types/functions to `pub(crate)` or private
-  visibility as appropriate.
-- Keep the crossterm patch minimal and document its upstream provenance and
-  upgrade path if vendoring remains necessary.
-- Add a pull-request validation job for targeted checks/tests, separate from
-  the release artifact build.
-- Migrate the macOS build before the runner removal deadline.
+- Complete the catalog capability/hash plumbing and an end-to-end request, or
+  remove/defer the unused scaffold under YAGNI.
+- Do not advertise remote compaction as implemented yet.
 
-## Reviewed areas that appear sound
+### 15. Login/logout latest-intent still fails for queued and cross-process operations
 
-The following portions were reviewed without finding an additional concrete
-defect:
+Severity: **Medium**
 
-- Credential precedence and provider-header isolation for models that are
-  correctly identified as Codex.
-- A single per-request credential snapshot for bearer, account ID, and FedRAMP
-  headers.
-- Account fingerprint, ETag, TTL, and conditional 304 handling for the disk
-  model catalog cache.
-- UTF-8 byte-length handling and genuine custom-tool v2 ID round-trips.
-- Ordered tool-output serialization before any later mutation.
-- Terminal mode 2031 initialization, report parsing, normal event routing,
-  SSH/PTY compatibility, and shutdown cleanup.
-- Removal of passive promotional UI while retaining critical operational
-  announcements and controls.
-- Linux x86_64 and macOS arm64 release builds, version smoke tests, binary rename
-  to `grok`, and distinct artifact names.
+Evidence:
+
+- extensions/codex.rs serializes operations through a FIFO mutex, but only a
+  logout cancels the login that is already registered as pending. A login
+  waiting behind the mutex has not registered its cancellation token yet.
+- With login A active, login B queued, and logout C queued, C cancels A; B then
+  acquires the mutex and starts a fresh callback wait before C can run. Pager
+  generation fencing hides stale UI results but does not change credential
+  state or queue latency.
+- The new auth mutex and LOGOUT_GENERATION fence in codex_auth.rs are
+  process-local statics.
+- The file lock serializes mutations but carries no persisted generation
+  between a TUI process and a separate CLI process.
+
+Impact:
+
+The user's final logout can be delayed behind a login that was requested
+earlier but had not started, potentially for the full callback timeout. Across
+processes, logout can complete and an older login can later acquire the file
+lock and recreate credentials.
+
+Recommendation:
+
+- Allocate operation generations/cancellation at enqueue time so a logout
+  invalidates active and queued older logins; add a real login-login-logout
+  concurrency test.
+- Persist a logout epoch/tombstone under the same cross-process lock and check
+  it immediately before login persistence, or explicitly prevent concurrent
+  cross-process flows.
+- Add a two-process auth-file regression test.
+
+### 16. Codex 401 recovery is not bounded to one replay
+
+Severity: **Medium**
+
+Evidence:
+
+- The Codex branch force-refreshes on each eligible failure in
+  session/acp_session_impl/sampler_turn.rs.
+- It then uses the shared AuthRetrySchedule, which allows several credentialed
+  retries rather than one replay for the logical request.
+- Tests cover low-level refresh and no-anchor failure, but not a successful
+  401 -> refreshed bearer -> one replay sequence or persistent-401 bound.
+
+Impact:
+
+A persistent 401 can trigger repeated OAuth refresh traffic and request
+replays, contrary to the comments and prior remediation requirement.
+
+Recommendation:
+
+- Track whether Codex recovery has already run for the logical request.
+- Add captured-wire tests for success and persistent-401 exhaustion.
+
+### 17. Identity-less valid Codex credentials are treated as logged out
+
+Severity: **Medium**
+
+Evidence:
+
+- account_fingerprint returns None when credentials have no account ID, user
+  ID, or email.
+- ModelsManager uses that optional fingerprint both for account scoping and as
+  its logged-in predicate.
+
+Impact:
+
+A usable bearer/refresh-token file without those optional claims hides bundled
+Codex models and suppresses live-catalog refresh.
+
+Recommendation:
+
+- Separate is_logged_in from optional account_fingerprint.
+- Keep authenticated visibility while conservatively disabling reusable
+  account-scoped cache publication when identity is unavailable.
+
+## Lower-priority maintenance issues
+
+- stored_entry_bytes claims to overcount serialized object size by one byte,
+  but it actually undercounts a non-empty JSON object by one: the real object
+  has two braces and one fewer comma. The global atomic merge fix is sound, but
+  an accounted 8 MiB map can serialize to 8 MiB + 1 byte.
+- xai-grok-shell and xai-grok-tools now pull the V8/ICU Code Mode dependency
+  graph into ordinary checks/tests unconditionally, even for Classic-only
+  builds. A code-mode feature boundary would avoid paying this compile cost
+  when the capability is disabled.
+- The workspace-wide vendored crossterm patch still needs a documented
+  upstream/upgrade path.
+- .github/workflows/build.yml still has no pull-request trigger or test job and
+  still uses macos-14.
+
+## Reviewed areas that now appear sound
+
+The following previous findings were rechecked and removed from the active
+list:
+
+- main-session live-catalog provider reconstruction;
+- proactive refresh startup and provider-isolated Codex 401 routing;
+- the single active-login followed by logout cancellation/mutation race (the
+  queued multi-operation and cross-process cases remain in finding 15);
+- sampler-internal x-codex-turn-state propagation;
+- durable recovery after retryable stream errors, idle timeout, and clean EOF;
+- account-fingerprinted catalog publication and stale-fetch fencing;
+- logout restoration of currentModelId to an available model;
+- child-process terminal theme resync and unified announcement visibility;
+- bounded unknown Responses-event logging and warning cleanup;
+- provider-gated hosted-search serialization;
+- session-global atomic stored-state merge enforcement;
+- custom-tool ID namespace documentation and regression coverage;
+- ordered result construction and the mutation paths now using
+  tool_result_edit, except retained-history pruning in finding 7.
 
 ## Validation evidence
 
-The following targeted check completed successfully:
+This was a read-only multi-agent code review. No production source file was
+modified by the review; only this document was updated.
 
-```text
-cargo check --all-targets --locked \
-  -p xai-grok-shell \
-  -p xai-grok-sampler \
-  -p xai-grok-pager \
-  -p xai-grok-code-mode \
-  -p xai-grok-code-mode-protocol \
-  -p xai-chat-state
-```
+The following check completed successfully against the reviewed snapshot:
 
-It completed in approximately 6 minutes 57 seconds. It also surfaced the 21
-new `xai-grok-shell` visibility warnings and six vendored crossterm warnings.
+    git diff --check
 
-The full workspace all-target check reached an unrelated pre-existing test
-compile error at
-`crates/codegen/xai-fast-worktree/src/nfs/remove.rs:317`; blame attributes that
-line to the base history rather than this review range.
-
-GitHub Actions run `32691191173` passed release build, version smoke, rename, and
-artifact upload for both `linux-x86_64` and `macos-aarch64`. The workflow does
-not run the state-machine and retry tests needed to detect the findings above.
+Claude's concurrent xai-grok-shell and xai-grok-pager test processes were still
+running when the snapshot was taken, so this document does not claim those
+suites as completed evidence. Green unit tests would not resolve the catalog
+wiring, hook bypass, provenance ordering, or serialization-shape findings.
 
 ## Recommended remediation order
 
-Before merge or release:
+Before enabling or merging Code Mode:
 
-1. Preserve live Codex provider identity through inference reconstruction.
-2. Start Codex proactive refresh and implement bounded Codex 401 recovery.
-3. Order/cancel login and logout operations according to the latest user intent.
-4. Propagate the latest turn-state inside the actual sampler retry loop.
-5. Scope the in-memory model catalog to the authenticated account.
-6. Restore the `currentModelId`/`availableModels` invariant after logout.
-7. Make durable recovery work for transport errors, timeout, and message-only
-   output.
+1. Map live Codex tool_mode into the effective catalog.
+2. Route nested calls through the normal hook/policy/lifecycle and same-path
+   locking funnel.
+3. Preserve structured results and reject logical failures.
+4. Fence runtime generations and define cancel/switch/rewind semantics.
+5. Finish the retained-history ordered-parts mutation path.
 
-Before enabling Code Mode product wiring:
+Before treating provider privacy as complete:
 
-8. Establish one canonical ordered tool-result representation.
-9. Enforce stored-state limits atomically at the session commit point.
+6. Mark Codex provenance before prompt persistence or xAI sync.
+7. Gate prompt traces on monotonic provenance.
+8. Propagate Codex subagent provenance to parents.
 
-Follow-up quality work:
+Before release:
 
-10. Reconcile terminal theme after child-process resume.
-11. Unify announcement visibility filtering.
-12. Resolve warnings, CI coverage gaps, and the macOS runner lifecycle issue.
+9. Fix live-only Codex provider reconstruction in subagents.
+10. Correct Pager raw-output parsing and implement/remove output caps.
+11. Wire remote compaction end to end or remove the unused scaffold.
+12. Bound Codex 401 recovery and decide the cross-process auth contract.
