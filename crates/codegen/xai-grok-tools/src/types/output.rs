@@ -1237,6 +1237,14 @@ impl MCPOutput {
     pub fn output_mut(&mut self) -> &mut MCPOutputDetails {
         &mut self.output
     }
+    /// Qualified tool name (`<server>__<tool>`) this result came from.
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+    /// MCP server that produced this result.
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
 }
 impl xai_tool_runtime::ToolOutput for ToolOutput {
     fn chat_completion_output(&self) -> Option<xai_tool_runtime::ToolChatCompletionResponse> {

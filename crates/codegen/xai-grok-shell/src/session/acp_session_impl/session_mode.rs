@@ -525,6 +525,17 @@ impl SessionActor {
     }
     /// Project the registry tool definitions into the code-mode nested-tool
     /// namespace, excluding `exec`/`wait` themselves.
+    ///
+    /// `output_schema` is deliberately `None` for every tool: nothing upstream
+    /// of this projection carries one. The sampling `ToolDefinition` /
+    /// `FunctionTool` the registry finalizes has `name`/`description`/
+    /// `parameters` only, `ToolMetadata` declares no output schema, and the
+    /// MCP client layer does not retain the servers' advertised
+    /// `outputSchema`. Publishing a guessed schema would be worse than none —
+    /// `build_exec_tool_description` renders it into the TypeScript
+    /// declarations the model codes against. Give it a real source (thread
+    /// `outputSchema` through MCP registration, or add one to `ToolMetadata`)
+    /// and this is the single place to project it.
     fn code_mode_nested_projection(
         defs: &[crate::sampling::types::ToolDefinition],
     ) -> Vec<xai_grok_code_mode_protocol::ToolDefinition> {
@@ -583,7 +594,15 @@ impl SessionActor {
                                 _ = cancellation_token.cancelled() => {
                                     Err("nested tool call cancelled".to_string())
                                 }
-                                result = session.run_code_mode_nested_call(&call) => result,
+                                // The generation travels with the call: this
+                                // task can park for a long time in a hook,
+                                // permission prompt, or path lock, so the
+                                // dequeue-time check above is not the last
+                                // word — `run_code_mode_nested_call` re-checks
+                                // it at the dispatch boundary.
+                                result = session.run_code_mode_nested_call(&call, generation) => {
+                                    result
+                                }
                             };
                             let _ = respond_to.send(result);
                         });
@@ -619,14 +638,25 @@ impl SessionActor {
     /// (MCP `CallToolResult` shape, image content) and a plain string for
     /// purely textual outputs.
     ///
-    /// Deliberate deviations from the batch path, kept narrow: client-side
-    /// (reverse-request) PreToolUse gate hooks are not consulted — their deny
-    /// path writes a paired tool_result into the conversation, which a nested
-    /// call must never do — and session-lifecycle tools (plan mode
-    /// enter/exit) are rejected outright rather than intercepted.
+    /// The client-side (reverse-request) PreToolUse gate is consulted too
+    /// (finding 3): the decision is taken through
+    /// [`Self::pre_tool_use_client_denial`], which has no session side
+    /// effects, so the deny reaches the cell as a rejected promise without the
+    /// paired top-level `tool_result` a nested call must never write.
+    ///
+    /// `generation` is the Code Mode runtime generation this call was admitted
+    /// under. It is re-checked immediately before `dispatch_tool` (finding 4):
+    /// everything between admission and dispatch — hooks, the permission
+    /// prompt, the per-path lock — can park for an unbounded time, and a model
+    /// switch, cancel, or rewind in that window must fence the call.
+    ///
+    /// The one deliberate deviation from the batch path: session-lifecycle
+    /// tools (plan mode enter/exit) are rejected outright rather than
+    /// intercepted, since their approval dialogs require top-level handling.
     async fn run_code_mode_nested_call(
         self: &Arc<Self>,
         call: &xai_grok_code_mode_protocol::CodeModeNestedToolCall,
+        generation: u64,
     ) -> Result<serde_json::Value, String> {
         let wire_name = call.tool_name.to_string();
         if !xai_grok_code_mode_protocol::is_code_mode_nested_tool(&wire_name) {
@@ -649,7 +679,7 @@ impl SessionActor {
             .dispatch_target_name()
             .unwrap_or_else(|| wire_name.clone());
         if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PreToolUse) {
-            let envelope =
+            let mut envelope =
                 self.make_pre_tool_use_envelope(&resolved_tool_name, &ui_call_id, &input_value);
             let hook_registry_snapshot = self.hook_registry.borrow().clone();
             if let Some(registry) = hook_registry_snapshot {
@@ -694,7 +724,27 @@ impl SessionActor {
                     resolved_tool_name = tool_input
                         .dispatch_target_name()
                         .unwrap_or_else(|| wire_name.clone());
+                    // Rebuild so the client gate below sees the rewritten
+                    // input and resolved name, exactly as prepare_tool_call
+                    // does.
+                    envelope = self.make_pre_tool_use_envelope(
+                        &resolved_tool_name,
+                        &ui_call_id,
+                        &input_value,
+                    );
                 }
+            }
+            // Client-side (reverse-request) PreToolUse gate — same decision the
+            // top-level path takes, minus its conversation side effects
+            // (finding 3). A nested deny rejects the cell's promise; it must
+            // never push a paired tool_result.
+            // Rejected before the ACP tool call is announced, exactly like the
+            // registry-hook deny above, so no orphan ToolCallUpdate is sent.
+            if let Some(denial) = self.pre_tool_use_client_denial(&wire_name, &envelope).await {
+                return Err(format!(
+                    "Tool `{}` was denied by hook `{}`: {}",
+                    denial.tool_name, denial.hook_name, denial.reason
+                ));
             }
         }
         let access_kind = AccessKind::from(&tool_input);
@@ -787,21 +837,50 @@ impl SessionActor {
                 .map(|path| self.tool_context.code_mode.nested_path_lock(path))
         };
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
-        self.signals_handle().record_tool_call(&wire_name);
         let result = {
             let _path_guard = match path_lock.as_ref() {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
             };
-            call_with_auth_retry(
-                self.auth_manager.as_ref(),
-                None,
-                &wire_name,
-                || async {
-                    dispatch_tool(&self.workspace_ops, &prepared, session_id.as_ref()).await
-                },
-            )
-            .await
+            // Last fence before the effect happens (finding 4). Everything
+            // above — hooks, the client gate, the permission prompt, this very
+            // path lock — can park indefinitely; if the runtime was
+            // invalidated while we waited, the call belongs to a runtime (and
+            // possibly a history) that no longer exists and must not land.
+            // Taken while holding the path guard so it cannot go stale between
+            // the check and the dispatch.
+            if self.tool_context.code_mode.current_generation() != generation {
+                None
+            } else {
+                self.signals_handle().record_tool_call(&wire_name);
+                Some(
+                    call_with_auth_retry(
+                        self.auth_manager.as_ref(),
+                        None,
+                        &wire_name,
+                        || async {
+                            dispatch_tool(&self.workspace_ops, &prepared, session_id.as_ref())
+                                .await
+                        },
+                    )
+                    .await,
+                )
+            }
+        };
+        let Some(result) = result else {
+            let message = format!(
+                "Tool `{wire_name}` was not executed: the code mode runtime was invalidated \
+                 (model switch, cancel, or rewind) while the call was waiting"
+            );
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                tool_name = %wire_name,
+                admitted_generation = generation,
+                current_generation = self.tool_context.code_mode.current_generation(),
+                "nested code mode call fenced at the dispatch boundary"
+            );
+            self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
+            return Err(message);
         };
         match result {
             Ok(run_result) => {
@@ -892,16 +971,28 @@ impl SessionActor {
         }
         Ok(())
     }
-    /// The JSON value a nested call resolves with (finding 5): preserve the
-    /// structured shape where the tool has one, use a plain string only for
-    /// genuinely textual outputs.
+    /// The JSON value a nested call resolves with: preserve the structured
+    /// shape where the tool has one, use a plain string only for genuinely
+    /// textual outputs.
     ///
     /// - MCP tools resolve with an MCP `CallToolResult`-shaped object
-    ///   (`{content: [{type: "text", ...}], isError}`), matching the
-    ///   `result.content[0]` contract in the exec description.
+    ///   (`{content: [...], isError, _meta}`), matching the
+    ///   `result.content[0]` contract in the exec description. Any images the
+    ///   tool layer captured out of the server's reply become `image` content
+    ///   blocks alongside the text block instead of being dropped, so
+    ///   `image(result.content[1])` forwarding works for MCP too.
     /// - Image-producing reads resolve with `{content: [{type: "image",
     ///   data, mimeType}]}` so `image(result.content[0])` forwarding works.
+    /// - Dynamic (runtime-registered) tools resolve with their JSON value
+    ///   verbatim, so JS can read its fields.
     /// - Everything else resolves with the prompt-facing text.
+    ///
+    /// Not preserved, because this build never carries it: MCP
+    /// `structuredContent`, audio, and resource blocks. `MCPOutput` stores a
+    /// single already-rendered `OkayOutput(String)`/`Error(String)` (the
+    /// runtime's `CallToolResult` renderer folds `structuredContent` into that
+    /// text before the tool layer sees it), so there is nothing left to
+    /// forward; the transport facts that *are* retained travel in `_meta`.
     fn nested_result_value(run_result: &ToolRunResult) -> serde_json::Value {
         use xai_grok_tools::types::output::MCPOutputDetails;
         match &run_result.output {
@@ -910,11 +1001,35 @@ impl SessionActor {
                     MCPOutputDetails::OkayOutput(text) => text.clone(),
                     MCPOutputDetails::Error(error) => error.clone(),
                 };
+                let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+                // Images the tool layer extracted from the server's reply. The
+                // nested path never runs the harness drain
+                // (`drain_tool_layer_extracted_images`), so they are still
+                // here — forward them rather than discarding them.
+                content.extend(mcp.extracted_images.iter().map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": image.data,
+                        "mimeType": image.mime_type,
+                    })
+                }));
                 serde_json::json!({
-                    "content": [{"type": "text", "text": text}],
+                    "content": content,
                     "isError": mcp.is_error,
+                    "_meta": {
+                        "x.ai/mcp": {
+                            "toolName": mcp.tool_name(),
+                            "serverName": mcp.server_name(),
+                            "isTimeout": mcp.is_timeout,
+                            "reconnectAttempted": mcp.reconnect_attempted,
+                            "authRetryAttempted": mcp.auth_retry_attempted,
+                        }
+                    },
                 })
             }
+            // Runtime-registered tools carry arbitrary JSON; hand it to the
+            // cell unchanged instead of flattening it to prompt text.
+            ToolsToolOutput::Dynamic(dynamic) => dynamic.value.clone(),
             ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(image)) => {
                 serde_json::json!({
                     "content": [{
@@ -1073,5 +1188,528 @@ mod code_mode_nested_tests {
             SessionActor::nested_result_value(&text),
             serde_json::Value::String("plain".to_string())
         );
+    }
+
+    /// Finding 6: a dynamic (runtime-registered) tool's JSON value reaches the
+    /// cell verbatim, so JS can read its fields instead of a rendered string.
+    #[test]
+    fn dynamic_output_round_trips_its_structured_value() {
+        let value = serde_json::json!({
+            "id": 42,
+            "nested": {"ok": true, "items": ["a", "b"]},
+        });
+        let dynamic = run_result(
+            ToolsToolOutput::Dynamic(xai_grok_tools::types::output::DynamicOutput::from(
+                value.clone(),
+            )),
+            "id=42 (rendered for the prompt)",
+        );
+        assert_eq!(SessionActor::nested_result_value(&dynamic), value);
+    }
+
+    /// Finding 6: a real `MCPOutput` forwards its extracted images as image
+    /// content blocks (they used to be dropped), reports `isError`, and keeps
+    /// the transport facts it does retain in `_meta`.
+    #[test]
+    fn mcp_output_forwards_images_error_flag_and_metadata() {
+        use xai_grok_tools::util::base64_images::ExtractedImage;
+
+        let mut mcp = MCPOutput::errored(
+            "figma__export".to_string(),
+            "figma".to_string(),
+            "render failed".to_string(),
+        );
+        mcp.is_timeout = true;
+        mcp.reconnect_attempted = true;
+        mcp.extracted_images = vec![
+            ExtractedImage {
+                data: "QUJD".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+            ExtractedImage {
+                data: "REVG".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            },
+        ];
+        let value = SessionActor::nested_result_value(&run_result(
+            ToolsToolOutput::MCP(mcp),
+            "render failed",
+        ));
+
+        assert_eq!(value["isError"], true);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "render failed");
+        assert_eq!(value["content"][1]["type"], "image");
+        assert_eq!(value["content"][1]["data"], "QUJD");
+        assert_eq!(value["content"][1]["mimeType"], "image/png");
+        assert_eq!(value["content"][2]["mimeType"], "image/jpeg");
+        assert_eq!(
+            value["content"].as_array().map(Vec::len),
+            Some(3),
+            "one text block plus every extracted image: {value}"
+        );
+        let meta = &value["_meta"]["x.ai/mcp"];
+        assert_eq!(meta["toolName"], "figma__export");
+        assert_eq!(meta["serverName"], "figma");
+        assert_eq!(meta["isTimeout"], true);
+        assert_eq!(meta["reconnectAttempted"], true);
+        assert_eq!(meta["authRetryAttempted"], false);
+    }
+
+    /// Finding 6, schema half: the nested projection drops `exec`/`wait` and
+    /// carries each tool's real input schema. `output_schema` stays `None`
+    /// because nothing upstream carries one — pinned here so a future source
+    /// of output schemas has to update this test deliberately rather than
+    /// leaving the advertised contract silently false.
+    #[test]
+    fn nested_projection_carries_input_schema_and_no_output_schema() {
+        use crate::sampling::types::ToolDefinition;
+
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        });
+        let defs = vec![
+            ToolDefinition::function("read_file", Some("read a file"), params.clone()),
+            ToolDefinition::function(
+                xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME,
+                Some("exec"),
+                serde_json::json!({}),
+            ),
+            ToolDefinition::function(
+                xai_grok_code_mode_protocol::WAIT_TOOL_NAME,
+                Some("wait"),
+                serde_json::json!({}),
+            ),
+        ];
+        let projected = SessionActor::code_mode_nested_projection(&defs);
+        assert_eq!(projected.len(), 1, "exec/wait must not be nested tools");
+        assert_eq!(projected[0].name, "read_file");
+        assert_eq!(projected[0].description, "read a file");
+        assert_eq!(projected[0].input_schema.as_ref(), Some(&params));
+        assert!(
+            projected[0].output_schema.is_none(),
+            "no registry surface carries an output schema in this build"
+        );
+    }
+}
+
+/// Session-level Code Mode invalidation and gating, driven through the real
+/// `run_code_mode_nested_call` path.
+#[cfg(test)]
+mod code_mode_session_tests {
+    use super::*;
+    use crate::session::acp_session::support::{create_test_actor, test_grok_build_agent_with_todo};
+
+    fn nested_call(cell: &str) -> xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+        xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+            cell_id: xai_grok_code_mode_protocol::CellId::new(cell.to_string()),
+            runtime_tool_call_id: "t1".to_string(),
+            tool_name: xai_grok_code_mode_protocol::ToolName::plain("todo_write"),
+            tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+            input: Some(serde_json::json!({
+                "todos": [{"id": "t1", "content": "do", "status": "completed"}]
+            })),
+        }
+    }
+
+    fn install_client_pre_tool_use_hook(actor: &SessionActor, callback_ids: &[&str]) {
+        let mut client_hooks = crate::extensions::hooks::ClientHooks::new();
+        client_hooks.insert(
+            xai_grok_hooks::event::HookEventName::PreToolUse,
+            vec![crate::extensions::hooks::ClientHookGroup {
+                matcher: None,
+                callback_ids: callback_ids.iter().map(|s| s.to_string()).collect(),
+                timeout: None,
+            }],
+        );
+        *actor.client_hooks.borrow_mut() = client_hooks;
+    }
+
+    /// An actor that can actually dispatch `todo_write`.
+    async fn dispatching_actor(
+        gateway_tx: tokio::sync::mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
+    ) -> Arc<SessionActor> {
+        let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+        actor
+            .workspace_ops
+            .bind_local_session(
+                &actor.session_id_string(),
+                actor.tool_context.cwd.as_path().to_path_buf(),
+                actor.tool_context.hunk_tracker_handle.clone(),
+                actor.agent.borrow().tool_bridge().toolset(),
+                None,
+            )
+            .expect("bind_local_session must succeed");
+        Arc::new(actor)
+    }
+
+    /// Finding 3: the client's `PreToolUse` gate now covers nested calls too.
+    /// A deny rejects the cell's promise — and, unlike the top-level path,
+    /// leaves the conversation untouched: a nested call must never write a
+    /// paired `tool_result`, which is exactly why the gate used to be skipped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_call_honors_a_client_pre_tool_use_deny() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = dispatching_actor(gateway_tx).await;
+                install_client_pre_tool_use_hook(&actor, &["cb_0"]);
+
+                let seen_input = Arc::new(std::sync::Mutex::new(None));
+                let recorder = Arc::clone(&seen_input);
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                                let params: serde_json::Value =
+                                    serde_json::from_str(args.request.params.get()).unwrap();
+                                *recorder.lock().unwrap() = Some(params["toolInput"].clone());
+                                let deny: Arc<serde_json::value::RawValue> =
+                                    serde_json::value::to_raw_value(&serde_json::json!({
+                                        "decision": "deny",
+                                        "systemMessage": "client policy forbids todo_write",
+                                    }))
+                                    .unwrap()
+                                    .into();
+                                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(deny)));
+                            }
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let generation = actor.tool_context.code_mode.current_generation();
+                let err = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    actor.run_code_mode_nested_call(&nested_call("1"), generation),
+                )
+                .await
+                .expect("the nested gate must not hang")
+                .expect_err("a client deny must reject the nested call");
+
+                assert!(err.contains("client:cb_0"), "{err}");
+                assert!(err.contains("client policy forbids todo_write"), "{err}");
+                assert_eq!(
+                    seen_input.lock().unwrap().as_ref().map(|v| v["todos"][0]["id"].clone()),
+                    Some(serde_json::json!("t1")),
+                    "the client gate must receive the nested call's real input"
+                );
+                assert!(
+                    actor
+                        .chat_state_handle
+                        .get_conversation()
+                        .await
+                        .iter()
+                        .all(|item| !matches!(item, ConversationItem::ToolResult(_))),
+                    "a nested deny must not write a paired tool_result"
+                );
+            })
+            .await;
+    }
+
+    /// The same gate answering `continue` lets the nested call through, so the
+    /// deny above is the hook's decision and not the plumbing failing closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_call_proceeds_when_the_client_gate_allows() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = dispatching_actor(gateway_tx).await;
+                install_client_pre_tool_use_hook(&actor, &["cb_0"]);
+
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                                let ok: Arc<serde_json::value::RawValue> =
+                                    serde_json::value::to_raw_value(&serde_json::json!({
+                                        "decision": "continue",
+                                    }))
+                                    .unwrap()
+                                    .into();
+                                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(ok)));
+                            }
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let generation = actor.tool_context.code_mode.current_generation();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    actor.run_code_mode_nested_call(&nested_call("1"), generation),
+                )
+                .await
+                .expect("the nested gate must not hang");
+                assert!(result.is_ok(), "an allowed nested call must run: {result:?}");
+            })
+            .await;
+    }
+
+    /// A registry `PreToolUse` rewrite is re-parsed and then re-published to
+    /// the client gate: the client sees the *rewritten* input, not the one the
+    /// cell sent. Without rebuilding the envelope after the rewrite, a client
+    /// policy would be deciding on input that no longer exists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_registry_rewrite_reaches_the_client_gate() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut actor = {
+                    let (persistence_tx, _persistence_rx) =
+                        tokio::sync::mpsc::unbounded_channel();
+                    create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await
+                };
+                actor.hook_resolved_workspace_root = "/tmp".to_string();
+                *actor.agent.borrow_mut() = test_grok_build_agent_with_todo().await;
+                *actor.hook_registry.borrow_mut() = Some(Arc::new(
+                    crate::session::acp_session::client_hooks_tests::file_registry_with_spec(
+                        xai_grok_hooks::event::HookEventName::PreToolUse,
+                        "echo '{\"hookSpecificOutput\":{\"updatedInput\":{\"todos\":\
+                         [{\"id\":\"rewritten\",\"content\":\"by the hook\",\
+                         \"status\":\"pending\"}]}}}'",
+                    ),
+                ));
+                let actor = Arc::new(actor);
+                install_client_pre_tool_use_hook(&actor, &["cb_0"]);
+
+                let seen_input = Arc::new(std::sync::Mutex::new(None));
+                let recorder = Arc::clone(&seen_input);
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = gateway_rx.recv().await {
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                                let params: serde_json::Value =
+                                    serde_json::from_str(args.request.params.get()).unwrap();
+                                if params["hookEventName"] == "pre_tool_use" {
+                                    *recorder.lock().unwrap() = Some(params["toolInput"].clone());
+                                }
+                                let deny: Arc<serde_json::value::RawValue> =
+                                    serde_json::value::to_raw_value(&serde_json::json!({
+                                        "decision": "deny",
+                                    }))
+                                    .unwrap()
+                                    .into();
+                                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(deny)));
+                            }
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let generation = actor.tool_context.code_mode.current_generation();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    actor.run_code_mode_nested_call(&nested_call("1"), generation),
+                )
+                .await
+                .expect("the nested gate must not hang");
+
+                let seen = seen_input.lock().unwrap().clone();
+                assert_eq!(
+                    seen.as_ref().map(|v| v["todos"][0]["id"].clone()),
+                    Some(serde_json::json!("rewritten")),
+                    "the client gate must see the rewritten input, got {seen:?}"
+                );
+            })
+            .await;
+    }
+
+    /// Finding 4, the TOCTOU itself: the runtime is invalidated *after* the
+    /// call was admitted and *while* it is parked in the client gate. The
+    /// dequeue-time check has already passed, so only the re-check at the
+    /// dispatch boundary can stop the write.
+    ///
+    /// The client gate doubles as the barrier: the responder holds its reply
+    /// until the test has invalidated the runtime, then answers `continue`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_call_is_fenced_when_invalidated_while_it_waits() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = dispatching_actor(gateway_tx).await;
+                install_client_pre_tool_use_hook(&actor, &["barrier_cb"]);
+
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_local(async move {
+                    let mut entered_tx = Some(entered_tx);
+                    let mut release_rx = Some(release_rx);
+                    while let Some(msg) = gateway_rx.recv().await {
+                        match msg {
+                            xai_acp_lib::AcpClientMessage::ExtMethod(args) => {
+                                if let Some(tx) = entered_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(rx) = release_rx.take() {
+                                    let _ = rx.await;
+                                }
+                                let ok: Arc<serde_json::value::RawValue> =
+                                    serde_json::value::to_raw_value(&serde_json::json!({
+                                        "decision": "continue",
+                                    }))
+                                    .unwrap()
+                                    .into();
+                                let _ = args.response_tx.send(Ok(acp::ExtResponse::new(ok)));
+                            }
+                            xai_acp_lib::AcpClientMessage::SessionNotification(args) => {
+                                let _ = args.response_tx.send(Ok(()));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let generation = actor.tool_context.code_mode.current_generation();
+                let call_actor = Arc::clone(&actor);
+                let call = tokio::task::spawn_local(async move {
+                    call_actor
+                        .run_code_mode_nested_call(&nested_call("1"), generation)
+                        .await
+                });
+
+                // The call is admitted and now parked inside the gate.
+                entered_rx.await.expect("the gate must be entered");
+                // Model switch / cancel / rewind lands here.
+                actor
+                    .tool_context
+                    .code_mode
+                    .shutdown_detached("test invalidation");
+                let _ = release_tx.send(());
+
+                let err = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+                    .await
+                    .expect("the fenced call must resolve")
+                    .expect("the nested task must not panic")
+                    .expect_err("a call admitted under a dead runtime must not dispatch");
+                assert!(
+                    err.contains("code mode runtime was invalidated"),
+                    "expected the dispatch-boundary fence, got: {err}"
+                );
+            })
+            .await;
+    }
+
+    /// Finding 4, explicit rewind (`SessionCommand::Rewind` → `handle_rewind`):
+    /// committing a rewind invalidates Code Mode before it touches anything,
+    /// so the runtime — and every yielded cell and `store()` value the
+    /// discarded turns created — is gone, and parked nested work is fenced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_rewind_shuts_code_mode_down() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+                let (_handle, bridge) = actor
+                    .tool_context
+                    .code_mode
+                    .ensure_runtime()
+                    .expect("the code mode runtime must initialize");
+                let generation = bridge.expect("a fresh runtime yields its bridge").1;
+                assert!(actor.tool_context.code_mode.handle().is_some());
+
+                let response = actor
+                    .handle_rewind(crate::session::RewindRequest {
+                        target_prompt_index: 0,
+                        mode: crate::session::RewindMode::FilesOnly,
+                        force: true,
+                    })
+                    .await
+                    .expect("rewind must not error");
+                assert!(response.success, "{response:?}");
+
+                assert!(
+                    actor.tool_context.code_mode.current_generation() > generation,
+                    "an explicit rewind must fence work admitted before it"
+                );
+                assert!(
+                    actor.tool_context.code_mode.handle().is_none(),
+                    "an explicit rewind must drop the runtime, its cells, and its store()"
+                );
+            })
+            .await;
+    }
+
+    /// Finding 4, legacy rewind branch (`cancel_running_task` with
+    /// `RewindIfNoOutput { prompt_id: None }`): it used to only abort the turn
+    /// and terminate live cells, keeping the runtime and its `store()` state
+    /// alive across a history rewind. Now it disposes of the whole runtime,
+    /// matching the named cancel-history branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_rewind_cancel_shuts_code_mode_down() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+                let (_handle, bridge) = actor
+                    .tool_context
+                    .code_mode
+                    .ensure_runtime()
+                    .expect("the code mode runtime must initialize");
+                let generation = bridge.expect("a fresh runtime yields its bridge").1;
+
+                // A rewindable in-flight turn with a user row at the front.
+                *actor
+                    .current_prompt_id
+                    .lock()
+                    .expect("current_prompt_id mutex poisoned") = Some("rw".to_string());
+                let (item, _rx) = crate::session::acp_session::support::user_item_with_rx(
+                    "rw", "owner",
+                );
+                {
+                    let mut state = actor.state.lock().await;
+                    state.rewindable = true;
+                    state.running_task = Some(AgentTask {
+                        prompt_id: "rw".into(),
+                        handle: tokio::task::spawn_local(async {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        })
+                        .abort_handle(),
+                    });
+                    state.pending_inputs.push_back(item);
+                }
+
+                let _ = actor
+                    .cancel_running_task(crate::session::CancelOptions {
+                        history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                            prompt_id: None,
+                        },
+                        user_initiated: true,
+                        ..Default::default()
+                    })
+                    .await;
+
+                assert!(
+                    actor.tool_context.code_mode.current_generation() > generation,
+                    "a legacy rewind must fence work admitted before it"
+                );
+                assert!(
+                    actor.tool_context.code_mode.handle().is_none(),
+                    "a legacy rewind must drop the runtime, its cells, and its store()"
+                );
+            })
+            .await;
     }
 }

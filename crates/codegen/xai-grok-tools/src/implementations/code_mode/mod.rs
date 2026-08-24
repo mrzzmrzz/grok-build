@@ -254,6 +254,36 @@ fn output_parts(content_items: Vec<FunctionCallOutputContentItem>) -> Vec<CodeMo
         .collect()
 }
 
+/// Estimated token cost of one part, in the same units
+/// [`truncate_parts_to_budget`] spends. Kept as one function so the
+/// pre-pass in [`budgeted_parts`] and the truncation loop can never drift.
+fn part_cost(part: &CodeModePart) -> u64 {
+    match part {
+        CodeModePart::Image { .. } => xai_token_estimation::IMAGE_TOKEN_ESTIMATE,
+        CodeModePart::Text { text } => xai_token_estimation::estimate_tokens(text),
+    }
+}
+
+/// Total estimated cost of an ordered part list.
+fn parts_cost(parts: &[CodeModePart]) -> u64 {
+    parts.iter().map(part_cost).sum()
+}
+
+/// Longest prefix of `text` whose byte length is at most `max_bytes`, cut on a
+/// char boundary. Byte- (not char-) bounded because `estimate_tokens` counts
+/// bytes: taking N *chars* of multi-byte text can cost up to 4N tokens' worth
+/// of bytes and blow the cap that the caller just computed.
+fn clip_to_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Enforce the advertised per-call output token budget (`exec`'s
 /// `max_output_tokens` / `wait`'s `max_tokens`) over the ordered parts.
 /// Text is estimated at [`xai_token_estimation::BYTES_PER_TOKEN`] bytes per
@@ -285,11 +315,13 @@ fn truncate_parts_to_budget(
                     out.push(CodeModePart::Text { text });
                     continue;
                 }
-                let keep_chars =
+                let keep_bytes =
                     xai_token_estimation::estimate_chars(budget.saturating_sub(used)) as usize;
-                let clipped: String = text.chars().take(keep_chars).collect();
+                let clipped = clip_to_bytes(&text, keep_bytes);
                 if !clipped.is_empty() {
-                    out.push(CodeModePart::Text { text: clipped });
+                    out.push(CodeModePart::Text {
+                        text: clipped.to_string(),
+                    });
                 }
                 return (out, true);
             }
@@ -298,18 +330,50 @@ fn truncate_parts_to_budget(
     (out, false)
 }
 
+/// The note appended when output had to be dropped. Its own cost counts
+/// against the budget (see [`budgeted_parts`]).
+fn truncation_marker(max_tokens: usize) -> String {
+    format!("[output truncated at the requested budget of {max_tokens} tokens]")
+}
+
+/// Apply the advertised budget as a **hard** cap: the estimated cost of the
+/// returned parts is never greater than `max_tokens`.
+///
+/// The truncation marker is part of the output, so it is paid for out of the
+/// same budget rather than appended on top of an already-exhausted one (which
+/// is how a small budget used to return *more* than it asked for). Order of
+/// operations:
+///
+/// 1. Everything fits ⇒ return it untouched, no marker (a budget that is not
+///    exceeded must behave exactly as before).
+/// 2. Otherwise reserve the marker's cost, clip the content to what is left,
+///    and append the marker: content + marker ≤ `max_tokens`.
+/// 3. The marker alone does not fit ⇒ return only the prefix of it that does
+///    (nothing at all when the budget rounds down to zero tokens).
 fn budgeted_parts(
     content_items: Vec<FunctionCallOutputContentItem>,
     max_tokens: usize,
 ) -> Vec<CodeModePart> {
-    let (mut parts, truncated) = truncate_parts_to_budget(output_parts(content_items), max_tokens);
-    if truncated {
-        parts.push(CodeModePart::Text {
-            text: format!(
-                "[output truncated at the requested budget of {max_tokens} tokens]"
-            ),
-        });
+    let parts = output_parts(content_items);
+    let budget = max_tokens as u64;
+    if parts_cost(&parts) <= budget {
+        return parts;
     }
+    let marker = truncation_marker(max_tokens);
+    let marker_cost = xai_token_estimation::estimate_tokens(&marker);
+    if marker_cost > budget {
+        let keep_bytes = xai_token_estimation::estimate_chars(budget) as usize;
+        let clipped = clip_to_bytes(&marker, keep_bytes);
+        if clipped.is_empty() {
+            return Vec::new();
+        }
+        return vec![CodeModePart::Text {
+            text: clipped.to_string(),
+        }];
+    }
+    let (mut parts, _) =
+        truncate_parts_to_budget(parts, budget.saturating_sub(marker_cost) as usize);
+    parts.push(CodeModePart::Text { text: marker });
     parts
 }
 
@@ -618,26 +682,115 @@ mod tests {
         assert_eq!(kept.len(), 3);
     }
 
-    /// The exec pragma budget applies to the real cell output.
+    fn text_item(text: &str) -> FunctionCallOutputContentItem {
+        FunctionCallOutputContentItem::InputText {
+            text: text.to_string(),
+        }
+    }
+
+    /// The advertised budget is a hard cap: the truncation marker is paid for
+    /// out of the same budget, so no `max_tokens` ever returns more than it
+    /// asked for. Boundaries: 0, "smaller than the marker", "exactly the
+    /// marker", and "exactly fits" (no marker at all).
+    #[test]
+    fn budgeted_parts_never_exceeds_the_requested_budget() {
+        let big = || vec![text_item(&"y".repeat(4000))]; // ~1000 tokens
+
+        // 0 tokens: nothing at all can be returned, not even the marker.
+        let parts = budgeted_parts(big(), 0);
+        assert_eq!(parts_cost(&parts), 0, "{parts:?}");
+        assert!(parts.is_empty(), "{parts:?}");
+
+        // Tiny budgets: only a prefix of the marker survives, and it fits.
+        for budget in [1usize, 2, 5, 12] {
+            let parts = budgeted_parts(big(), budget);
+            assert!(
+                parts_cost(&parts) <= budget as u64,
+                "budget {budget} overflowed: {parts:?}"
+            );
+            assert_eq!(parts.len(), 1, "budget {budget}: {parts:?}");
+            let CodeModePart::Text { text } = &parts[0] else {
+                panic!("budget {budget} must yield text: {parts:?}");
+            };
+            assert!(
+                truncation_marker(budget).starts_with(text.as_str()),
+                "budget {budget} must return a prefix of the marker, got {text:?}"
+            );
+        }
+
+        // Exactly the marker's cost: the marker is returned whole and no
+        // content rides along with it.
+        let marker_only = truncation_marker(0);
+        let exact = xai_token_estimation::estimate_tokens(&marker_only) as usize;
+        let parts = budgeted_parts(big(), exact);
+        assert!(parts_cost(&parts) <= exact as u64, "{parts:?}");
+
+        // Room for content + marker: both are present and the total still fits.
+        let parts = budgeted_parts(big(), 100);
+        assert!(parts_cost(&parts) <= 100, "{parts:?}");
+        assert!(parts.len() >= 2, "{parts:?}");
+        assert!(
+            matches!(parts.last(), Some(CodeModePart::Text { text })
+                if text == &truncation_marker(100)),
+            "{parts:?}"
+        );
+
+        // Exactly fits: untouched, and no marker is appended.
+        let parts = budgeted_parts(vec![text_item(&"z".repeat(40))], 10);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(matches!(&parts[0], CodeModePart::Text { text } if text.len() == 40));
+
+        // Under budget: untouched, no marker.
+        let parts = budgeted_parts(vec![text_item("short")], 20_000);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(matches!(&parts[0], CodeModePart::Text { text } if text == "short"));
+    }
+
+    /// A clip lands on a char boundary and stays inside the *byte* budget the
+    /// estimator counts in — taking N chars of multi-byte text would cost up
+    /// to 4N bytes and break the cap.
+    #[test]
+    fn multibyte_text_is_clipped_within_the_byte_budget() {
+        // 40 chars x 3 bytes = 120 bytes ≈ 30 tokens.
+        let text = "。".repeat(40);
+        let (kept, truncated) = truncate_parts_to_budget(vec![CodeModePart::Text { text }], 4);
+        assert!(truncated);
+        assert!(parts_cost(&kept) <= 4, "{kept:?}");
+        let CodeModePart::Text { text } = &kept[0] else {
+            panic!("expected text: {kept:?}");
+        };
+        // 16 bytes of budget, clipped down to the 15-byte char boundary.
+        assert_eq!(text.len(), 15);
+        assert!(text.chars().all(|c| c == '。'));
+    }
+
+    /// The exec pragma budget applies to the real cell output, as a hard cap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exec_pragma_budget_truncates_real_output() {
-        let handle = test_handle();
-        let output = xai_tool_runtime::Tool::run(
-            &ExecTool,
-            ctx_with(Some(handle)),
-            ExecToolInput {
-                source: "// @exec: {\"max_output_tokens\": 2}\ntext('a'.repeat(400));"
-                    .to_string(),
-            },
-        )
-        .await
-        .expect("exec should complete");
+        async fn exec_with_budget(budget: usize) -> CodeModeCallOutput {
+            let handle = test_handle();
+            xai_tool_runtime::Tool::run(
+                &ExecTool,
+                ctx_with(Some(handle)),
+                ExecToolInput {
+                    source: format!(
+                        "// @exec: {{\"max_output_tokens\": {budget}}}\ntext('a'.repeat(400));"
+                    ),
+                },
+            )
+            .await
+            .expect("exec should complete")
+        }
+
+        // Room for content + marker: both land, and the whole result fits.
+        let output = exec_with_budget(50).await;
         assert_eq!(output.status, CodeModeCellStatus::Completed);
         let rendered = output.to_prompt_format();
         assert!(
-            rendered.contains("[output truncated at the requested budget of 2 tokens]"),
+            rendered.contains("[output truncated at the requested budget of 50 tokens]"),
             "{rendered}"
         );
+        assert!(parts_cost(&output.parts) <= 50, "{:?}", output.parts);
         let text_len: usize = output
             .parts
             .iter()
@@ -646,7 +799,20 @@ mod tests {
                 _ => None,
             })
             .sum();
-        assert!(text_len <= 8, "clipped to the 2-token budget, got {text_len}");
+        assert!(text_len > 0, "content should survive a 50-token budget");
+
+        // A budget too small for the marker itself returns only a prefix of
+        // it — never more than the caller asked for (maintenance finding).
+        let output = exec_with_budget(2).await;
+        assert!(parts_cost(&output.parts) <= 2, "{:?}", output.parts);
+        assert!(
+            output.parts.iter().all(|p| matches!(
+                p,
+                CodeModePart::Text { text } if truncation_marker(2).starts_with(text.as_str())
+            )),
+            "{:?}",
+            output.parts
+        );
     }
 
     fn test_handle() -> CodeModeHandle {

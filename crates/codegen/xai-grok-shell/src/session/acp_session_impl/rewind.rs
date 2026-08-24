@@ -281,6 +281,23 @@ impl SessionActor {
 
         // ── Commit mode (force=true): execute the rewind ─────────────
 
+        // Invalidate Code Mode *before* anything is reverted or truncated
+        // (finding 4). `shutdown_detached` bumps the runtime generation
+        // synchronously, so a nested call already parked in a hook, permission
+        // prompt, or path lock is fenced at its dispatch boundary and cannot
+        // write into the state this rewind is about to restore. It also drops
+        // the runtime — and with it every yielded cell and all `store()` state
+        // the discarded turns created, which would otherwise stay live and
+        // callable after the history that produced it is gone. The runtime is
+        // recreated lazily at the next code-mode turn.
+        //
+        // Unconditional: a `FilesOnly` rewind reverts exactly the files a live
+        // cell may still be writing, and a `ConversationOnly` rewind discards
+        // the turns whose `store()` state the runtime is holding.
+        self.tool_context
+            .code_mode
+            .shutdown_detached("explicit rewind");
+
         // Execute file revert
         let mut reverted_files = Vec::new();
         if wants_file_revert {

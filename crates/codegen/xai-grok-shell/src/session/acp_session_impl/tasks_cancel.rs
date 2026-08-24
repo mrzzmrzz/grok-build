@@ -627,6 +627,14 @@ impl SessionActor {
                 if let Some(task) = state.running_task.take() {
                     self.abort_turn_task(&task, turn_epoch);
                 }
+                // Same disposal as the named branch above: a rewind discards
+                // the turn's effects wholesale, so terminating live cells is
+                // not enough — the runtime (and the rewound turn's `store()`
+                // state) goes too, and the synchronous generation bump fences
+                // any nested call still parked before its dispatch boundary.
+                self.tool_context
+                    .code_mode
+                    .shutdown_detached("history rewind");
                 if let Some(gate) = &self.tool_context.task_wake_suppressed {
                     gate.set(false);
                 }

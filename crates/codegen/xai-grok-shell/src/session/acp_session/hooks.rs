@@ -43,6 +43,23 @@ const CLIENT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// silently drop a ported goal policy that runs a build or test suite.
 const CLIENT_STOP_GATE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// A client `PreToolUse` deny, decoupled from what the caller does about it.
+///
+/// The top-level tool loop turns one of these into a `deny_tool` (which pairs
+/// a `tool_result` with the model's call); the Code Mode nested path turns it
+/// into a rejected JS promise and must never touch the conversation. Both
+/// consume the identical decision — see
+/// [`SessionActor::pre_tool_use_client_denial`].
+pub(crate) struct ClientPreToolUseDenial {
+    /// The resolved tool the matcher gated (the MCP target for a
+    /// meta-dispatch call, otherwise the wire name).
+    pub tool_name: String,
+    /// `client:<callbackId>` — names the specific callback that denied.
+    pub hook_name: String,
+    /// The callback's `systemMessage`, or a generic fallback.
+    pub reason: String,
+}
+
 /// Outcome of the `x.ai/hooks/run` reverse request, before interpreting it as a
 /// decision. Separate so [`classify`] stays pure and unit-testable.
 enum ReverseOutcome {
@@ -270,29 +287,64 @@ impl SessionActor {
     /// same payload file hooks and observe events receive).
     ///
     /// Returns `Some(ToolLoop::HookDenied)` on the first deny, else `None`.
+    ///
+    /// Top-level path only: a deny here writes a paired `tool_result` into the
+    /// conversation (`deny_tool`). Callers that must not do that — Code Mode
+    /// nested calls, whose deny rejects a JS promise instead — take the same
+    /// decision through [`Self::pre_tool_use_client_denial`] and supply their
+    /// own effect.
     pub(super) async fn run_pre_tool_use_client_hook(
         &self,
         call: &ToolCallResponse,
         tool_call_id: &acp::ToolCallId,
         envelope: &HookEventEnvelope,
     ) -> Result<Option<ToolLoop>, acp::Error> {
-        // Clone the matched groups so we don't hold the `client_hooks` borrow across the
-        // dispatch awaits below.
-        let Some(groups) = self
-            .client_hooks
-            .borrow()
-            .get(&HookEventName::PreToolUse)
-            .cloned()
+        let Some(denial) = self
+            .pre_tool_use_client_denial(call.function.name.as_str(), envelope)
+            .await
         else {
             return Ok(None);
         };
+        Ok(Some(
+            self.deny_tool(
+                &call.id,
+                tool_call_id,
+                denial.tool_name,
+                denial.hook_name,
+                denial.reason,
+            )
+            .await?,
+        ))
+    }
+
+    /// The client `PreToolUse` gate's decision, with no session side effects.
+    ///
+    /// Fires `x.ai/hooks/run` once per matching callback and returns the first
+    /// deny. What a deny *does* is the caller's business: the top-level path
+    /// turns it into a `deny_tool` (paired `tool_result` + ACP annotation), the
+    /// Code Mode nested path into a rejected promise. Splitting the decision
+    /// from the effect is what lets both consume the same client policy
+    /// (finding 3); before this, nested calls skipped the gate entirely
+    /// because the only available consumer wrote a top-level `tool_result`.
+    pub(super) async fn pre_tool_use_client_denial(
+        &self,
+        fallback_tool_name: &str,
+        envelope: &HookEventEnvelope,
+    ) -> Option<ClientPreToolUseDenial> {
+        // Clone the matched groups so we don't hold the `client_hooks` borrow across the
+        // dispatch awaits below.
+        let groups = self
+            .client_hooks
+            .borrow()
+            .get(&HookEventName::PreToolUse)
+            .cloned()?;
         // Match on the resolved target (in the envelope) so a client deny matcher
         // keyed on the real MCP tool gates a meta-dispatch call, matching the
         // observe path (`notify_client_hooks`). Equals `function.name` otherwise.
         let tool_name = envelope
             .payload
             .match_value()
-            .unwrap_or(call.function.name.as_str());
+            .unwrap_or(fallback_tool_name);
 
         let mut pending = self.client_gate_responses(&groups, Some(tool_name), envelope);
         while let Some((callback_id, response, _elapsed, _outcome)) = pending.next().await {
@@ -301,21 +353,16 @@ impl SessionActor {
                     .system_message
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "blocked by client hook".to_string());
-                return Ok(Some(
-                    self.deny_tool(
-                        &call.id,
-                        tool_call_id,
-                        tool_name.to_owned(),
-                        // Name the specific callback so telemetry / the UI annotation can
-                        // attribute the block, not collapse every client hook to "client".
-                        format!("client:{callback_id}"),
-                        reason,
-                    )
-                    .await?,
-                ));
+                return Some(ClientPreToolUseDenial {
+                    tool_name: tool_name.to_owned(),
+                    // Name the specific callback so telemetry / the UI annotation can
+                    // attribute the block, not collapse every client hook to "client".
+                    hook_name: format!("client:{callback_id}"),
+                    reason,
+                });
             }
         }
-        Ok(None)
+        None
     }
 
     /// Run the client `Stop`/`SubagentStop` gate for a turn-end envelope.
