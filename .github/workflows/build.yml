@@ -3,21 +3,57 @@ name: build
 on:
   push:
     branches: [main, codex/sync-open-grok-codex]
+  pull_request:
+    branches: [main, codex/sync-open-grok-codex]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fast validation for pull requests and pushes: workspace check plus the
+  # test suites that are deterministic on clean runners. The shell suite is
+  # excluded here — it carries environment-sensitive tests (real $GROK_HOME,
+  # deep-stack, timing) that need a curated harness.
+  test:
+    name: check-and-test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc 29.3
+        run: |
+          curl -sSfL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip"
+          unzip -q /tmp/protoc.zip -d "$HOME/protoc"
+          echo "PROTOC=$HOME/protoc/bin/protoc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Workspace check
+        run: cargo check --locked --workspace
+
+      - name: Core test suites
+        run: |
+          cargo test --locked \
+            -p xai-grok-sampling-types \
+            -p xai-grok-sampler \
+            -p xai-chat-state \
+            -p xai-grok-code-mode-protocol \
+            -p xai-grok-code-mode \
+            -p xai-grok-pager-render
+
   build:
     name: ${{ matrix.name }}
+    # Release artifacts only for pushes and manual runs; PRs get the test job.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macos-aarch64
-            runner: macos-14
+            # macos-14 is scheduled for removal on 2026-11-02.
+            runner: macos-15
             protoc: protoc-29.3-osx-aarch_64.zip
           - name: linux-x86_64
             runner: ubuntu-22.04
