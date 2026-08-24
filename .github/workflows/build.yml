@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main, codex/sync-open-grok-codex]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            runner: macos-14
+            protoc: protoc-29.3-osx-aarch_64.zip
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            protoc: protoc-29.3-linux-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same protoc release the repo's dotslash wrapper (bin/protoc) pins.
+      - name: Install protoc 29.3
+        run: |
+          curl -sSfL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/${{ matrix.protoc }}"
+          unzip -q /tmp/protoc.zip -d "$HOME/protoc"
+          echo "PROTOC=$HOME/protoc/bin/protoc" >> "$GITHUB_ENV"
+
+      # rustup picks up rust-toolchain.toml (1.94.0 + pinned targets) on the
+      # first cargo invocation; no explicit toolchain action needed.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build TUI (release)
+        run: cargo build --release --locked -p xai-grok-pager-bin
+
+      - name: Smoke-run
+        run: ./target/release/xai-grok-pager --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-${{ matrix.name }}
+          path: target/release/xai-grok-pager
+          if-no-files-found: error
