@@ -52,6 +52,16 @@ jobs:
             -p xai-grok-code-mode \
             -p xai-grok-pager-render
 
+      # The shell/pager/tools suites carry environment-sensitive tests that
+      # need a curated harness, but their #[cfg(test)] code must at least
+      # keep compiling — `cargo check --workspace` alone never builds it.
+      - name: Compile remaining test suites (no run)
+        run: |
+          cargo test --locked --no-run \
+            -p xai-grok-shell \
+            -p xai-grok-tools \
+            -p xai-grok-pager
+
   build:
     name: ${{ matrix.name }}
     # Release artifacts only for pushes and manual runs; PRs get the test job.
