@@ -74,6 +74,38 @@ fn prefire_lead_percent() -> u64 {
 fn comp_hash_changed(previous: Option<&str>, current: Option<&str>) -> bool {
     matches!((previous, current), (Some(prev), Some(cur)) if prev != cur)
 }
+
+fn filter_mcp_server_summaries_for_compaction(
+    ever_used_codex: bool,
+    summaries: Vec<crate::session::helpers::compaction_context::CompactionServerSummary>,
+) -> Vec<crate::session::helpers::compaction_context::CompactionServerSummary> {
+    if ever_used_codex {
+        Vec::new()
+    } else {
+        summaries
+    }
+}
+
+#[cfg(test)]
+mod codex_compaction_reminder_tests {
+    use super::*;
+    use crate::session::helpers::compaction_context::CompactionServerSummary;
+
+    #[test]
+    fn codex_compaction_drops_grok_mcp_server_reminders() {
+        let servers = vec![CompactionServerSummary {
+            name: "linear".to_string(),
+            tool_count: 3,
+            description: Some("issues".to_string()),
+        }];
+
+        assert!(filter_mcp_server_summaries_for_compaction(true, servers.clone()).is_empty());
+        assert_eq!(
+            filter_mcp_server_summaries_for_compaction(false, servers).len(),
+            1
+        );
+    }
+}
 fn compaction_mode_label(
     mode: xai_chat_state::CompactionMode,
 ) -> xai_grok_telemetry::events::CompactionModeLabel {
@@ -1757,7 +1789,8 @@ impl SessionActor {
                         use xai_grok_tools::implementations::search_tool::{
                             sanitize_description, truncate_description,
                         };
-                        self.connected_server_summaries()
+                        let summaries = self
+                            .connected_server_summaries()
                             .into_iter()
                             .map(|s| {
                                 let desc = s
@@ -1770,7 +1803,11 @@ impl SessionActor {
                                     description: desc,
                                 }
                             })
-                            .collect()
+                            .collect();
+                        filter_mcp_server_summaries_for_compaction(
+                            self.chat_state_handle.ever_used_codex_now(),
+                            summaries,
+                        )
                     };
                     let todos = {
                         use crate::session::helpers::compaction_context::{

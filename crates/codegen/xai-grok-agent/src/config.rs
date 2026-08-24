@@ -1576,6 +1576,11 @@ impl AgentDefinition {
         Self {
             tool_config: codex_toolset(),
             system_prompt: TemplateOverride::Codex,
+            // The Codex preset is a closed execution surface. Do not append
+            // Grok-only memory, media, LSP, web, or OpenCode fallback tools
+            // from feature flags; skills and live MCP tools are wired through
+            // their dedicated runtime paths.
+            inject_default_tools: false,
             ..Self::base(BuiltinAgentName::Codex, "Codex toolset and prompt")
         }
     }
@@ -1757,6 +1762,10 @@ mod tests {
         }
         assert!(!ids.iter().any(|id| id.ends_with(":search_tool")));
         assert!(!ids.iter().any(|id| id.ends_with(":use_tool")));
+        assert!(
+            !AgentDefinition::codex().inject_default_tools,
+            "Codex must not receive Grok-only feature-flag tool injections"
+        );
     }
     #[test]
     fn presets_select_distinct_toolsets_by_size() {
