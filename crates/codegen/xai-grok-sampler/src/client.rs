@@ -94,9 +94,9 @@ impl GrokRequestHeaders<'_> {
 /// stamps `turn_state` from a Codex response header).
 ///
 /// `x-codex-beta-features: remote_compaction_v2` is deliberately NOT sent
-/// here yet: remote compaction is unimplemented and the capability is not
-/// declared. When compaction lands, this is the injection point for that
-/// header.
+/// here (ordinary turns): the beta header rides only an explicit
+/// remote-compaction request — see
+/// [`SamplingClient::codex_remote_compaction_v2_headers`].
 fn apply_codex_turn_state(
     builder: reqwest::RequestBuilder,
     profile: ProviderProfile,
@@ -108,6 +108,89 @@ fn apply_codex_turn_state(
     match turn_state.filter(|s| !s.is_empty()) {
         Some(state) => builder.header("x-codex-turn-state", state),
         None => builder,
+    }
+}
+
+/// Codex beta feature opt-in header name.
+pub const X_CODEX_BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
+/// Beta feature token for the streaming remote-compaction v2 protocol.
+pub const REMOTE_COMPACTION_V2_FEATURE: &str = "remote_compaction_v2";
+
+/// Merge `feature` into a comma-separated `x-codex-beta-features` value:
+/// existing entries keep their order, the feature is appended once (never
+/// duplicated), and stray whitespace/empty segments are dropped.
+fn merge_codex_beta_features(existing: Option<&str>, feature: &str) -> String {
+    let mut features: Vec<&str> = existing
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !features.contains(&feature) {
+        features.push(feature);
+    }
+    features.join(",")
+}
+
+/// Shape an already-serialized Responses request body into the Codex
+/// remote-compaction-v2 wire form, in place:
+///
+/// - retains only the allow-listed request fields (`model`, `input`,
+///   `instructions`, `tools`, `parallel_tool_calls`, `reasoning`,
+///   `service_tier`, `prompt_cache_key`, `text`, `include`, `store`,
+///   `stream`), dropping everything else — notably `temperature`,
+///   `max_output_tokens`, and `previous_response_id` (v2 replays the full
+///   input and must not chain response ids);
+/// - forces `store: false` and `stream: true`;
+/// - sets `instructions` to the compaction instructions;
+/// - guarantees `include` carries `reasoning.encrypted_content`;
+/// - appends `{"type": "compaction_trigger"}` as the **final** `input`
+///   element (the server-side trigger for the compaction pass).
+///
+/// The body must already be provider-isolated (no xAI hosted tools /
+/// `x-grok` metadata): this runs after the profile-gated serialization
+/// chokepoints, not instead of them.
+pub fn shape_codex_remote_compaction_v2_body(body: &mut serde_json::Value, instructions: &str) {
+    const RETAINED: [&str; 12] = [
+        "model",
+        "input",
+        "instructions",
+        "tools",
+        "parallel_tool_calls",
+        "reasoning",
+        "service_tier",
+        "prompt_cache_key",
+        "text",
+        "include",
+        "store",
+        "stream",
+    ];
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+    map.retain(|key, value| RETAINED.contains(&key.as_str()) && !value.is_null());
+    map.insert("store".to_owned(), serde_json::Value::Bool(false));
+    map.insert("stream".to_owned(), serde_json::Value::Bool(true));
+    map.insert(
+        "instructions".to_owned(),
+        serde_json::Value::String(instructions.to_owned()),
+    );
+    let include = map
+        .entry("include")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(entries) = include.as_array_mut() {
+        let encrypted = serde_json::Value::String("reasoning.encrypted_content".to_owned());
+        if !entries.contains(&encrypted) {
+            entries.push(encrypted);
+        }
+    }
+    let input = map
+        .entry("input")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(items) = input.as_array_mut() {
+        items.push(serde_json::json!({ "type": "compaction_trigger" }));
     }
 }
 
@@ -931,6 +1014,55 @@ impl SamplingClient {
                 .map(|s| bearer_suffix(&s).to_string());
         }
         Self::sent_fragment_from_headers(&self.default_headers, &self.defaults.auth_scheme)
+    }
+
+    /// Extra headers for a Codex remote-compaction-v2 request.
+    ///
+    /// - Errors unless this client's provider profile is Codex over the
+    ///   Responses backend: the beta header (and the request it decorates)
+    ///   must never cross providers.
+    /// - Returns `Ok(None)` when the model has not declared the
+    ///   `remote_compaction_v2` capability — the caller must then pick an
+    ///   explicit alternative (client-side compaction, or the legacy unary
+    ///   endpoint behind its own opt-in); there is no silent fallback here.
+    /// - `capability_declared` is a parameter rather than client state
+    ///   because `ModelInfo` does not carry the capability field yet: the
+    ///   shell resolves it from the live Codex catalog and injects it.
+    ///
+    /// The returned map merges `remote_compaction_v2` into any
+    /// `x-codex-beta-features` value already configured on the client
+    /// (comma-separated, deduplicated) so a user-configured beta opt-in is
+    /// preserved. The header rides only the compaction request — ordinary
+    /// turns never send it (see [`apply_codex_turn_state`]).
+    pub fn codex_remote_compaction_v2_headers(
+        &self,
+        capability_declared: bool,
+    ) -> Result<Option<HeaderMap>> {
+        if self.defaults.provider_profile.provider != ModelProvider::Codex
+            || !matches!(self.defaults.api_backend, ApiBackend::Responses)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 requires the Codex provider profile over the Responses backend",
+            ));
+        }
+        if !capability_declared {
+            return Ok(None);
+        }
+        let existing = self
+            .default_headers
+            .get(X_CODEX_BETA_FEATURES_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let merged = merge_codex_beta_features(existing, REMOTE_COMPACTION_V2_FEATURE);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_CODEX_BETA_FEATURES_HEADER),
+            HeaderValue::from_str(&merged).map_err(|_| {
+                SamplingError::InvalidConfiguration(
+                    "configured x-codex-beta-features value is not a valid header value",
+                )
+            })?,
+        );
+        Ok(Some(headers))
     }
 
     /// Invoke the optional 401 attribution callback for one logical
@@ -2092,8 +2224,13 @@ impl SamplingClient {
         let turn_state = request.turn_state.clone();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
-        // `splice_extra_tool_entries`, whose doc explains why each one does.
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+        // `splice_extra_tool_entries`, whose doc explains why each one does. The
+        // provider profile is enforced here so xAI-only hosted search tools can
+        // never serialize into a non-xAI request body.
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(
+            &request.hosted_tools,
+            self.defaults.provider_profile,
+        );
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -2131,8 +2268,13 @@ impl SamplingClient {
         let turn_state = request.turn_state.clone();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
-        // `splice_extra_tool_entries`, whose doc explains why each one does.
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
+        // `splice_extra_tool_entries`, whose doc explains why each one does. The
+        // provider profile is enforced here so xAI-only hosted search tools can
+        // never serialize into a non-xAI request body.
+        let extra_tools = xai_grok_sampling_types::extra_tool_entries(
+            &request.hosted_tools,
+            self.defaults.provider_profile,
+        );
 
         let responses_request: rs::CreateResponse = (&request).into();
 
@@ -2542,6 +2684,234 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|tool| tool["type"] == "x_search")
+        );
+    }
+
+    /// Drive a full `ConversationRequest` through the Responses call sites and
+    /// capture the exact serialized body the wire would carry.
+    async fn capture_conversation_body(
+        profile: ProviderProfile,
+        hosted_tools: Vec<xai_grok_sampling_types::HostedTool>,
+        streaming: bool,
+    ) -> serde_json::Value {
+        let (body_tx, body_rx) = oneshot::channel();
+        let body_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(body_tx)));
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let body_tx = body_tx.clone();
+                async move {
+                    let _ = body_tx.lock().unwrap().take().unwrap().send(body);
+                    if streaming {
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from("data: [DONE]\n\n"))
+                            .unwrap()
+                    } else {
+                        axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(r#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}"#))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_backend: ApiBackend::Responses,
+            provider_profile: profile,
+            ..minimal_config()
+        })
+        .unwrap();
+        let mut request = xai_grok_sampling_types::ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::user("hi"),
+        ]);
+        request.hosted_tools = hosted_tools;
+        if streaming {
+            let (_stream, _metadata, _collector) = client
+                .conversation_stream_responses(request)
+                .await
+                .expect("streaming conversation request should succeed");
+        } else {
+            client
+                .conversation_responses(request)
+                .await
+                .expect("unary conversation request should succeed");
+        }
+        let body = body_rx.await.unwrap();
+        server.abort();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Regression: the Codex provider profile must never serialize xAI's
+    /// backend-hosted search tools into the request body — regardless of what
+    /// `supports_backend_search` metadata upstream claimed — while the
+    /// provider-neutral client-custom tool (Code Mode) survives under both
+    /// profiles, and the xAI profile keeps everything.
+    #[tokio::test]
+    async fn codex_profile_body_never_contains_hosted_search_tools() {
+        let hosted = || {
+            vec![
+                xai_grok_sampling_types::HostedTool::XSearch { options: None },
+                xai_grok_sampling_types::HostedTool::WebSearch { options: None },
+                xai_grok_sampling_types::HostedTool::ClientCustom(
+                    xai_grok_sampling_types::CustomToolSpec {
+                        name: "exec".to_string(),
+                        description: None,
+                        format: rs::CustomToolParamFormat::default(),
+                    },
+                ),
+            ]
+        };
+        let tool_types = |body: &serde_json::Value| -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|t| t["type"].as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        for streaming in [false, true] {
+            let codex =
+                capture_conversation_body(ProviderProfile::CODEX, hosted(), streaming).await;
+            let raw = codex.to_string();
+            assert!(!raw.contains("x_search"), "x_search leaked: {raw}");
+            assert!(!raw.contains("web_search"), "web_search leaked: {raw}");
+            assert_eq!(
+                tool_types(&codex),
+                vec!["custom"],
+                "client-custom must survive the Codex gate"
+            );
+
+            let xai = capture_conversation_body(ProviderProfile::XAI, hosted(), streaming).await;
+            assert_eq!(
+                tool_types(&xai),
+                vec!["x_search", "web_search", "custom"],
+                "the xAI profile must keep every hosted tool"
+            );
+        }
+    }
+
+    /// Remote-compaction-v2 header pipeline: Codex-profile-only, gated on the
+    /// (injected) model capability declaration, and merged into any existing
+    /// beta-features opt-in without duplication.
+    #[test]
+    fn remote_compaction_v2_beta_header_is_capability_and_provider_gated() {
+        // xAI profile: hard error regardless of capability — the header (and
+        // the request) must never cross providers.
+        let xai = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::Responses,
+            provider_profile: ProviderProfile::XAI,
+            ..minimal_config()
+        })
+        .unwrap();
+        assert!(xai.codex_remote_compaction_v2_headers(true).is_err());
+
+        // Codex over Chat Completions: also an error (v2 is Responses-only).
+        let codex_chat = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::ChatCompletions,
+            provider_profile: ProviderProfile::CODEX,
+            ..minimal_config()
+        })
+        .unwrap();
+        assert!(codex_chat.codex_remote_compaction_v2_headers(true).is_err());
+
+        // Codex + Responses, capability NOT declared: no header, no fallback.
+        let codex = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::Responses,
+            provider_profile: ProviderProfile::CODEX,
+            ..minimal_config()
+        })
+        .unwrap();
+        assert_eq!(codex.codex_remote_compaction_v2_headers(false).unwrap(), None);
+
+        // Declared: exactly the beta header.
+        let headers = codex
+            .codex_remote_compaction_v2_headers(true)
+            .unwrap()
+            .expect("declared capability must yield the beta header");
+        assert_eq!(
+            headers.get(X_CODEX_BETA_FEATURES_HEADER).unwrap(),
+            REMOTE_COMPACTION_V2_FEATURE
+        );
+
+        // An existing beta opt-in is preserved and deduplicated.
+        let mut extra = IndexMap::new();
+        extra.insert(
+            X_CODEX_BETA_FEATURES_HEADER.to_owned(),
+            "existing_feature, remote_compaction_v2".to_owned(),
+        );
+        let codex_with_existing = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::Responses,
+            provider_profile: ProviderProfile::CODEX,
+            extra_headers: extra,
+            ..minimal_config()
+        })
+        .unwrap();
+        let headers = codex_with_existing
+            .codex_remote_compaction_v2_headers(true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            headers.get(X_CODEX_BETA_FEATURES_HEADER).unwrap(),
+            "existing_feature,remote_compaction_v2"
+        );
+    }
+
+    /// The v2 body shape: allow-listed fields only, `store:false`/`stream:true`
+    /// forced, encrypted-reasoning include present, and the compaction trigger
+    /// as the final input element.
+    #[test]
+    fn remote_compaction_v2_body_shape_is_allow_listed_and_triggered() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.1-codex",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "temperature": 0.5,
+            "max_output_tokens": 1000,
+            "previous_response_id": "resp_123",
+            "store": true,
+            "tools": [],
+            "prompt_cache_key": "codex-session",
+            "x_custom": {"nope": true},
+        });
+        shape_codex_remote_compaction_v2_body(&mut body, "compact this conversation");
+        let map = body.as_object().unwrap();
+        for dropped in ["temperature", "max_output_tokens", "previous_response_id", "x_custom"] {
+            assert!(!map.contains_key(dropped), "{dropped} must be dropped");
+        }
+        assert_eq!(map["store"], serde_json::json!(false));
+        assert_eq!(map["stream"], serde_json::json!(true));
+        assert_eq!(
+            map["instructions"],
+            serde_json::json!("compact this conversation")
+        );
+        assert!(
+            map["include"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("reasoning.encrypted_content"))
+        );
+        let input = map["input"].as_array().unwrap();
+        assert_eq!(
+            input.last().unwrap(),
+            &serde_json::json!({"type": "compaction_trigger"}),
+            "the trigger must be the final input element"
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|i| i["type"] == "compaction_trigger")
+                .count(),
+            1
         );
     }
 

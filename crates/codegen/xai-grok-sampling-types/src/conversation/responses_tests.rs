@@ -3,6 +3,7 @@
 use super::test_support::*;
 use super::*;
 use crate::tool_overrides::*;
+use crate::types::ProviderProfile;
 use assert_matches::assert_matches;
 
 #[test]
@@ -69,7 +70,7 @@ fn function_tool_colliding_with_hosted_web_search_is_dropped() {
     );
 
     // The hosted web_search is emitted as a raw entry instead.
-    let entries = extra_tool_entries(&req.hosted_tools);
+    let entries = extra_tool_entries(&req.hosted_tools, ProviderProfile::XAI);
     assert_eq!(entries, vec![serde_json::json!({"type": "web_search"})]);
 }
 
@@ -88,7 +89,7 @@ fn function_tool_colliding_with_hosted_x_search_is_dropped() {
     let responses_req: rs::CreateResponse = (&req).into();
     let tools = responses_req.tools.unwrap_or_default();
     assert!(tools.is_empty(), "expected no tools, got: {tools:?}");
-    let entries = extra_tool_entries(&req.hosted_tools);
+    let entries = extra_tool_entries(&req.hosted_tools, ProviderProfile::XAI);
     assert_eq!(entries, vec![serde_json::json!({"type": "x_search"})]);
 }
 
@@ -99,7 +100,7 @@ fn function_tool_colliding_with_hosted_x_search_is_dropped() {
 #[test]
 fn web_search_domain_filters_reach_the_tool_entry() {
     let hosted = |options: Option<WebSearchOptions>| {
-        extra_tool_entries(&[HostedTool::WebSearch { options }])
+        extra_tool_entries(&[HostedTool::WebSearch { options }], ProviderProfile::XAI)
     };
     assert_eq!(
         hosted(Some(WebSearchOptions {
@@ -138,13 +139,17 @@ fn web_search_domain_filters_reach_the_tool_entry() {
 #[test]
 fn x_search_serializes_to_the_tool_entry() {
     // A full bound reaches the flat snake_case entry; an empty or `None` bound emits the bare entry.
-    let dated = extra_tool_entries(&[HostedTool::XSearch {
-        options: Some(XSearchOptions {
-            date_bound: Some(
-                SearchDateBound::new(Some("2024-01-01".into()), Some("2024-03-15".into())).unwrap(),
-            ),
-        }),
-    }]);
+    let dated = extra_tool_entries(
+        &[HostedTool::XSearch {
+            options: Some(XSearchOptions {
+                date_bound: Some(
+                    SearchDateBound::new(Some("2024-01-01".into()), Some("2024-03-15".into()))
+                        .unwrap(),
+                ),
+            }),
+        }],
+        ProviderProfile::XAI,
+    );
     assert_eq!(
         dated,
         vec![serde_json::json!({
@@ -155,16 +160,57 @@ fn x_search_serializes_to_the_tool_entry() {
     );
     let bare = vec![serde_json::json!({"type": "x_search"})];
     assert_eq!(
-        extra_tool_entries(&[HostedTool::XSearch {
-            options: Some(XSearchOptions {
-                date_bound: Some(SearchDateBound::new(None, None).unwrap()),
-            }),
-        }]),
+        extra_tool_entries(
+            &[HostedTool::XSearch {
+                options: Some(XSearchOptions {
+                    date_bound: Some(SearchDateBound::new(None, None).unwrap()),
+                }),
+            }],
+            ProviderProfile::XAI,
+        ),
         bare
     );
     assert_eq!(
-        extra_tool_entries(&[HostedTool::XSearch { options: None }]),
+        extra_tool_entries(&[HostedTool::XSearch { options: None }], ProviderProfile::XAI),
         bare
+    );
+}
+
+/// The serialization chokepoint must drop xAI's backend-hosted search tools
+/// for any non-xAI profile regardless of what upstream metadata claimed, while
+/// provider-neutral client-custom tools survive under every profile.
+#[test]
+fn codex_profile_drops_hosted_search_but_keeps_client_custom() {
+    let hosted = vec![
+        HostedTool::WebSearch { options: None },
+        HostedTool::XSearch { options: None },
+        HostedTool::ClientCustom(CustomToolSpec {
+            name: "exec".to_string(),
+            description: Some("run javascript".to_string()),
+            format: rs::CustomToolParamFormat::default(),
+        }),
+    ];
+
+    let codex_entries = extra_tool_entries(&hosted, ProviderProfile::CODEX);
+    assert_eq!(
+        codex_entries.len(),
+        1,
+        "only the client-custom tool may serialize under Codex: {codex_entries:?}"
+    );
+    assert_eq!(codex_entries[0]["type"], "custom");
+    assert_eq!(codex_entries[0]["name"], "exec");
+    let body = serde_json::to_string(&codex_entries).unwrap();
+    assert!(!body.contains("x_search"), "x_search leaked: {body}");
+    assert!(!body.contains("web_search"), "web_search leaked: {body}");
+
+    // The same hosted tools under the xAI profile keep all three entries.
+    let xai_entries = extra_tool_entries(&hosted, ProviderProfile::XAI);
+    assert_eq!(
+        xai_entries
+            .iter()
+            .map(|e| e["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["web_search", "x_search", "custom"],
     );
 }
 

@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::types::ProviderProfile;
+
 /// Flatten `response.output` into `ConversationItem`s, preserving emission
 /// order. Replaying that order byte for byte on the next turn is what keeps
 /// the server-side prefix cache hot.
@@ -436,17 +438,35 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
 /// `allowed_domains` and cannot carry `excluded_domains`. Emitting either as a typed `rs::Tool`
 /// as well would send it twice, which the API rejects as a duplicate; the JSON built here is
 /// byte-identical to the native `rs::Tool::WebSearch` for the no-filter and allowlist-only cases.
-pub fn extra_tool_entries(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value> {
+///
+/// `profile` is the transport identity of the client that will send this
+/// request. xAI's backend-hosted search tools (`x_search`/`web_search`) exist
+/// only on the xAI backend, so any non-xAI profile drops them here — at the
+/// single serialization chokepoint — rather than trusting every upstream
+/// caller (catalog data, `[model.*]` overrides, subagent-inherited cells) to
+/// have kept `supports_backend_search` false. [`HostedTool::ClientCustom`] is
+/// provider-neutral (a client-executed tool such as Code Mode's `exec`) and is
+/// always kept.
+pub fn extra_tool_entries(
+    hosted_tools: &[HostedTool],
+    profile: ProviderProfile,
+) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     for tool in hosted_tools {
         match tool {
             HostedTool::WebSearch { options } => {
+                if drop_hosted_search_for_profile(profile, tool.wire_name()) {
+                    continue;
+                }
                 entries.push(match options {
                     Some(o) => o.to_tool_entry(),
                     None => WebSearchOptions::default().to_tool_entry(),
                 });
             }
             HostedTool::XSearch { options } => {
+                if drop_hosted_search_for_profile(profile, tool.wire_name()) {
+                    continue;
+                }
                 entries.push(match options {
                     Some(o) => o.to_tool_entry(),
                     None => XSearchOptions::default().to_tool_entry(),
@@ -467,4 +487,23 @@ pub fn extra_tool_entries(hosted_tools: &[HostedTool]) -> Vec<serde_json::Value>
         }
     }
     entries
+}
+
+/// Provider gate for xAI backend-hosted search tools. Returns `true` (drop)
+/// for every non-xAI provider; warns once per process so a misconfigured
+/// catalog or override doesn't spam the log on every request.
+fn drop_hosted_search_for_profile(profile: ProviderProfile, wire_name: &'static str) -> bool {
+    if matches!(profile.provider, crate::types::ModelProvider::Xai) {
+        return false;
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            tool = wire_name,
+            provider = ?profile.provider,
+            "dropping xAI backend-hosted search tool: it does not exist on this \
+             provider's backend and must not appear in its request body"
+        );
+    });
+    true
 }
