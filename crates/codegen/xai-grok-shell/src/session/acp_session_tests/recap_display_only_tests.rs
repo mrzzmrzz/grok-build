@@ -899,8 +899,8 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
     );
 }
 
-/// Recap wire shape: main-turn tools + `prompt_cache_key` = session id, so the
-/// request rides the parent turn's prefix cache instead of cold-prefilling.
+/// Recap wire shape: main-turn tools + the restored `prompt_cache_key`, so a
+/// verbatim fork's auxiliary request rides the warmed parent prefix.
 #[tokio::test(flavor = "current_thread")]
 async fn recap_request_rides_parent_prompt_cache() {
     use xai_grok_test_support::MockInferenceServer;
@@ -911,7 +911,8 @@ async fn recap_request_rides_parent_prompt_cache() {
             let (gateway_tx, _grx) =
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.startup_hints.cache_affinity_id = Some("warmed-parent".into());
             // Register a real tool so the "recap sends the main turn's tools"
             // assertion is non-vacuous.
             *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
@@ -953,8 +954,8 @@ async fn recap_request_rides_parent_prompt_cache() {
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
             assert_eq!(
                 body["prompt_cache_key"].as_str(),
-                Some(actor.session_info.id.to_string().as_str()),
-                "prompt_cache_key must be the parent session id for sticky routing"
+                Some("warmed-parent"),
+                "recap must reuse the restored prompt-cache affinity"
             );
             let main_turn_specs =
                 actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
@@ -1301,7 +1302,8 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
         .await;
 }
 
-/// A `/btw` call sends the main turn's tools and the session id as `prompt_cache_key`, so it reuses the parent's cached prefix.
+/// A `/btw` call sends the main turn's tools and the restored
+/// `prompt_cache_key`, so a verbatim fork reuses its parent's cached prefix.
 #[tokio::test(flavor = "current_thread")]
 async fn side_question_request_rides_parent_prompt_cache() {
     use xai_grok_test_support::MockInferenceServer;
@@ -1312,7 +1314,8 @@ async fn side_question_request_rides_parent_prompt_cache() {
             let (gateway_tx, _grx) =
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.startup_hints.cache_affinity_id = Some("warmed-parent".into());
             *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
 
             let server = MockInferenceServer::start().await.unwrap();
@@ -1356,8 +1359,8 @@ async fn side_question_request_rides_parent_prompt_cache() {
             let body = btw_req.body.as_ref().expect("btw body must be JSON");
             assert_eq!(
                 body["prompt_cache_key"].as_str(),
-                Some(actor.session_info.id.to_string().as_str()),
-                "prompt_cache_key must be the parent session id for sticky routing"
+                Some("warmed-parent"),
+                "side question must reuse the restored prompt-cache affinity"
             );
             let tools = body["tools"].as_array().expect("tools must be present");
 

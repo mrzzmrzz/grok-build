@@ -152,6 +152,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 tool_call_id: "reader".to_string(),
                 enabled_tools: Vec::new(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
+                max_output_tokens: 10_000,
             },
             ObserveMode::YieldAfter(Duration::from_secs(1)),
         )
@@ -174,6 +175,7 @@ fn execute_request(source: &str) -> CreateCellRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        max_output_tokens: 10_000,
     }
 }
 
@@ -222,6 +224,7 @@ fn gated_store_request(tool_call_id: &str, key: &str, value_bytes: usize) -> Cre
         source: format!(
             r#"await tools.gate(); store("{key}", "x".repeat({value_bytes})); text("stored");"#
         ),
+        max_output_tokens: 10_000,
     }
 }
 
@@ -250,8 +253,7 @@ async fn concurrent_cells_cannot_jointly_exceed_the_global_stored_state_cap() {
         .await
         .expect("start second cell");
 
-    let (first_event, second_event) =
-        tokio::join!(first.initial_event(), second.initial_event());
+    let (first_event, second_event) = tokio::join!(first.initial_event(), second.initial_event());
     let events = [
         first_event.expect("first completion"),
         second_event.expect("second completion"),
@@ -304,6 +306,7 @@ async fn merge_point_accepts_deltas_that_fit_the_global_state() {
                 tool_call_id: "writer".to_string(),
                 enabled_tools: Vec::new(),
                 source: r#"store("small", "value"); text("ok");"#.to_string(),
+                max_output_tokens: 10_000,
             },
             ObserveMode::YieldAfter(Duration::from_secs(10)),
         )

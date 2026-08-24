@@ -12,8 +12,6 @@ use xai_grok_tools::implementations::grok_build;
 use xai_grok_tools::implementations::grok_build_concise;
 use xai_grok_tools::implementations::memory;
 use xai_grok_tools::implementations::opencode;
-use xai_grok_tools::implementations::search_tool;
-use xai_grok_tools::implementations::use_tool;
 use xai_grok_tools::registry::types::{ToolConfig, ToolServerConfig};
 /// Process-global registry of externally-provided toolset presets.
 ///
@@ -108,7 +106,7 @@ and execute. Use them aggressively and liberally \u{2014} spawn subagents early 
 - High-level planning and architecture decisions
 - Reading files for quick context (${{ tools.by_kind.read }}, ${{ tools.by_kind.search }}, ${{ tools.by_kind.list }})
 - Running quick terminal commands for orientation (${{ tools.by_kind.execute }})
-- Invoking skills and MCP tools (${{ tools.by_kind.skill }}, ${{ tools.by_kind.search_tool }}, ${{ tools.by_kind.use_tool }})
+- Invoking skills and registered MCP tools directly (${{ tools.by_kind.skill }})
 - Web research (${{ tools.by_kind.web_search }}, ${{ tools.by_kind.web_fetch }})
 - Asking the user questions (${{ tools.by_kind.ask_user }})
 - Managing task lists and tracking progress (${{ tools.by_kind.plan }})
@@ -280,8 +278,6 @@ fn default_grok_build_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
             (&grok_build::WorkflowTool).into(),
         ],
@@ -331,8 +327,6 @@ pub fn grok_build_hashline_toolset(
         (&grok_build::SchedulerDeleteTool).into(),
         (&grok_build::SchedulerListTool).into(),
         (&grok_build::MonitorTool).into(),
-        (&search_tool::SearchTool).into(),
-        (&use_tool::UseTool).into(),
         (&grok_build::UpdateGoalTool).into(),
         (&grok_build::WorkflowTool).into(),
     ]);
@@ -356,8 +350,9 @@ fn codex_toolset() -> ToolServerConfig {
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             task_output_tool_config(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
+            (&grok_build::SchedulerCreateTool).into(),
+            (&grok_build::SchedulerListTool).into(),
+            (&grok_build::SchedulerDeleteTool).into(),
         ],
         behavior_preset: None,
     }
@@ -420,8 +415,6 @@ fn grok_build_plan_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
             (&grok_build::WorkflowTool).into(),
             // Plan mode tools
@@ -452,8 +445,6 @@ fn orchestrator_toolset() -> ToolServerConfig {
             wait_tasks_tool_config(),
             kill_task_tool_config(),
             // Skills and MCP
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
             // Planning and user interaction
             (&grok_build::TodoWriteTool).into(),
             (&grok_build::EnterPlanModeTool).into(),
@@ -505,8 +496,6 @@ fn grok_build_plan_no_subagents_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
             (&grok_build::WorkflowTool).into(),
             // Plan mode tools
@@ -538,8 +527,6 @@ fn grok_build_ask_user_toolset() -> ToolServerConfig {
             (&grok_build::SchedulerDeleteTool).into(),
             (&grok_build::SchedulerListTool).into(),
             (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
             (&grok_build::UpdateGoalTool).into(),
             (&grok_build::WorkflowTool).into(),
             // Ask user tool (without plan mode)
@@ -1754,6 +1741,22 @@ mod tests {
             );
         }
         assert!(toolset_for_preset("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn codex_preset_keeps_schedulers_and_drops_grok_mcp_dispatchers() {
+        let codex = toolset_for_preset("codex").expect("codex preset");
+        let ids: std::collections::HashSet<&str> =
+            codex.tools.iter().map(|tool| tool.id.as_str()).collect();
+        for scheduler in [
+            ToolConfig::from(&grok_build::SchedulerCreateTool).id,
+            ToolConfig::from(&grok_build::SchedulerListTool).id,
+            ToolConfig::from(&grok_build::SchedulerDeleteTool).id,
+        ] {
+            assert!(ids.contains(scheduler.as_str()), "missing {scheduler}");
+        }
+        assert!(!ids.iter().any(|id| id.ends_with(":search_tool")));
+        assert!(!ids.iter().any(|id| id.ends_with(":use_tool")));
     }
     #[test]
     fn presets_select_distinct_toolsets_by_size() {

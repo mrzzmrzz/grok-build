@@ -540,6 +540,13 @@ impl SessionActor {
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
+        // Pick up OAuth credentials written by another session/process at a
+        // real lifecycle boundary. This used to be coupled to a successful
+        // Grok `search_tool` batch; direct Codex MCP tools have no such call.
+        // Recovery performs the handshake, re-registers qualified tools, and
+        // emits the existing tools-changed notification before this turn
+        // builds its tool manifest.
+        self.retry_auth_required_servers().await;
         let yolo_mode = self.permissions.is_yolo_mode();
         let msg_count = self.chat_state_handle.get_conversation_len().await;
         let redirect_kind = if policy.authority.is_human_intent() {
@@ -2081,9 +2088,7 @@ impl SessionActor {
         // mode but the runtime cannot initialize.
         // Boxed so the (rarely hot) refresh future does not grow the already
         // enormous turn future.
-        if let Err(message) =
-            Box::pin(self.refresh_code_mode_for_turn(&tool_definitions)).await
-        {
+        if let Err(message) = Box::pin(self.refresh_code_mode_for_turn(&tool_definitions)).await {
             return Err(acp::Error::internal_error().data(message));
         }
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
@@ -2130,6 +2135,7 @@ impl SessionActor {
                     auth_manager,
                     &tool_defs,
                     manifest_clone.as_ref(),
+                    Some(chat_state_handle),
                 )
                 .await;
             });
@@ -2325,8 +2331,7 @@ impl SessionActor {
                 });
             }
             let build_req_start = std::time::Instant::now();
-            let chat_state_handle_ever_used_codex =
-                self.chat_state_handle.ever_used_codex().await;
+            let chat_state_handle_ever_used_codex = self.chat_state_handle.ever_used_codex().await;
             let request = self
                 .chat_state_handle
                 .build_request(
@@ -2377,21 +2382,22 @@ impl SessionActor {
             // the provider-tagged session identity. Runs on every loop
             // iteration, so tool continuations and 401-refresh resubmits
             // reuse the binding; xAI requests are left untouched.
-            {
-                let provider = self
-                    .model_auth_facts(request.model.as_deref().unwrap_or_default())
-                    .model_provider;
-                crate::session::turn_affinity::apply_turn_affinity(
-                    &mut request,
-                    provider,
-                    &self.session_info.id.to_string(),
-                    self.codex_turn_state.borrow().clone(),
-                );
-            }
+            let request_provider = self
+                .model_auth_facts(request.model.as_deref().unwrap_or_default())
+                .model_provider;
+            crate::session::turn_affinity::apply_turn_affinity(
+                &mut request,
+                request_provider,
+                &self.prompt_cache_affinity_id(),
+                self.codex_turn_state.borrow().clone(),
+            );
             request.max_output_tokens = self
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
                 .map_err(|message| acp::Error::internal_error().data(message))?;
+            let request_summary = (request_provider
+                == xai_grok_sampling_types::ModelProvider::Codex)
+                .then(|| crate::session::CacheTracker::summarize_request(&request));
             self.emit_event(crate::session::events::Event::PhaseChanged {
                 phase: crate::session::events::Phase::WaitingForModel,
             });
@@ -2592,6 +2598,20 @@ impl SessionActor {
                     "tokens_per_sec": tokens_per_sec,
                 })),
             );
+            if let (Some(usage), Some(request_summary)) = (response.usage.as_ref(), request_summary)
+            {
+                let turn_idx = self.chat_state_handle.get_prompt_index().await.to_string();
+                self.cache_tracker.borrow_mut().record_turn_outcome(
+                    self.session_info.id.0.as_ref(),
+                    &turn_idx,
+                    loop_index,
+                    usage.prompt_tokens,
+                    usage.cached_prompt_tokens,
+                    usage.completion_tokens,
+                    model_timer,
+                    request_summary,
+                );
+            }
             if let Some(usage) = response.usage.as_ref() {
                 self.chat_state_handle
                     .record_token_usage(u64::from(usage.total_tokens));

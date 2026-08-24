@@ -14,11 +14,11 @@ use xai_grok_pager_diff::DiffHunk;
 
 use super::blocks::mermaid_content::DiagramAffordance;
 use super::blocks::{
-    AgentMessageBlock, BgTaskBlock, BtwBlock, ContextInfoBlock, CreditLimitBlock,
-    EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock,
-    ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock,
-    SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock,
-    UserPromptBlock, WorkflowBlock,
+    AgentMessageBlock, BgTaskBlock, BtwBlock, CodeModeStreamBlock, ContextInfoBlock,
+    CreditLimitBlock, EditToolCallBlock, ExecuteToolCallBlock, LineRange, ListDirToolCallBlock,
+    OtherToolCallBlock, ReadToolCallBlock, SearchFileMatch, SearchToolCallBlock, SessionEvent,
+    SessionEventBlock, SubagentBlock, SubagentBlockKind, SystemMessageBlock, ThinkingBlock,
+    ToolCallBlock, UserPromptBlock, WorkflowBlock,
 };
 use super::types::{
     AccentStyle, BlockBackground, BlockContext, BlockOutput, DisplayMode, RenderedBlockOutput,
@@ -394,6 +394,8 @@ pub enum RenderBlock {
     ContextInfo(ContextInfoBlock),
     /// Credit-limit card for max-tier users (red accent, single action).
     CreditLimit(CreditLimitBlock),
+    /// Ephemeral sanitized preview of inferred nested Code Mode tools.
+    CodeModeStream(CodeModeStreamBlock),
 }
 
 /// Delegate a method call to the inner block variant.
@@ -413,6 +415,7 @@ macro_rules! delegate_block {
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
             RenderBlock::CreditLimit(b) => b.$method($($arg),*),
+            RenderBlock::CodeModeStream(b) => b.$method($($arg),*),
         }
     };
 }
@@ -1028,7 +1031,8 @@ impl RenderBlock {
             RenderBlock::System(_)
             | RenderBlock::SessionEvent(_)
             | RenderBlock::ContextInfo(_)
-            | RenderBlock::CreditLimit(_) => None,
+            | RenderBlock::CreditLimit(_)
+            | RenderBlock::CodeModeStream(_) => None,
             RenderBlock::Btw(_) => Some(theme.accent_plan),
             RenderBlock::Stub(block) => Some(block.accent_color),
         }
@@ -1178,6 +1182,9 @@ impl RenderBlock {
             RenderBlock::CreditLimit(b) => {
                 join_searchable([Some(b.heading.clone()), Some(b.url.clone())])
             }
+            // This block is live-only and disappears when a canonical tool
+            // card arrives, so it must never leave a dangling search hit.
+            RenderBlock::CodeModeStream(_) => None,
             RenderBlock::ToolCall(tc) => tc.searchable_text(),
         }
     }

@@ -1170,6 +1170,20 @@ impl StorageAdapter for JsonlStorageAdapter {
         )
         .await
     }
+    async fn update_previous_turn_model(
+        &self,
+        info: &Info,
+        previous_turn_model: crate::session::PreviousTurnModel,
+    ) -> io::Result<()> {
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                previous_turn_model: Some(previous_turn_model),
+                ..Default::default()
+            },
+        )
+        .await
+    }
     async fn mark_ever_used_codex(&self, info: &Info) -> io::Result<()> {
         self.apply_summary_patch(
             info,

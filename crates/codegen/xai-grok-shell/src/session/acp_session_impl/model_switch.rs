@@ -28,6 +28,11 @@ impl SessionActor {
         // owned by a concurrently running prompt task we cannot reach; the
         // monotonic latch is the revocation.
         if new_provider == xai_grok_sampling_types::ModelProvider::Codex {
+            // Serialize the one-way revocation with xAI-hosted auxiliary HTTP
+            // calls. Existing calls complete before the switch is published;
+            // future calls acquire the read side only after the latch is true
+            // and fail closed. This removes the check-then-send window.
+            let _aux_revocation = self.chat_state_handle.xai_aux_revocation_guard().await;
             self.chat_state_handle.mark_ever_used_codex();
             let _ = self
                 .notifications

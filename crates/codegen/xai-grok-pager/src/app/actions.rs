@@ -713,6 +713,8 @@ pub enum Action {
     ShowContextInfo,
     /// `/usage` — session token/cost, plus consumer credits when visible.
     ShowUsage,
+    /// `/cache` — Codex prompt-cache hit rate and prefix diagnostics.
+    ShowCache,
     /// `/usage manage` — open consumer billing (no-op if surface hidden).
     ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block
@@ -2185,6 +2187,10 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
+    FetchSessionCache {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Fetch OpenAI Codex account usage via `x.ai/usage/codex`. Fired
     /// alongside the xAI usage fetches; each side fails independently.
     FetchCodexUsage {
@@ -2847,6 +2853,16 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         error: String,
         nonce: u64,
+    },
+    SessionCacheComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        cache: Box<xai_grok_shell::extensions::cache::SessionCacheResponse>,
+    },
+    SessionCacheFailed {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        error: String,
     },
     /// `/usage` Codex account usage fetched (any outcome — "not connected"
     /// and fetch errors ride in the response so one provider's failure never

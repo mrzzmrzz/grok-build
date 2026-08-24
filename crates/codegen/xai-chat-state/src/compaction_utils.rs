@@ -406,6 +406,167 @@ pub fn is_real_user_turn(item: &ConversationItem) -> bool {
         _ => false,
     }
 }
+
+/// Maximum real-user history retained alongside a Codex remote-compaction-v2
+/// item. This mirrors codex-rs's current retained-message budget.
+pub const CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS: u64 = 64_000;
+
+fn codex_remote_compaction_v2_user(item: &ConversationItem) -> Option<ConversationItem> {
+    let ConversationItem::User(user) = item else {
+        return None;
+    };
+    if !matches!(
+        user.synthetic_reason,
+        None | Some(xai_grok_sampling_types::SyntheticReason::Interjection)
+    ) {
+        return None;
+    }
+    let mut user = user.clone();
+    user.content = user
+        .content
+        .into_iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => {
+                let text = extract_user_query(&text);
+                (!text.is_empty()).then(|| ContentPart::Text {
+                    text: std::sync::Arc::<str>::from(text),
+                })
+            }
+            image @ ContentPart::Image { .. } => Some(image),
+        })
+        .collect();
+    (!user.content.is_empty()).then_some(ConversationItem::User(user))
+}
+
+fn codex_remote_compaction_v2_text_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(xai_token_estimation::BYTES_PER_TOKEN.saturating_sub(1))
+        / xai_token_estimation::BYTES_PER_TOKEN
+}
+
+fn codex_remote_compaction_v2_user_text_tokens(item: &ConversationItem) -> u64 {
+    let ConversationItem::User(user) = item else {
+        return 0;
+    };
+    user.content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => codex_remote_compaction_v2_text_tokens(text.len()),
+            ContentPart::Image { .. } => 0,
+        })
+        .sum::<u64>()
+        .max(1)
+}
+
+fn truncate_codex_remote_compaction_v2_user(
+    item: ConversationItem,
+    max_tokens: u64,
+) -> Option<ConversationItem> {
+    let ConversationItem::User(mut user) = item else {
+        return None;
+    };
+    let mut remaining_text_tokens = max_tokens;
+    let mut retained = Vec::with_capacity(user.content.len());
+    for part in user.content {
+        match part {
+            ContentPart::Image { url } => retained.push(ContentPart::Image { url }),
+            ContentPart::Text { text } => {
+                if remaining_text_tokens == 0 {
+                    continue;
+                }
+                let text_tokens = codex_remote_compaction_v2_text_tokens(text.len());
+                if text_tokens <= remaining_text_tokens {
+                    remaining_text_tokens -= text_tokens;
+                    retained.push(ContentPart::Text { text });
+                    continue;
+                }
+                let available = usize::try_from(
+                    remaining_text_tokens.saturating_mul(xai_token_estimation::BYTES_PER_TOKEN),
+                )
+                .unwrap_or(usize::MAX);
+                let kept = truncate_text_to_bytes(&text, available)
+                    .unwrap_or_else(|| std::sync::Arc::clone(&text));
+                remaining_text_tokens = 0;
+                if !kept.is_empty() {
+                    retained.push(ContentPart::Text { text: kept });
+                }
+            }
+        }
+    }
+    user.content = retained;
+    if user.content.is_empty() {
+        return None;
+    }
+    let item = ConversationItem::User(user);
+    (codex_remote_compaction_v2_user_text_tokens(&item) <= max_tokens).then_some(item)
+}
+
+fn fit_codex_remote_compaction_v2_user_tail(
+    user_messages: Vec<ConversationItem>,
+    max_tokens: u64,
+) -> Vec<ConversationItem> {
+    let mut remaining = max_tokens;
+    let mut reversed = Vec::new();
+    for item in user_messages.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let cost = codex_remote_compaction_v2_user_text_tokens(&item);
+        if cost <= remaining {
+            remaining -= cost;
+            reversed.push(item);
+            continue;
+        }
+        if let Some(item) = truncate_codex_remote_compaction_v2_user(item, remaining) {
+            reversed.push(item);
+        }
+        break;
+    }
+    reversed.reverse();
+    reversed
+}
+
+/// Install history for a successful v2 compaction: a bounded tail of genuine
+/// user messages followed by the authoritative encrypted compaction item.
+pub fn build_codex_remote_compaction_v2_history(
+    prompt_input: &[ConversationItem],
+    compaction_item: ConversationItem,
+) -> Vec<ConversationItem> {
+    let user_messages = prompt_input
+        .iter()
+        .filter_map(codex_remote_compaction_v2_user)
+        .collect::<Vec<_>>();
+    let mut retained = fit_codex_remote_compaction_v2_user_tail(
+        user_messages,
+        CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS,
+    );
+    retained.push(compaction_item);
+    retained
+}
+
+/// Return genuine user messages appended while compaction was in flight, but
+/// only when the request snapshot remains an exact prefix of live history.
+pub fn codex_remote_compaction_v2_interjections(
+    snapshot: &[ConversationItem],
+    current: &[ConversationItem],
+) -> Option<Vec<ConversationItem>> {
+    if current.len() < snapshot.len() {
+        return None;
+    }
+    let unchanged = snapshot.iter().zip(current).all(|(expected, actual)| {
+        serde_json::to_value(expected).ok() == serde_json::to_value(actual).ok()
+    });
+    if !unchanged {
+        return None;
+    }
+    Some(
+        current[snapshot.len()..]
+            .iter()
+            .filter_map(codex_remote_compaction_v2_user)
+            .collect(),
+    )
+}
 /// Extract all *real* user queries from a conversation, in order.
 ///
 /// "Real" means the item passes [`is_real_user_turn`] — it has no

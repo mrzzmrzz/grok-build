@@ -27,15 +27,40 @@ use crate::session::two_pass::{
 use agent_client_protocol as acp;
 use std::sync::Arc;
 use xai_chat_state::compaction_utils::{
-    CompactedHistoryInput, CompactionAttempt, build_compacted_history, is_degenerate_summary,
+    CompactedHistoryInput, CompactionAttempt, build_codex_remote_compaction_v2_history,
+    build_compacted_history, codex_remote_compaction_v2_interjections, is_degenerate_summary,
     prepare_conversation_for_verbatim_summarization, sanitize_compacted_history,
     validate_compacted_history,
 };
-use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+use xai_grok_sampling_types::{ApiBackend, ConversationItem, ModelProvider};
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
 const DEFAULT_PREFIRE_LEAD_PERCENT: u64 = 10;
+const CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated";
+
+fn rewrite_codex_tool_outputs_to_fit_context_window(
+    items: &mut [ConversationItem],
+    input_budget: u64,
+) -> usize {
+    let mut rewritten = 0usize;
+    for index in (0..items.len()).rev() {
+        if xai_chat_state::estimate_conversation_tokens(items) <= input_budget {
+            break;
+        }
+        let ConversationItem::ToolResult(output) = &mut items[index] else {
+            break;
+        };
+        output.content = Arc::<str>::from(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+        output.images.clear();
+        output.parts = vec![xai_grok_sampling_types::ContentPart::Text {
+            text: Arc::<str>::from(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE),
+        }];
+        rewritten = rewritten.saturating_add(1);
+    }
+    rewritten
+}
 fn prefire_lead_percent() -> u64 {
     std::env::var("GROK_PREFIRE_LEAD_PERCENT")
         .ok()
@@ -631,7 +656,7 @@ impl SessionActor {
         self.emit_status_snapshot_detached();
         Ok(())
     }
-    async fn emit_compact_cancelled(&self, auto_trigger: bool) -> Result<(), acp::Error> {
+    async fn emit_compact_cancelled<T>(&self, auto_trigger: bool) -> Result<T, acp::Error> {
         if auto_trigger {
             use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
             self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
@@ -856,6 +881,263 @@ impl SessionActor {
             }
         }
     }
+
+    async fn run_codex_remote_compact_request(
+        &self,
+        mut client: xai_grok_sampler::SamplingClient,
+        request: xai_grok_sampling_types::ConversationRequest,
+        instructions: &str,
+        operation_turn_state: &crate::session::turn_affinity::OperationTurnState,
+        cancel: &tokio_util::sync::CancellationToken,
+        auto_trigger: bool,
+        estimated_tokens: u64,
+        context_window: u64,
+    ) -> Result<(Vec<ConversationItem>, u32), acp::Error> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut refreshed_auth = false;
+        self.reset_codex_401_recovery();
+        for attempt in 1..=MAX_ATTEMPTS {
+            if cancel.is_cancelled() {
+                return self.emit_compact_cancelled(auto_trigger).await;
+            }
+            let mut attempt_request = request.clone();
+            crate::session::turn_affinity::apply_turn_affinity(
+                &mut attempt_request,
+                ModelProvider::Codex,
+                &self.prompt_cache_affinity_id(),
+                operation_turn_state.get().map(str::to_owned),
+            );
+            let attempt_started = std::time::Instant::now();
+            match client
+                .compact_codex_conversation_v2(attempt_request, instructions, true)
+                .await
+            {
+                Ok(result) => {
+                    if let Some(turn_state) = result.turn_state {
+                        operation_turn_state.observe(turn_state);
+                    }
+                    if let Some(usage) = result.usage.as_ref() {
+                        let usage = xai_grok_sampling_types::TokenUsage {
+                            prompt_tokens: usage.input_tokens,
+                            completion_tokens: usage.output_tokens,
+                            total_tokens: usage.total_tokens,
+                            reasoning_tokens: usage.output_tokens_details.reasoning_tokens,
+                            cached_prompt_tokens: usage.input_tokens_details.cached_tokens,
+                            cache_creation_prompt_tokens: 0,
+                        };
+                        let api_duration_ms = u64::try_from(attempt_started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        self.chat_state_handle.record_model_call_usage(
+                            request.model.clone(),
+                            usage.clone(),
+                            Some(api_duration_ms),
+                            None,
+                        );
+                        self.signals_handle()
+                            .record_token_usage(usage.completion_tokens, usage.reasoning_tokens);
+                    }
+                    tracing::info!(
+                        session_id = %self.session_info.id.0,
+                        response_id = %result.response_id,
+                        attempt,
+                        "Codex remote compaction v2 stream completed"
+                    );
+                    return Ok((
+                        build_codex_remote_compaction_v2_history(
+                            &request.items,
+                            result.compaction_item,
+                        ),
+                        attempt,
+                    ));
+                }
+                Err(error) => {
+                    if error.is_auth_error()
+                        && !refreshed_auth
+                        && attempt < MAX_ATTEMPTS
+                        && self.try_codex_401_recovery().await
+                    {
+                        refreshed_auth = true;
+                        client = self.prepare_chat_completion(false).await?;
+                        continue;
+                    }
+                    let retry_after = match &error {
+                        xai_grok_sampling_types::SamplingError::Api {
+                            retry_after_secs, ..
+                        } => *retry_after_secs,
+                        _ => None,
+                    };
+                    if attempt < MAX_ATTEMPTS && error.is_retryable() {
+                        let delay = retry_after.unwrap_or(3).min(120);
+                        tracing::warn!(
+                            session_id = %self.session_info.id.0,
+                            attempt,
+                            delay,
+                            error = %error,
+                            "retrying Codex remote compaction v2"
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                return self.emit_compact_cancelled(auto_trigger).await;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+                        }
+                        continue;
+                    }
+                    if auto_trigger {
+                        let reason = Self::classify_suppress_reason(&error.to_string());
+                        self.suppress_auto_compaction(reason, estimated_tokens, context_window)
+                            .await;
+                    }
+                    return Err(crate::sampling::error::map_sampling_err_to_acp(error));
+                }
+            }
+        }
+        unreachable!("Codex remote compaction retry loop always returns")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_codex_remote_compacted_history(
+        &self,
+        mut compacted_history: Vec<ConversationItem>,
+        system_items: Vec<ConversationItem>,
+        conversation_snapshot: &[ConversationItem],
+        segment_messages: &[ConversationItem],
+        tokens_before: u64,
+        auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
+        compact_source: &'static str,
+        attempts: u32,
+        compaction: xai_grok_telemetry::events::CompactionScope,
+    ) -> Result<(), acp::Error> {
+        if compacted_history.is_empty() {
+            return Err(acp::Error::internal_error()
+                .data("Codex remote compaction returned no replacement history"));
+        }
+        let compacted_history_chars = compacted_history
+            .iter()
+            .map(|item| match item {
+                ConversationItem::BackendToolCall(item) => item.estimated_content_len(),
+                _ => item.text_content().chars().count(),
+            })
+            .sum::<usize>();
+        let mut replacement = system_items;
+        replacement.append(&mut compacted_history);
+        let current = self.chat_state_handle.get_conversation().await;
+        let interjections = codex_remote_compaction_v2_interjections(
+            conversation_snapshot,
+            &current,
+        )
+        .ok_or_else(|| {
+            acp::Error::internal_error().data(
+                "conversation changed while Codex remote compaction was in flight; refusing stale replacement history",
+            )
+        })?;
+        replacement.extend(interjections);
+
+        let segments_written = u32::from(self.persist_compaction_segment(
+            segment_messages,
+            "[OpenAI server-side compacted context]",
+        ));
+        let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
+        let original_user_info = self
+            .chat_state_handle
+            .get_conversation_item_at(1)
+            .await
+            .and_then(|item| match item {
+                ConversationItem::User(parts) => {
+                    parts
+                        .content
+                        .into_iter()
+                        .next()
+                        .and_then(|part| match part {
+                            xai_grok_sampling_types::ContentPart::Text { text } => {
+                                Some(text.as_ref().to_owned())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            });
+        self.persist_compaction_checkpoint(
+            &replacement,
+            prompt_index_at_compaction,
+            auto_continue,
+            original_user_info,
+        );
+        if self.startup_hints.inherited_prefix_len.is_some() {
+            self.compaction
+                .prefix_released
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::Span::current().record("compaction_prefix_released", true);
+        }
+        let new_len = replacement.len();
+        self.chat_state_handle
+            .replace_conversation_for_compaction(replacement);
+        self.compaction
+            .auto_compact_suppressed
+            .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        self.last_idle_flush_conversation_len
+            .store(new_len, std::sync::atomic::Ordering::Relaxed);
+        self.memory
+            .context_injected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::PlanState(
+                crate::tools::todo::TodoState::default(),
+            ));
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_agents_md_compaction()
+            .await;
+        self.agent
+            .borrow()
+            .tool_bridge()
+            .on_skill_discovery_compaction()
+            .await;
+        self.persist_announcement_state().await;
+        self.plan_mode.lock().reset_after_compaction();
+        self.persist_plan_mode_state();
+        self.dispatch_hook(
+            xai_grok_hooks::event::HookEventName::PostCompact,
+            xai_grok_hooks::event::HookPayload::PostCompact {
+                source: compact_source.into(),
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let tokens_after = self.chat_state_handle.get_total_tokens().await;
+        let span = tracing::Span::current();
+        span.record("compaction_tokens_after", tokens_after as i64);
+        span.record("compaction_summary_chars", compacted_history_chars as i64);
+        span.record("compaction_attempts", attempts as i64);
+        span.record("compaction_degenerate_rejections", 0i64);
+        span.record("compaction_input_overflow_rejections", 0i64);
+        span.record("compaction_deterministic_rejections", 0i64);
+        span.record("compaction_transient_rejections", 0i64);
+        span.record("compaction_stop_reason", "responses_compaction_v2");
+        span.record("compaction_outcome", CompactionOutcome::Success.as_str());
+        compaction.complete(
+            xai_grok_telemetry::events::CompactionCompleteStats {
+                tokens_after,
+                two_pass_used: false,
+                segments_written,
+                degenerate_retries: 0,
+                input_overflow_retries: 0,
+            },
+            xai_grok_telemetry::events::CompactionTiming {
+                model_wait_ms: None,
+                pre_compaction_ms: None,
+                post_compaction_ms: None,
+            },
+        );
+        Ok(())
+    }
     /// Inner implementation of compaction that supports an optional `auto_continue`
     /// payload for the checkpoint.
     #[tracing::instrument(
@@ -956,6 +1238,7 @@ impl SessionActor {
             self.chat_state_handle.get_system_message(),
             self.chat_state_handle.get_conversation(),
         );
+        let provider_conversation = full_conversation.clone();
         let assembly_start = std::time::Instant::now();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
@@ -1037,6 +1320,87 @@ impl SessionActor {
             .collect();
         let compaction_hosted_tools: Vec<xai_grok_sampling_types::HostedTool> =
             self.hosted_tools_for_turn();
+        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
+        if sampling_config.provider_profile.provider == ModelProvider::Codex
+            && sampling_config.api_backend == ApiBackend::Responses
+            && self.agent.borrow().compaction_policy().remote_compaction_v2
+        {
+            let base_instruction_count = provider_conversation
+                .iter()
+                .take_while(|item| matches!(item, ConversationItem::System(_)))
+                .count();
+            let system_items = provider_conversation[..base_instruction_count].to_vec();
+            let mut instructions = system_items
+                .iter()
+                .map(ConversationItem::text_content)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut compact_input = provider_conversation[base_instruction_count..].to_vec();
+            if let Some(context) = user_context
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                if !instructions.is_empty() {
+                    instructions.push_str("\n\n");
+                }
+                instructions.push_str(&format!(
+                    "<compaction_context>\n{context}\n</compaction_context>"
+                ));
+            }
+            let compact_input_budget = context_window
+                .saturating_sub(xai_token_estimation::estimate_tokens(&instructions))
+                .saturating_sub(compaction_tool_tokens);
+            let rewritten_outputs = rewrite_codex_tool_outputs_to_fit_context_window(
+                &mut compact_input,
+                compact_input_budget,
+            );
+            if rewritten_outputs > 0 {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    rewritten_outputs,
+                    "rewrote trailing tool outputs before Codex remote compaction"
+                );
+            }
+            let estimated_input_tokens =
+                xai_chat_state::estimate_conversation_tokens(&compact_input);
+            let mut request =
+                xai_grok_sampling_types::ConversationRequest::from_items(compact_input)
+                    .with_model(sampling_config.model.clone())
+                    .with_tools(compaction_tools);
+            request.hosted_tools = compaction_hosted_tools;
+            request.reasoning_effort = sampling_config.reasoning_effort;
+            request.x_grok_session_id = Some(self.session_info.id.0.to_string());
+            let operation_turn_state = crate::session::turn_affinity::OperationTurnState::new();
+            let (replacement, attempts) = self
+                .run_codex_remote_compact_request(
+                    sampling_client,
+                    request,
+                    &instructions,
+                    &operation_turn_state,
+                    &cancel,
+                    auto_trigger,
+                    estimated_input_tokens,
+                    context_window,
+                )
+                .await?;
+            if cancel.is_cancelled() {
+                return self.emit_compact_cancelled(auto_trigger).await;
+            }
+            return self
+                .install_codex_remote_compacted_history(
+                    replacement,
+                    system_items,
+                    &provider_conversation,
+                    &segment_messages,
+                    tokens_before,
+                    auto_continue,
+                    compact_source,
+                    attempts,
+                    compaction,
+                )
+                .await;
+        }
         if lossy_input {
             simplified_messages = xai_chat_state::compaction_utils::fit_conversation_to_budget(
                 simplified_messages,
@@ -1076,7 +1440,6 @@ impl SessionActor {
         let started_at = chrono::Utc::now().to_rfc3339();
         let estimated_input_tokens =
             xai_chat_state::estimate_conversation_tokens(&simplified_messages);
-        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let wall_clock_budget_secs = self
             .agent
             .borrow()
@@ -1480,27 +1843,6 @@ impl SessionActor {
                     }
                 }
             };
-        use crate::session::helpers::compaction_context::McpToolNames;
-        let mcp_tool_names: Option<McpToolNames> =
-            if use_short_prompt || state_context.connected_mcp_servers.is_empty() {
-                None
-            } else {
-                let agent_ref = self.agent.borrow();
-                let bridge = agent_ref.tool_bridge();
-                let empty = serde_json::json!({});
-                let search_name = bridge
-                    .render_prompt("${{ tools.by_kind.search_tool }}", &empty)
-                    .await
-                    .filter(|s| !s.is_empty() && !s.contains("by_kind"));
-                let call_name = bridge
-                    .render_prompt("${{ tools.by_kind.use_tool }}", &empty)
-                    .await
-                    .filter(|s| !s.is_empty() && !s.contains("by_kind"));
-                match (search_name, call_name) {
-                    (Some(search), Some(call)) => Some(McpToolNames { search, call }),
-                    _ => None,
-                }
-            };
         let memory_backend_impl = {
             let g = self.memory.storage.borrow();
             g.as_ref()
@@ -1539,7 +1881,7 @@ impl SessionActor {
                 &all_skills_for_compaction,
                 memory_ref,
                 subagent_tool_names.as_ref(),
-                mcp_tool_names.as_ref(),
+                None,
                 workflow_listing.as_deref(),
             )
             .await
@@ -2001,22 +2343,26 @@ impl SessionActor {
             // opaque history hit the new format.
             if comp_hash_changed(
                 prev.comp_hash.as_deref(),
-                self.current_codex_comp_hash().as_deref(),
+                self.codex_comp_hash_for_model(&cfg.model).as_deref(),
             ) && !self.is_account_state_suppressed()
             {
                 let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
-                if let Some(trigger_info) =
-                    self.should_auto_compact(total_tokens, cfg.context_window)
-                {
-                    tracing::info!(
-                        model = %cfg.model,
-                        "Proactive compact: Codex compaction compatibility hash changed"
-                    );
-                    if let Err(e) = self.run_compact_only(trigger_info, false).await {
-                        tracing::error!(error = %e, "comp_hash-change compaction failed");
-                        if Self::is_auth_compact_error(&e) {
-                            return Err(self.surface_compact_auth_failure(e).await);
-                        }
+                let trigger_info = AutoCompactTriggerInfo {
+                    tokens_used: total_tokens,
+                    context_window: cfg.context_window.get(),
+                    percentage: xai_token_estimation::usage_percentage_u8(
+                        total_tokens,
+                        cfg.context_window.get(),
+                    ),
+                };
+                tracing::info!(
+                    model = %cfg.model,
+                    "Proactive compact: Codex compaction compatibility hash changed"
+                );
+                if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                    tracing::error!(error = %e, "comp_hash-change compaction failed");
+                    if Self::is_auth_compact_error(&e) {
+                        return Err(self.surface_compact_auth_failure(e).await);
                     }
                 }
             }
@@ -2054,27 +2400,27 @@ impl SessionActor {
     /// Record the current model for model-switch detection on the next turn.
     pub(crate) async fn record_turn_model(&self) {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
-            self.compaction.previous_model.set(Some(
-                crate::session::compaction_config::PreviousModelInfo {
-                    model_slug: cfg.model.clone(),
-                    context_window: cfg.context_window.get(),
-                    comp_hash: self.current_codex_comp_hash(),
-                },
-            ));
+            let previous_model = crate::session::compaction_config::PreviousModelInfo {
+                model_slug: cfg.model.clone(),
+                context_window: cfg.context_window.get(),
+                comp_hash: self.codex_comp_hash_for_model(&cfg.model),
+            };
+            self.compaction
+                .previous_model
+                .set(Some(previous_model.clone()));
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::PreviousTurnModel(previous_model));
         }
     }
 
-    /// Codex compaction-compatibility hash for the session's current model,
-    /// from the live Codex catalog.
-    ///
-    /// Currently always `None`: `comp_hash` is per-model catalog metadata
-    /// (`/models` → `CodexWireModel.comp_hash`) and the catalog structs live
-    /// in `codex_models.rs`, outside this port stage's editable surface — see
-    /// the phase-8 integration notes for the exact plumbing. `None` is a safe
-    /// "no signal": [`comp_hash_changed`] fires only between two *present*
-    /// values, so nothing triggers until the metadata lands.
-    fn current_codex_comp_hash(&self) -> Option<String> {
-        None
+    /// Account-fenced Codex compaction-compatibility hash from the live model
+    /// catalog. Missing metadata remains a safe "no signal".
+    fn codex_comp_hash_for_model(&self, model: &str) -> Option<String> {
+        self.models_manager
+            .codex_compaction_metadata(model)
+            .and_then(|metadata| metadata.comp_hash)
     }
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
     /// Emits telemetry (`auto_compact_fired`) and UI notifications automatically.

@@ -180,6 +180,14 @@ impl PromptUsage {
             && cache_creation_tokens == 0
             && self.model_usage.is_empty()
     }
+
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.totals.cache_hit_rate()
+    }
+
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.totals.cache_hit_rate_pct()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -221,6 +229,19 @@ pub struct PromptUsageModel {
     /// `cost_is_partial` only — never on the public ACP wire.
     #[serde(default, skip_serializing)]
     pub cost_missing_calls: u64,
+}
+
+impl PromptUsageModel {
+    /// Uses the full session input total as the denominator; cached reads are
+    /// already included in `input_tokens` on this aggregate ACP shape.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.input_tokens != 0)
+            .then(|| self.cached_read_tokens as f64 / self.input_tokens as f64 * 100.0)
+    }
+
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.cache_hit_rate().unwrap_or(0.0)
+    }
 }
 
 /// One model call's token usage: the four Messages API `message.usage` fields

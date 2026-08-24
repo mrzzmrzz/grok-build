@@ -1205,6 +1205,12 @@ pub struct MCPOutput {
     /// `to_value`/`from_value`; session drains before PostToolUse and ACP.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extracted_images: Vec<crate::util::base64_images::ExtractedImage>,
+    /// Original MCP `CallToolResult`, retained as protocol-shaped JSON for
+    /// Code Mode. The prompt-facing renderer still uses `output`, while this
+    /// preserves structuredContent, typed content blocks, annotations and
+    /// protocol metadata for JavaScript callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_tool_result: Option<serde_json::Value>,
 }
 impl MCPOutput {
     pub fn okay_output(tool_name: String, server_name: String, output: String) -> Self {
@@ -1217,6 +1223,7 @@ impl MCPOutput {
             is_timeout: false,
             is_error: false,
             extracted_images: Vec::new(),
+            call_tool_result: None,
         }
     }
     pub fn errored(tool_name: String, server_name: String, error: String) -> Self {
@@ -1229,6 +1236,7 @@ impl MCPOutput {
             is_timeout: false,
             is_error: true,
             extracted_images: Vec::new(),
+            call_tool_result: None,
         }
     }
     pub fn output(&self) -> &MCPOutputDetails {

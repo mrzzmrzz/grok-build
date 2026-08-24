@@ -217,6 +217,7 @@ pub(crate) async fn spawn_session_actor(
     compaction_verbatim_input: bool,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
+    remote_compaction_v2: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -316,6 +317,13 @@ pub(crate) async fn spawn_session_actor(
     ),
     xai_grok_agent::AgentBuildError,
 > {
+    if startup_hints
+        .cache_affinity_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        startup_hints.cache_affinity_id = Some(session_info.id.to_string());
+    }
     if max_turns == Some(0) {
         return Err(xai_grok_agent::AgentBuildError::InvalidConfig(
             "max_turns must be greater than 0".to_string(),
@@ -801,6 +809,7 @@ pub(crate) async fn spawn_session_actor(
                 .and_then(|r| r.compaction_wall_clock_budget_secs),
         ),
         two_pass_enabled,
+        remote_compaction_v2,
     };
     let reminder_policy = resolve_reminder_policy(remote_settings.as_ref(), todo_gate);
     let (user_question_tx, user_question_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -1166,7 +1175,6 @@ pub(crate) async fn spawn_session_actor(
     let system_prompt = agent.system_prompt().to_string();
     let mut prompt_context = agent.prompt_context().clone();
     prompt_context.normalize_for_persistence();
-    save_prompt_context(&session_info, &prompt_context);
     let is_subagent_spawn = startup_hints.is_subagent;
     let session_non_interactive = startup_hints.non_interactive;
     install_system_prompt(
@@ -1176,6 +1184,9 @@ pub(crate) async fn spawn_session_actor(
         startup_hints.preserve_inherited_system,
         &system_prompt,
     );
+    if installed_system_matches_rendered_prompt(&conversation, &system_prompt) {
+        save_prompt_context(&session_info, &prompt_context);
+    }
     if !startup_hints.preserve_inherited_system
         && !conversation_has_project_instructions(&conversation)
         && let Some(agents_md_reminder) = agent.agents_md_user_reminder()
@@ -1758,6 +1769,7 @@ pub(crate) async fn spawn_session_actor(
         git_head_enabled: fs_watch_caps.git_head,
         status_line_enabled: status_line_enabled.clone(),
         models_manager,
+        cache_tracker: std::cell::RefCell::new(crate::session::CacheTracker::new()),
         display_cwd: {
             let lock = std::sync::OnceLock::new();
             if let Some(ref cwd) = prompt_display_cwd {
@@ -2317,6 +2329,7 @@ pub(crate) async fn spawn_session_on_thread(
     compaction_verbatim_input: bool,
     compaction_tool_choice: crate::util::config::CompactionToolChoice,
     two_pass_enabled: bool,
+    remote_compaction_v2: bool,
     buffering_settings: Option<BufferingSettings>,
     origin_client: Option<crate::http::OriginClientInfo>,
     codebase_indexes: std::sync::Arc<parking_lot::Mutex<CodebaseIndexManager>>,
@@ -2502,6 +2515,7 @@ pub(crate) async fn spawn_session_on_thread(
                         compaction_verbatim_input,
                         compaction_tool_choice,
                         two_pass_enabled,
+                        remote_compaction_v2,
                         buffering_settings,
                         origin_client,
                         codebase_indexes,

@@ -183,6 +183,8 @@ pub(crate) mod hydrate {
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,
+            cache_affinity_id: Some(info.id.0.to_string()),
+            previous_turn_model: None,
             // A session pulled from the xAI backend was, by definition,
             // synced there — Codex-marked sessions never upload.
             ever_used_codex: false,

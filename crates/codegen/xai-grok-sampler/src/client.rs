@@ -223,6 +223,7 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
         Err(first_err) => {
             // Try sanitizing: parse as Value, strip unknown tools, retry.
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
+                normalize_compaction_output_ids(&mut value);
                 // Strip tools that async_openai's rs::Tool can't deserialize
                 // (e.g., xAI-specific "x_search"). Instead of maintaining a
                 // hardcoded allowlist, try deserializing each tool entry —
@@ -244,6 +245,35 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+/// async-openai 0.33.1 requires `CompactionBody.id`, while the Responses
+/// wire permits the field to be absent. Insert an empty typed-boundary
+/// sentinel only for decoding; the conversation converter omits it from
+/// provider replay.
+fn normalize_compaction_output_ids(value: &mut serde_json::Value) {
+    fn fill(item: &mut serde_json::Value) {
+        let Some(item) = item.as_object_mut() else {
+            return;
+        };
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            && !item.contains_key("id")
+        {
+            item.insert("id".to_owned(), serde_json::Value::String(String::new()));
+        }
+    }
+
+    if let Some(item) = value.get_mut("item") {
+        fill(item);
+    }
+    if let Some(output) = value
+        .pointer_mut("/response/output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in output {
+            fill(item);
+        }
+    }
 }
 
 /// Classify a Responses-event decode failure before logging it. An unknown
@@ -375,6 +405,30 @@ fn splice_extra_tool_entries(
     }
 }
 
+fn patch_raw_input_replacements(
+    request_body: &mut serde_json::Value,
+    replacements: &[xai_grok_sampling_types::RawInputItemReplacement],
+) -> Result<()> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let input = request_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(SamplingError::InvalidConfiguration(
+            "Codex raw input replacements require an input array",
+        ))?;
+    for replacement in replacements {
+        let slot = input.get_mut(replacement.input_item_index).ok_or(
+            SamplingError::InvalidConfiguration(
+                "Codex raw input replacement index is out of range",
+            ),
+        )?;
+        *slot = replacement.value.clone();
+    }
+    Ok(())
+}
+
 /// The ChatGPT Codex backend rejects `system`-role input items outright
 /// ("System messages are not allowed"). Reshape a serialized Responses body
 /// for the Codex dialect: the contiguous leading run of system messages
@@ -399,8 +453,7 @@ fn patch_codex_instruction_roles(request_body: &mut serde_json::Value) {
             continue;
         }
         if in_leading_prefix
-            && let Some(text) =
-                responses_message_text(&item).filter(|text| !text.trim().is_empty())
+            && let Some(text) = responses_message_text(&item).filter(|text| !text.trim().is_empty())
         {
             leading_instructions.push(text);
             continue;
@@ -521,6 +574,174 @@ struct StreamOptions {
     include_usage: bool,
 }
 
+/// Successful Codex remote-compaction-v2 stream result. Installation remains
+/// the shell's responsibility so a partial/retried stream cannot mutate live
+/// conversation state.
+#[derive(Debug, Clone)]
+pub struct CodexRemoteCompactionV2Result {
+    pub compaction_item: xai_grok_sampling_types::ConversationItem,
+    pub response_id: String,
+    pub usage: Option<rs::ResponseUsage>,
+    pub turn_state: Option<String>,
+}
+
+#[derive(Default)]
+struct CodexRemoteCompactionV2Collector {
+    output_item_count: usize,
+    compaction_items: Vec<serde_json::Value>,
+    completed_response_id: Option<String>,
+    completed_usage: Option<rs::ResponseUsage>,
+    saw_completed: bool,
+}
+
+impl CodexRemoteCompactionV2Collector {
+    fn absorb(&mut self, event_name: &str, data: &str) -> Result<()> {
+        if let Some(error) = try_parse_stream_error(data) {
+            return Err(error);
+        }
+        let value = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(SamplingError::Serialization)?;
+        let event_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(event_name);
+        match event_type {
+            "response.output_item.done" => {
+                self.output_item_count = self.output_item_count.saturating_add(1);
+                let item = value
+                    .get("item")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 output_item.done contained no item",
+                        )
+                    })?;
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                    self.compaction_items
+                        .push(serde_json::Value::Object(item.clone()));
+                }
+            }
+            "response.completed" => {
+                let response = value
+                    .get("response")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 response.completed contained no response",
+                        )
+                    })?;
+                let response_id = response
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        SamplingError::serialization_message(
+                            "Codex remote compaction v2 response.completed contained no response id",
+                        )
+                    })?;
+                self.completed_response_id = Some(response_id.to_owned());
+                self.completed_usage = response
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .cloned()
+                    .map(normalize_codex_remote_compaction_usage)
+                    .transpose()?;
+                self.saw_completed = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self, turn_state: Option<String>) -> Result<CodexRemoteCompactionV2Result> {
+        if !self.saw_completed {
+            return Err(SamplingError::EventStreamError(
+                "Codex remote compaction v2 stream closed before response.completed".to_owned(),
+            ));
+        }
+        if self.compaction_items.len() != 1 {
+            return Err(SamplingError::serialization_message(format!(
+                "Codex remote compaction v2 expected exactly one compaction output item, got {} from {} output items",
+                self.compaction_items.len(),
+                self.output_item_count,
+            )));
+        }
+        let mut items = xai_grok_sampling_types::codex_compact_output_to_conversation_items(
+            self.compaction_items,
+        )
+        .map_err(SamplingError::serialization_message)?;
+        let compaction_item = items.pop().ok_or_else(|| {
+            SamplingError::serialization_message(
+                "Codex remote compaction v2 produced no replayable compaction item",
+            )
+        })?;
+        Ok(CodexRemoteCompactionV2Result {
+            compaction_item,
+            response_id: self.completed_response_id.ok_or_else(|| {
+                SamplingError::serialization_message(
+                    "Codex remote compaction v2 completed without a response id",
+                )
+            })?,
+            usage: self.completed_usage,
+            turn_state,
+        })
+    }
+}
+
+fn normalize_codex_remote_compaction_usage(usage: serde_json::Value) -> Result<rs::ResponseUsage> {
+    fn insert_default(
+        object: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        default: serde_json::Value,
+    ) {
+        if object.get(key).is_none_or(serde_json::Value::is_null) {
+            object.insert(key.to_owned(), default);
+        }
+    }
+
+    let mut usage = usage
+        .as_object()
+        .cloned()
+        .ok_or_else(|| SamplingError::serialization_message("Responses usage is not an object"))?;
+    insert_default(&mut usage, "input_tokens", serde_json::json!(0));
+    insert_default(&mut usage, "output_tokens", serde_json::json!(0));
+    let total_tokens = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        .saturating_add(
+            usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        )
+        .min(u64::from(u32::MAX));
+    insert_default(&mut usage, "total_tokens", serde_json::json!(total_tokens));
+    insert_default(
+        &mut usage,
+        "input_tokens_details",
+        serde_json::json!({"cached_tokens": 0}),
+    );
+    insert_default(
+        &mut usage,
+        "output_tokens_details",
+        serde_json::json!({"reasoning_tokens": 0}),
+    );
+    if let Some(details) = usage
+        .get_mut("input_tokens_details")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        insert_default(details, "cached_tokens", serde_json::json!(0));
+    }
+    if let Some(details) = usage
+        .get_mut("output_tokens_details")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        insert_default(details, "reasoning_tokens", serde_json::json!(0));
+    }
+    serde_json::from_value(serde_json::Value::Object(usage)).map_err(SamplingError::Serialization)
+}
+
 fn append_response_includes(body: &mut serde_json::Value, extra_includes: &[String]) {
     if extra_includes.is_empty() {
         return;
@@ -622,6 +843,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    idle_timeout_secs: Option<u64>,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request
@@ -947,6 +1169,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
+            idle_timeout_secs: config.idle_timeout_secs,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -1126,6 +1349,133 @@ impl SamplingClient {
             })?,
         );
         Ok(Some(headers))
+    }
+
+    /// Run Codex remote compaction v2 over the normal streaming Responses
+    /// endpoint. The stream must yield exactly one durable compaction item and
+    /// a terminal `response.completed`; installation is left to the caller.
+    pub async fn compact_codex_conversation_v2(
+        &self,
+        mut request: ConversationRequest,
+        instructions: &str,
+        capability_declared: bool,
+    ) -> Result<CodexRemoteCompactionV2Result> {
+        if self.defaults.provider_profile.provider != ModelProvider::Codex
+            || !matches!(self.defaults.api_backend, ApiBackend::Responses)
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 requires the Codex provider profile over the Responses backend",
+            ));
+        }
+        if request.items.is_empty() {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 requires non-empty conversation input",
+            ));
+        }
+        let beta_headers = self
+            .codex_remote_compaction_v2_headers(capability_declared)?
+            .ok_or(SamplingError::InvalidConfiguration(
+                "remote compaction v2 was not declared by the live Codex model catalog",
+            ))?;
+
+        self.apply_conversation_defaults(&mut request)?;
+        request.trace.take();
+        let raw_input_replacements = request.raw_codex_input_replacements();
+        let extra_tool_entries = xai_grok_sampling_types::extra_tool_entries(
+            &request.hosted_tools,
+            self.defaults.provider_profile,
+        );
+        let inner: rs::CreateResponse = (&request).into();
+        let mut request_body = serde_json::to_value(inner).map_err(|error| {
+            tracing::error!(%error, "failed to serialize Codex remote compaction v2 request");
+            SamplingError::Serialization(error)
+        })?;
+        splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
+        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        patch_codex_instruction_roles(&mut request_body);
+        shape_codex_remote_compaction_v2_body(&mut request_body, instructions);
+
+        let endpoint = self.endpoint("responses");
+        let timeout_secs = self
+            .defaults
+            .idle_timeout_secs
+            .unwrap_or(300)
+            .saturating_mul(4)
+            .max(1);
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(endpoint.clone());
+        let http_request = apply_codex_turn_state(
+            builder,
+            self.defaults.provider_profile,
+            request.turn_state.as_deref(),
+        )
+        .headers(beta_headers)
+        .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .json(&request_body);
+        let response = http_request.send().await.map_err(SamplingError::Http)?;
+        let status = response.status();
+        let model_metadata = extract_model_metadata(response.headers());
+        let turn_state = model_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.turn_state.clone());
+        let retry_after_secs = extract_retry_after(response.headers());
+        let should_retry = extract_should_retry(response.headers());
+        if !status.is_success() {
+            let bytes = response.bytes().await.map_err(SamplingError::Http)?;
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ResponsesStream,
+                    sent_bearer.as_deref(),
+                );
+                let server_message = user_facing_api_error_message(status, bytes.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {endpoint}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
+            }
+            let message = user_facing_api_error_message(status, bytes.as_ref());
+            return Err(SamplingError::Api {
+                status,
+                message,
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
+            });
+        }
+
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        let mut first = true;
+        let byte_stream = response.bytes_stream().map(move |result| {
+            result.map(|bytes| {
+                if first {
+                    first = false;
+                    if bytes.starts_with(UTF8_BOM) {
+                        return bytes.slice(UTF8_BOM.len()..);
+                    }
+                }
+                bytes
+            })
+        });
+        let mut event_stream = byte_stream.eventsource();
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        while let Some(event) = event_stream.next().await {
+            let event =
+                event.map_err(|error| SamplingError::EventStreamError(error.to_string()))?;
+            if event.data == "[DONE]" {
+                break;
+            }
+            collector.absorb(&event.event, &event.data)?;
+            if collector.saw_completed {
+                break;
+            }
+        }
+        collector.finish(turn_state)
     }
 
     /// Invoke the optional 401 attribution callback for one logical
@@ -1568,11 +1918,13 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
+        let raw_input_replacements = std::mem::take(&mut request.raw_input_replacements);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
@@ -1712,6 +2064,7 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
+        let raw_input_replacements = std::mem::take(&mut request.raw_input_replacements);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
@@ -1721,6 +2074,7 @@ impl SamplingClient {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
+        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         if self.defaults.provider_profile.provider == ModelProvider::Codex {
@@ -2291,6 +2645,7 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let turn_state = request.turn_state.clone();
+        let raw_input_replacements = request.raw_codex_input_replacements();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
         // `splice_extra_tool_entries`, whose doc explains why each one does. The
@@ -2310,6 +2665,7 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        wrapper.raw_input_replacements = raw_input_replacements;
         wrapper.turn_state = turn_state;
 
         if let Some(trace) = trace {
@@ -2335,6 +2691,7 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let turn_state = request.turn_state.clone();
+        let raw_input_replacements = request.raw_codex_input_replacements();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
         // `splice_extra_tool_entries`, whose doc explains why each one does. The
@@ -2354,6 +2711,7 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        wrapper.raw_input_replacements = raw_input_replacements;
         wrapper.turn_state = turn_state;
 
         if let Some(trace) = trace {
@@ -2451,15 +2809,14 @@ impl SamplingClient {
                     .filter_map(|tool| tool.client_custom_name().map(str::to_owned))
                     .collect();
                 let (raw, meta, doom_loop) = self.conversation_stream_responses(request).await?;
-                let events =
-                    crate::stream::stream_responses_with_client_custom_tools(
-                        raw,
-                        meta,
-                        request_id,
-                        idle_timeout,
-                        doom_loop,
-                        client_custom_tool_names,
-                    );
+                let events = crate::stream::stream_responses_with_client_custom_tools(
+                    raw,
+                    meta,
+                    request_id,
+                    idle_timeout,
+                    doom_loop,
+                    client_custom_tool_names,
+                );
                 crate::stream::collect_response(events).await
             }
             ApiBackend::Messages => {
@@ -2958,7 +3315,10 @@ mod tests {
             ..minimal_config()
         })
         .unwrap();
-        assert_eq!(codex.codex_remote_compaction_v2_headers(false).unwrap(), None);
+        assert_eq!(
+            codex.codex_remote_compaction_v2_headers(false).unwrap(),
+            None
+        );
 
         // Declared: exactly the beta header.
         let headers = codex
@@ -3011,7 +3371,12 @@ mod tests {
         });
         shape_codex_remote_compaction_v2_body(&mut body, "compact this conversation");
         let map = body.as_object().unwrap();
-        for dropped in ["temperature", "max_output_tokens", "previous_response_id", "x_custom"] {
+        for dropped in [
+            "temperature",
+            "max_output_tokens",
+            "previous_response_id",
+            "x_custom",
+        ] {
             assert!(!map.contains_key(dropped), "{dropped} must be dropped");
         }
         assert_eq!(map["store"], serde_json::json!(false));
@@ -3038,6 +3403,107 @@ mod tests {
                 .filter(|i| i["type"] == "compaction_trigger")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_requires_one_done_item_and_completion() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        collector
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "ignored"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        collector
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {"type": "compaction", "encrypted_content": "opaque"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_completed",
+                        "usage": {"input_tokens": 120, "output_tokens": 8}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let result = collector.finish(Some("sticky-state".into())).unwrap();
+        assert_eq!(result.response_id, "resp_completed");
+        assert_eq!(result.usage.unwrap().total_tokens, 128);
+        assert_eq!(result.turn_state.as_deref(), Some("sticky-state"));
+        let request = ConversationRequest::from_items(vec![result.compaction_item]);
+        let replay = request.raw_codex_input_replacements();
+        assert_eq!(replay[0].value["encrypted_content"], "opaque");
+        assert!(replay[0].value.get("id").is_none());
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_rejects_incomplete_or_ambiguous_streams() {
+        let mut incomplete = CodexRemoteCompactionV2Collector::default();
+        incomplete
+            .absorb(
+                "response.output_item.done",
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "compaction", "encrypted_content": "opaque"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert!(
+            incomplete
+                .finish(None)
+                .unwrap_err()
+                .to_string()
+                .contains("closed before response.completed")
+        );
+
+        let mut duplicate = CodexRemoteCompactionV2Collector::default();
+        let done = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "compaction", "encrypted_content": "opaque"}
+        })
+        .to_string();
+        duplicate
+            .absorb("response.output_item.done", &done)
+            .unwrap();
+        duplicate
+            .absorb("response.output_item.done", &done)
+            .unwrap();
+        duplicate
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_completed"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert!(
+            duplicate
+                .finish(None)
+                .unwrap_err()
+                .to_string()
+                .contains("expected exactly one compaction output item, got 2")
         );
     }
 

@@ -51,6 +51,18 @@ pub(crate) fn subagent_template() -> Zeroizing<String> {
     decrypt(SUBAGENT_PROMPT_ENC, PROMPT_SEEDS[2])
 }
 
+/// The Codex provider keeps the compact subagent contract while identifying
+/// the runtime accurately instead of inheriting the primary-session prompt.
+pub(crate) fn codex_subagent_template() -> Zeroizing<String> {
+    let mut template = subagent_template();
+    let first_line_end = template.find('\n').unwrap_or(template.len());
+    template.replace_range(
+        ..first_line_end,
+        "You are a Codex coding subagent running in Grok Build — a focused worker delegated a specific task.",
+    );
+    template
+}
+
 /// The compact system prompt used after conversation compaction.
 pub const COMPACT_SYSTEM_PROMPT: &str = "You are an AI coding agent. You operate in a workspace with a provided codebase.\n\n\
      Your main goal is to complete the user's request, denoted within the <user_query> tag.";
@@ -509,6 +521,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagent_template_is_compact_and_provider_accurate() {
+        let template = codex_subagent_template();
+        assert!(template.starts_with("You are a Codex coding subagent running in Grok Build"));
+        assert!(!template.contains("released by xAI"));
+        assert!(template.len() < apply_patch_template().len());
+    }
+
+    #[test]
     fn test_apply_patch_template_plan_absent_omits_planning() {
         // Renderer without Plan tool
         let tools: HashMap<ToolKind, String> = [
@@ -695,12 +715,8 @@ mod tests {
                     .map(|e| i + 3 + e + 2)
                     .unwrap_or(bytes.len());
                 let body = std::str::from_utf8(&bytes[i + 3..end - 2]).unwrap().trim();
-                // search_tool and use_tool are always built-in, so they
-                // never need a guard.
-                const ALWAYS_BUILTIN: &[&str] = &["search_tool", "use_tool"];
                 if let Some(kind) = body.strip_prefix("tools.by_kind.")
                     && kind.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    && !ALWAYS_BUILTIN.contains(&kind)
                     && !stack.iter().any(|c| guarantees(c, kind))
                 {
                     let line = template[..i].lines().count() + 1;
@@ -721,6 +737,15 @@ mod tests {
         assert_guards(&base_template(), "prompt.md");
         assert_guards(&subagent_template(), "subagent_prompt.md");
         assert_guards(&apply_patch_template(), "apply_patch_prompt.md");
+    }
+
+    #[test]
+    fn codex_prompt_keeps_grok_build_host_without_xai_or_meta_dispatch_philosophy() {
+        let prompt = render_apply_patch(&default_renderer(), &default_placeholders());
+        assert!(prompt.contains("coding agent running in the Grok Build CLI"));
+        for retired in ["released by xAI", "search_tool", "use_tool"] {
+            assert!(!prompt.contains(retired), "Codex prompt leaked `{retired}`");
+        }
     }
 
     // ── Combination sweep ───────────────────────────────────────────

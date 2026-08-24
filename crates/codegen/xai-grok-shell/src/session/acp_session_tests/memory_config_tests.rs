@@ -244,6 +244,7 @@ async fn create_test_actor_with_memory(
         git_head_enabled: false,
         status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         models_manager: Default::default(),
+        cache_tracker: std::cell::RefCell::new(crate::session::CacheTracker::new()),
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
         queue_exit_reminder_on_approved_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),

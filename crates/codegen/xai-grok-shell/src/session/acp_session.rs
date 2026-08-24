@@ -825,6 +825,8 @@ pub(crate) struct SessionActor {
     pub(crate) status_line_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Shared models manager for etag-triggered refresh from response headers.
     pub(crate) models_manager: crate::agent::models::ModelsManager,
+    /// Codex Responses prompt-cache telemetry for this live session.
+    pub(crate) cache_tracker: std::cell::RefCell<crate::session::CacheTracker>,
     /// Stable display path for forked sessions (original project path).
     ///
     /// Used by `build_user_message_prefix` (user-message `Workspace Path`),
@@ -1266,6 +1268,14 @@ pub(crate) struct TraceConfigTemplate {
     pub(crate) upload_method: crate::session::repo_changes::UploadMethod,
 }
 impl SessionActor {
+    /// Stable prompt-cache identity stamped on Codex Responses requests.
+    pub(crate) fn prompt_cache_affinity_id(&self) -> String {
+        crate::session::persistence::resolve_prompt_cache_affinity_id(
+            self.session_info.id.0.as_ref(),
+            self.startup_hints.cache_affinity_id.as_deref(),
+        )
+    }
+
     /// Get the signals handle for tracking session events.
     fn signals_handle(&self) -> SessionSignalsHandle {
         self.feedback_manager.signals_handle()
@@ -1445,6 +1455,17 @@ impl SessionActor {
     }
 }
 const PROMPT_CONTEXT_FILENAME: &str = "prompt_context.json";
+
+fn installed_system_matches_rendered_prompt(
+    conversation: &[ConversationItem],
+    rendered_prompt: &str,
+) -> bool {
+    matches!(
+        conversation.first(),
+        Some(ConversationItem::System(system)) if system.content.as_ref() == rendered_prompt
+    )
+}
+
 /// Persist the structured prompt context to `{session_dir}/prompt_context.json`.
 ///
 /// This is best-effort: failures are logged but do not block session creation.

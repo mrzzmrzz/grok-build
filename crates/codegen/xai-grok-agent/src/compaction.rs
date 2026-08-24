@@ -31,6 +31,10 @@ pub struct CompactionPolicy {
     /// config (`two_pass_compaction` flag) at session build; `false` keeps the
     /// legacy single-pass path. Default `false` (real sessions set it from config).
     pub two_pass_enabled: bool,
+
+    /// Use Codex's streaming `remote_compaction_v2` Responses protocol for
+    /// Codex sessions. The shell resolves the feature once at session spawn.
+    pub remote_compaction_v2: bool,
 }
 
 impl Default for CompactionPolicy {
@@ -41,6 +45,7 @@ impl Default for CompactionPolicy {
             memory_flush_enabled: false,
             wall_clock_budget_secs: 300,
             two_pass_enabled: false,
+            remote_compaction_v2: true,
         }
     }
 }

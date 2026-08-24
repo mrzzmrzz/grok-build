@@ -27,15 +27,7 @@ pub(crate) const SUPPRESS_AUTH: u8 = 4;
 
 /// Model slug, context window, and Codex compaction-compatibility hash from
 /// the previous turn.
-#[derive(Clone, Debug)]
-pub(crate) struct PreviousModelInfo {
-    pub model_slug: String,
-    pub context_window: u64,
-    /// Opaque Codex catalog `comp_hash` snapshotted with the turn's model.
-    /// `None` means "no signal" (xAI models, or catalog metadata not yet
-    /// plumbed) — see `comp_hash_changed` in `session/compaction.rs`.
-    pub comp_hash: Option<String>,
-}
+pub(crate) use crate::session::acp_types::PreviousTurnModel as PreviousModelInfo;
 
 /// Cached result of an **async** (background / prefire) pass-1 sample for
 /// two-pass compaction. Held on the session actor between the background

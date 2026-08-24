@@ -94,7 +94,7 @@ impl MvpAgent {
     pub(super) fn build_summary_client(
         &self,
         primary: &SamplingConfig,
-    ) -> Result<(OaiCompatClient, String), acp::Error> {
+    ) -> Result<(OaiCompatClient, String, bool), acp::Error> {
         let slug = self.resolve_session_summary_model();
         let slug_is_explicit = self.cfg.borrow().session_summary_pin.is_explicit();
         let resolved_aux = if summary_aux_resolution_allowed(primary, slug_is_explicit) {
@@ -130,9 +130,12 @@ impl MvpAgent {
             None
         };
         let config = plan_summary_sampler_config(primary, slug, resolved_aux, slug_is_explicit);
+        let revoke_on_codex = !slug_is_explicit
+            && config.provider_profile.provider
+                == xai_grok_sampling_types::ModelProvider::Xai;
         let model = config.model.clone();
         let client = OaiCompatClient::new(config).map_err(map_sampling_err_to_acp)?;
-        Ok((client, model))
+        Ok((client, model, revoke_on_codex))
     }
     fn has_proxy_credentials(&self) -> bool {
         self.cfg.borrow().endpoints.deployment_key.is_some()
@@ -4264,7 +4267,15 @@ impl MvpAgent {
             );
             std::sync::Arc::new(TerminalRunner::new(notifier, session_info.id.clone()))
         };
-        let startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
+        let mut startup_hints = startup_hints_from_meta(session_meta, init.meta.as_ref());
+        startup_hints.cache_affinity_id =
+            crate::session::persistence::cache_affinity_from_session_dir(
+                &crate::session::persistence::session_dir(&session_info),
+            );
+        startup_hints.previous_turn_model =
+            crate::session::persistence::previous_turn_model_from_session_dir(
+                &crate::session::persistence::session_dir(&session_info),
+            );
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities
@@ -4443,6 +4454,7 @@ impl MvpAgent {
             .is_feature_enabled(crate::agent::config::Feature::CompactionVerbatimInput);
         let compaction_tool_choice = self.cfg.borrow().resolve_compaction_tool_choice();
         let two_pass_enabled = self.cfg.borrow().is_two_pass_compaction_enabled();
+        let remote_compaction_v2 = self.cfg.borrow().is_remote_compaction_v2_enabled();
         let auto_update = self.cfg.borrow().cli.auto_update;
         let client_type = *self.client_type.borrow();
         let buffering_settings = self.buffering_settings.borrow().clone();
@@ -4878,6 +4890,7 @@ impl MvpAgent {
                     compaction_verbatim_input,
                     compaction_tool_choice,
                     two_pass_enabled,
+                    remote_compaction_v2,
                     buffering_settings,
                     origin_client.clone(),
                     self.codebase_indexes.clone(),
@@ -5057,6 +5070,14 @@ impl MvpAgent {
             });
         self.notify_session_cwd_for_watch(std::path::Path::new(&session_info.cwd));
         self.activity.register_session(&session_info.id.0, &handle);
+        // Persistence is created before chat state. Install its live monotonic
+        // provenance guard before exposing the resident session, so the first
+        // prompt cannot use a stale xAI summary client after a Codex switch.
+        let _ = handle.persistence_tx.send(
+            crate::session::persistence::PersistenceMsg::SetSummaryCodexGuard(
+                handle.chat_state_handle.clone(),
+            ),
+        );
         if let Some(old) = self.insert_resident(&session_info.id, handle)
             && let Some(scope) = &old.tool_context.process_scope
         {

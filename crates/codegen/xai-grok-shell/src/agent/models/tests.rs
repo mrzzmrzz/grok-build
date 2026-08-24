@@ -2452,10 +2452,7 @@ mod codex_catalog {
             initial.and_then(crate::codex_models::account_fingerprint),
         ));
         let probe_slot = Arc::clone(&slot);
-        (
-            slot,
-            Arc::new(move || probe_slot.lock().unwrap().clone()),
-        )
+        (slot, Arc::new(move || probe_slot.lock().unwrap().clone()))
     }
 
     fn fingerprint_of(account: &CodexCredentials) -> String {
@@ -2518,7 +2515,8 @@ mod codex_catalog {
         assert!(!lists_model(&mgr, "gpt-6-live"));
 
         // Background half fetches, maps, and merges the live catalog.
-        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr))
+            .await;
         assert!(lists_model(&mgr, "gpt-6-live"));
         assert!(
             lists_model(&mgr, "grok-4.6"),
@@ -2567,7 +2565,8 @@ mod codex_catalog {
         let (mgr, _mgr_tmp) = manager_with_codex_account(Some(&codex_credentials("account-2")));
         // The fetch runs as account-1 but account-2 is current by publish
         // time: the catalog must be dropped and the cache invalidated.
-        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr))
+            .await;
         server.abort();
         assert!(!lists_model(&mgr, "gpt-6-live"));
         assert!(!client.cache_path().exists());
@@ -2584,10 +2583,12 @@ mod codex_catalog {
         let client = codex_client(tmp.path(), &base_url, auth);
 
         let (mgr, _mgr_tmp) = manager_with_codex_account(Some(&codex_credentials("account-1")));
-        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr))
+            .await;
         let first = serde_json::to_string(&mgr.models()).unwrap();
         // Revalidating an identical catalog (cache is fresh now) is a no-op.
-        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr))
+            .await;
         server.abort();
         assert_eq!(serde_json::to_string(&mgr.models()).unwrap(), first);
     }
@@ -2629,6 +2630,39 @@ mod codex_catalog {
         ));
         assert!(lists_model(&mgr, "gpt-b-live"));
         assert!(!lists_model(&mgr, "gpt-a-live"));
+    }
+
+    #[test]
+    fn codex_compaction_metadata_is_live_and_account_fenced() {
+        let account_a = codex_credentials("account-a");
+        let account_b = codex_credentials("account-b");
+        let (slot, probe) = switchable_probe(Some(&account_a));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+        let mut metadata = IndexMap::new();
+        metadata.insert(
+            "gpt-a-live".to_owned(),
+            CodexCompactionMetadata {
+                auto_compact_token_limit: Some(300_000),
+                comp_hash: Some("3000".to_owned()),
+            },
+        );
+        assert!(mgr.set_codex_models_with_metadata_fenced(
+            live_entries("gpt-a-live"),
+            metadata,
+            fingerprint_of(&account_a),
+            codex_generation(&mgr),
+        ));
+        let current = mgr
+            .codex_compaction_metadata("gpt-a-live")
+            .expect("current account metadata");
+        assert_eq!(current.auto_compact_token_limit, Some(300_000));
+        assert_eq!(current.comp_hash.as_deref(), Some("3000"));
+
+        *slot.lock().unwrap() = Some(fingerprint_of(&account_b));
+        assert!(
+            mgr.codex_compaction_metadata("gpt-a-live").is_none(),
+            "metadata from account A must not be visible to account B"
+        );
     }
 
     /// Failure / disabled-fetch path: with no successful refresh for B, A's

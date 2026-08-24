@@ -2,8 +2,8 @@
 //! plan-mode reminders and persistence, active-template detection), plus the
 //! Code Mode session integration (per-turn plan refresh, nested-call bridge,
 //! cell termination).
-use super::*;
 use super::tool_calls::{PlanEditGate, plan_mode_edit_gate};
+use super::*;
 pub(super) fn prompt_mode_from_session_mode_id(session_mode_id: &acp::SessionModeId) -> PromptMode {
     use xai_grok_tools::types::SessionMode;
     match SessionMode::from_id(session_mode_id.0.as_ref()) {
@@ -30,6 +30,59 @@ pub(super) fn filter_cursor_tools_by_plan_mode(
     _plan_active: bool,
 ) -> Vec<ToolDefinition> {
     defs
+}
+
+/// Map the registry's raw `server__tool` identity to Codex's model-visible
+/// MCP name while retaining the raw name used by the existing MCP handler.
+fn code_mode_tool_identity(registry_name: &str) -> (String, xai_grok_code_mode_protocol::ToolName) {
+    match crate::session::mcp_servers::parse_mcp_tool_name(registry_name) {
+        Some((server, tool)) => (
+            format!("mcp__{server}__{tool}"),
+            xai_grok_code_mode_protocol::ToolName::plain(registry_name),
+        ),
+        None => (
+            registry_name.to_string(),
+            xai_grok_code_mode_protocol::ToolName::plain(registry_name),
+        ),
+    }
+}
+
+/// Normalize the MCP input schema the same way Codex does before exposing it
+/// to the model: OpenAI function schemas require an object `properties` map.
+fn normalize_mcp_input_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(object) = &mut schema
+        && object
+            .get("properties")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        object.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+    schema
+}
+
+/// MCP calls resolve to the protocol `CallToolResult`, not directly to the
+/// server's `outputSchema`. Preserve that structured-content schema inside
+/// the same wrapper used by Codex CLI.
+fn mcp_call_tool_result_output_schema(
+    structured_content_schema: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "array",
+                "items": {"type": "object"}
+            },
+            "structuredContent": structured_content_schema,
+            "isError": {"type": "boolean"},
+            "_meta": {"type": "object"}
+        },
+        "required": ["content"],
+        "additionalProperties": false
+    })
 }
 impl SessionActor {
     pub(super) fn apply_prompt_modes_to_snapshot(&self, snapshot: &mut TurnDeltaSnapshot) {
@@ -444,10 +497,7 @@ impl SessionActor {
             .await
             .map(|c| c.model)
             .unwrap_or_default();
-        let mode = crate::agent::config::model_tool_mode(
-            &self.models_manager.models(),
-            &model_id,
-        );
+        let mode = crate::agent::config::model_tool_mode(&self.models_manager.models(), &model_id);
         if !mode.is_code_mode() {
             let previously_active = self.tool_context.code_mode.code_mode_active()
                 || self.tool_context.code_mode.handle().is_some();
@@ -471,7 +521,8 @@ impl SessionActor {
         let provider = self.model_auth_facts(&model_id).model_provider;
         let transport =
             xai_grok_sampling_types::ProviderProfile::for_provider(provider).code_mode_transport;
-        let raw_defs = Self::code_mode_nested_projection(defs);
+        let output_schemas = self.mcp_state.lock().await.mcp_tool_output_schemas.clone();
+        let raw_defs = Self::code_mode_nested_projection(defs, &output_schemas);
         let exec_description = xai_grok_code_mode_protocol::build_exec_tool_description(
             &raw_defs,
             /*deferred_tools*/ &[],
@@ -526,32 +577,42 @@ impl SessionActor {
     /// Project the registry tool definitions into the code-mode nested-tool
     /// namespace, excluding `exec`/`wait` themselves.
     ///
-    /// `output_schema` is deliberately `None` for every tool: nothing upstream
-    /// of this projection carries one. The sampling `ToolDefinition` /
-    /// `FunctionTool` the registry finalizes has `name`/`description`/
-    /// `parameters` only, `ToolMetadata` declares no output schema, and the
-    /// MCP client layer does not retain the servers' advertised
-    /// `outputSchema`. Publishing a guessed schema would be worse than none —
-    /// `build_exec_tool_description` renders it into the TypeScript
-    /// declarations the model codes against. Give it a real source (thread
-    /// `outputSchema` through MCP registration, or add one to `ToolMetadata`)
-    /// and this is the single place to project it.
+    /// MCP definitions use Codex's `mcp__server__tool` model-visible name while
+    /// retaining the registry's raw `server__tool` dispatch identity. Their
+    /// advertised output schema is wrapped in the MCP `CallToolResult` shape
+    /// that the nested runtime actually returns.
     fn code_mode_nested_projection(
         defs: &[crate::sampling::types::ToolDefinition],
+        output_schemas: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Vec<xai_grok_code_mode_protocol::ToolDefinition> {
         defs.iter()
-            .filter(|d| {
-                xai_grok_code_mode_protocol::is_code_mode_nested_tool(&d.function.name)
-            })
-            .map(|d| xai_grok_code_mode_protocol::ToolDefinition {
-                name: d.function.name.clone(),
-                tool_name: xai_grok_code_mode_protocol::ToolName::plain(
-                    d.function.name.clone(),
-                ),
-                description: d.function.description.clone().unwrap_or_default(),
-                kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
-                input_schema: Some(d.function.parameters.clone()),
-                output_schema: None,
+            .filter(|d| xai_grok_code_mode_protocol::is_code_mode_nested_tool(&d.function.name))
+            .map(|d| {
+                let registry_name = d.function.name.as_str();
+                let is_mcp =
+                    crate::session::mcp_servers::parse_mcp_tool_name(registry_name).is_some();
+                let (name, tool_name) = code_mode_tool_identity(registry_name);
+                let input_schema = if is_mcp {
+                    normalize_mcp_input_schema(d.function.parameters.clone())
+                } else {
+                    d.function.parameters.clone()
+                };
+                let output_schema = is_mcp.then(|| {
+                    mcp_call_tool_result_output_schema(
+                        output_schemas
+                            .get(registry_name)
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                    )
+                });
+                xai_grok_code_mode_protocol::ToolDefinition {
+                    name,
+                    tool_name,
+                    description: d.function.description.clone().unwrap_or_default(),
+                    kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                    input_schema: Some(input_schema),
+                    output_schema,
+                }
             })
             .collect()
     }
@@ -573,8 +634,7 @@ impl SessionActor {
         tokio::task::spawn_local(async move {
             while let Some(msg) = rx.recv().await {
                 let Some(session) = weak.upgrade() else { break };
-                let stale =
-                    session.tool_context.code_mode.current_generation() != generation;
+                let stale = session.tool_context.code_mode.current_generation() != generation;
                 match msg {
                     CodeModeBridgeMsg::NestedCall {
                         call,
@@ -582,10 +642,9 @@ impl SessionActor {
                         respond_to,
                     } => {
                         if stale {
-                            let _ = respond_to.send(Err(
-                                "code mode runtime was shut down; nested call rejected"
-                                    .to_string(),
-                            ));
+                            let _ = respond_to
+                                .send(Err("code mode runtime was shut down; nested call rejected"
+                                    .to_string()));
                             continue;
                         }
                         tokio::task::spawn_local(async move {
@@ -660,7 +719,9 @@ impl SessionActor {
     ) -> Result<serde_json::Value, String> {
         let wire_name = call.tool_name.to_string();
         if !xai_grok_code_mode_protocol::is_code_mode_nested_tool(&wire_name) {
-            return Err(format!("tool `{wire_name}` cannot be called from inside exec"));
+            return Err(format!(
+                "tool `{wire_name}` cannot be called from inside exec"
+            ));
         }
         let mut input_value = call
             .input
@@ -799,24 +860,22 @@ impl SessionActor {
             .await;
         let denial = match resolution.decision {
             Decision::Allow | Decision::Ask => None,
-            Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => Some(format!(
-                "Tool `{wire_name}` was not executed: {reason}"
-            )),
-            Decision::Cancelled => {
-                Some(format!("User cancelled the execution for tool `{wire_name}`"))
+            Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => {
+                Some(format!("Tool `{wire_name}` was not executed: {reason}"))
             }
+            Decision::Cancelled => Some(format!(
+                "User cancelled the execution for tool `{wire_name}`"
+            )),
             Decision::FollowupMessage(_) => Some(format!(
                 "The user declined to run tool `{wire_name}` from exec"
             )),
         };
         if let Some(message) = denial {
-            self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
+            self.finish_code_mode_nested_ui(&ui_id, false, &message)
+                .await;
             return Err(message);
         }
-        let is_read_only = matches!(
-            access_kind,
-            AccessKind::Read(_) | AccessKind::Grep { .. }
-        );
+        let is_read_only = matches!(access_kind, AccessKind::Read(_) | AccessKind::Grep { .. });
         let prepared = PreparedToolCall {
             call_id: ui_id.0.to_string(),
             tool_call_id: ui_id.clone(),
@@ -842,6 +901,7 @@ impl SessionActor {
                 Some(lock) => Some(lock.lock().await),
                 None => None,
             };
+            let _dispatch_guard = self.tool_context.code_mode.nested_dispatch_guard().await;
             // Last fence before the effect happens (finding 4). Everything
             // above — hooks, the client gate, the permission prompt, this very
             // path lock — can park indefinitely; if the runtime was
@@ -854,15 +914,20 @@ impl SessionActor {
             } else {
                 self.signals_handle().record_tool_call(&wire_name);
                 Some(
-                    call_with_auth_retry(
-                        self.auth_manager.as_ref(),
-                        None,
-                        &wire_name,
-                        || async {
-                            dispatch_tool(&self.workspace_ops, &prepared, session_id.as_ref())
-                                .await
-                        },
-                    )
+                    call_with_auth_retry(self.auth_manager.as_ref(), None, &wire_name, || async {
+                        // `call_with_auth_retry` invokes this closure for
+                        // both the first attempt and the post-refresh
+                        // replay. Invalidation while auth recovery waits
+                        // must fence the replay too.
+                        if self.tool_context.code_mode.current_generation() != generation {
+                            return Err(xai_tool_runtime::ToolError::cancelled(
+                                xai_tool_protocol::ToolId::new(wire_name.clone())
+                                    .expect("registered tool name is a valid ToolId"),
+                                "code mode runtime was invalidated before dispatch",
+                            ));
+                        }
+                        dispatch_tool(&self.workspace_ops, &prepared, session_id.as_ref()).await
+                    })
                     .await,
                 )
             }
@@ -879,7 +944,8 @@ impl SessionActor {
                 current_generation = self.tool_context.code_mode.current_generation(),
                 "nested code mode call fenced at the dispatch boundary"
             );
-            self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
+            self.finish_code_mode_nested_ui(&ui_id, false, &message)
+                .await;
             return Err(message);
         };
         match result {
@@ -894,8 +960,8 @@ impl SessionActor {
                 }
                 // PostToolUse hooks (same payload shape as the batch path).
                 if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUse) {
-                    let tool_result_value = serde_json::to_value(&run_result.output)
-                        .unwrap_or(serde_json::Value::Null);
+                    let tool_result_value =
+                        serde_json::to_value(&run_result.output).unwrap_or(serde_json::Value::Null);
                     let (tool_input_value, tool_input_truncated) =
                         xai_grok_hooks::event::truncate_payload(input_value.clone());
                     let (tool_result_val, tool_result_truncated) =
@@ -921,7 +987,10 @@ impl SessionActor {
                 // Contract with the cell: a logical failure rejects the JS
                 // promise (finding 4); a success resolves with the tool's
                 // structured value where it has one (finding 5).
-                if failed {
+                // MCP `isError` is an application-level result, not a
+                // transport failure. Resolve it as the typed CallToolResult
+                // so JavaScript can inspect structured repair information.
+                if failed && !matches!(&run_result.output, ToolsToolOutput::MCP(_)) {
                     return Err(run_result.prompt_text);
                 }
                 Ok(Self::nested_result_value(&run_result))
@@ -929,9 +998,9 @@ impl SessionActor {
             Err(error) => {
                 let message = format!("Tool `{wire_name}` failed: {error}");
                 self.signals_handle().record_tool_failure(&wire_name);
-                self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
-                if self
-                    .may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
+                self.finish_code_mode_nested_ui(&ui_id, false, &message)
+                    .await;
+                if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
                 {
                     let (tool_input_value, tool_input_truncated) =
                         xai_grok_hooks::event::truncate_payload(input_value.clone());
@@ -956,10 +1025,7 @@ impl SessionActor {
     }
     /// Session-lifecycle tools that require top-level interception (plan
     /// approval dialogs) must not be reachable from inside `exec`.
-    fn reject_lifecycle_nested_tool(
-        wire_name: &str,
-        tool_input: &ToolInput,
-    ) -> Result<(), String> {
+    fn reject_lifecycle_nested_tool(wire_name: &str, tool_input: &ToolInput) -> Result<(), String> {
         if matches!(
             tool_input,
             ToolInput::ExitPlanMode(_) | ToolInput::EnterPlanMode(_)
@@ -997,6 +1063,9 @@ impl SessionActor {
         use xai_grok_tools::types::output::MCPOutputDetails;
         match &run_result.output {
             ToolsToolOutput::MCP(mcp) => {
+                if let Some(call_tool_result) = &mcp.call_tool_result {
+                    return call_tool_result.clone();
+                }
                 let text = match mcp.output() {
                     MCPOutputDetails::OkayOutput(text) => text.clone(),
                     MCPOutputDetails::Error(error) => error.clone(),
@@ -1058,12 +1127,7 @@ impl SessionActor {
     }
     /// Terminal ACP update for a nested call registered by
     /// [`Self::run_code_mode_nested_call`].
-    async fn finish_code_mode_nested_ui(
-        &self,
-        ui_id: &acp::ToolCallId,
-        success: bool,
-        text: &str,
-    ) {
+    async fn finish_code_mode_nested_ui(&self, ui_id: &acp::ToolCallId, success: bool, text: &str) {
         let status = if success {
             acp::ToolCallStatus::Completed
         } else {
@@ -1256,21 +1320,48 @@ mod code_mode_nested_tests {
         assert_eq!(meta["authRetryAttempted"], false);
     }
 
-    /// Finding 6, schema half: the nested projection drops `exec`/`wait` and
-    /// carries each tool's real input schema. `output_schema` stays `None`
-    /// because nothing upstream carries one — pinned here so a future source
-    /// of output schemas has to update this test deliberately rather than
-    /// leaving the advertised contract silently false.
     #[test]
-    fn nested_projection_carries_input_schema_and_no_output_schema() {
+    fn mcp_output_prefers_the_original_call_tool_result() {
+        let original = serde_json::json!({
+            "content": [{
+                "type": "audio",
+                "data": "QUJD",
+                "mimeType": "audio/wav",
+                "annotations": {"audience": ["assistant"]}
+            }],
+            "structuredContent": {"retryAfter": 3},
+            "isError": true,
+            "_meta": {"requestId": "req-1"}
+        });
+        let mut mcp = MCPOutput::errored(
+            "server__repair".to_string(),
+            "server".to_string(),
+            "repair required".to_string(),
+        );
+        mcp.call_tool_result = Some(original.clone());
+        let value = SessionActor::nested_result_value(&run_result(
+            ToolsToolOutput::MCP(mcp),
+            "repair required",
+        ));
+        assert_eq!(value, original);
+    }
+
+    /// MCP definitions match the Codex name/schema contract while retaining
+    /// the raw registry name for dispatch.
+    #[test]
+    fn nested_projection_carries_direct_mcp_name_and_schemas() {
         use crate::sampling::types::ToolDefinition;
 
         let params = serde_json::json!({
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {"issue_id": {"type": "string"}},
+        });
+        let structured_content = serde_json::json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}}
         });
         let defs = vec![
-            ToolDefinition::function("read_file", Some("read a file"), params.clone()),
+            ToolDefinition::function("linear__get_issue", Some("get an issue"), params.clone()),
             ToolDefinition::function(
                 xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME,
                 Some("exec"),
@@ -1282,14 +1373,43 @@ mod code_mode_nested_tests {
                 serde_json::json!({}),
             ),
         ];
-        let projected = SessionActor::code_mode_nested_projection(&defs);
+        let output_schemas = std::collections::HashMap::from([(
+            "linear__get_issue".to_string(),
+            structured_content.clone(),
+        )]);
+        let projected = SessionActor::code_mode_nested_projection(&defs, &output_schemas);
         assert_eq!(projected.len(), 1, "exec/wait must not be nested tools");
-        assert_eq!(projected[0].name, "read_file");
-        assert_eq!(projected[0].description, "read a file");
+        assert_eq!(projected[0].name, "mcp__linear__get_issue");
+        assert_eq!(
+            projected[0].tool_name,
+            xai_grok_code_mode_protocol::ToolName::plain("linear__get_issue")
+        );
+        assert_eq!(projected[0].description, "get an issue");
         assert_eq!(projected[0].input_schema.as_ref(), Some(&params));
-        assert!(
-            projected[0].output_schema.is_none(),
-            "no registry surface carries an output schema in this build"
+        assert_eq!(
+            projected[0].output_schema,
+            Some(mcp_call_tool_result_output_schema(structured_content))
+        );
+    }
+
+    #[test]
+    fn nested_projection_normalizes_schema_for_mcp_without_properties() {
+        use crate::sampling::types::ToolDefinition;
+
+        let defs = vec![ToolDefinition::function(
+            "filesystem__roots",
+            Some("list roots"),
+            serde_json::json!({"type": "object"}),
+        )];
+        let projected =
+            SessionActor::code_mode_nested_projection(&defs, &std::collections::HashMap::new());
+        assert_eq!(
+            projected[0].input_schema.as_ref().unwrap()["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            projected[0].output_schema,
+            Some(mcp_call_tool_result_output_schema(serde_json::json!({})))
         );
     }
 }
@@ -1299,7 +1419,57 @@ mod code_mode_nested_tests {
 #[cfg(test)]
 mod code_mode_session_tests {
     use super::*;
-    use crate::session::acp_session::support::{create_test_actor, test_grok_build_agent_with_todo};
+    use crate::session::acp_session::support::{
+        create_test_actor, test_grok_build_agent_with_todo,
+    };
+    use xai_grok_tools::types::output::MCPOutput;
+
+    #[derive(Debug)]
+    struct DirectMcpFixture;
+
+    impl xai_grok_tools::types::tool_metadata::ToolMetadata for DirectMcpFixture {
+        fn kind(&self) -> xai_grok_tools::types::tool::ToolKind {
+            xai_grok_tools::types::tool::ToolKind::Other
+        }
+
+        fn tool_namespace(&self) -> xai_grok_tools::types::tool::ToolNamespace {
+            xai_grok_tools::types::tool::ToolNamespace::MCP
+        }
+
+        fn description_template(&self) -> &str {
+            "direct MCP fixture"
+        }
+    }
+
+    impl xai_tool_runtime::Tool for DirectMcpFixture {
+        type Args = serde_json::Value;
+        type Output = xai_grok_tools::types::output::ToolOutput;
+
+        fn id(&self) -> xai_tool_protocol::ToolId {
+            xai_tool_protocol::ToolId::new("fixture__echo").expect("valid tool id")
+        }
+
+        fn description(
+            &self,
+            _ctx: &xai_tool_runtime::ListToolsContext,
+        ) -> xai_tool_types::ToolDescription {
+            xai_tool_types::ToolDescription::new("fixture__echo", "direct MCP fixture")
+        }
+
+        async fn run(
+            &self,
+            _ctx: xai_tool_runtime::ToolCallContext,
+            args: serde_json::Value,
+        ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
+            Ok(xai_grok_tools::types::output::ToolOutput::MCP(
+                MCPOutput::okay_output(
+                    "fixture__echo".to_string(),
+                    "fixture".to_string(),
+                    args["message"].as_str().unwrap_or_default().to_string(),
+                ),
+            ))
+        }
+    }
 
     fn nested_call(cell: &str) -> xai_grok_code_mode_protocol::CodeModeNestedToolCall {
         xai_grok_code_mode_protocol::CodeModeNestedToolCall {
@@ -1344,6 +1514,53 @@ mod code_mode_session_tests {
             )
             .expect("bind_local_session must succeed");
         Arc::new(actor)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_code_mode_call_dispatches_a_registered_mcp_tool_directly() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+                let actor = dispatching_actor(gateway_tx).await;
+                let bridge = actor.agent.borrow().tool_bridge().clone();
+                bridge
+                    .register_mcp_tools(
+                        "fixture__echo".to_string(),
+                        DirectMcpFixture,
+                        Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                            "required": ["message"]
+                        })),
+                    )
+                    .await
+                    .expect("fixture MCP registration succeeds");
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = gateway_rx.recv().await {
+                        if let xai_acp_lib::AcpClientMessage::SessionNotification(args) = message {
+                            let _ = args.response_tx.send(Ok(()));
+                        }
+                    }
+                });
+
+                let call = xai_grok_code_mode_protocol::CodeModeNestedToolCall {
+                    cell_id: xai_grok_code_mode_protocol::CellId::new("mcp-cell".to_string()),
+                    runtime_tool_call_id: "mcp-call".to_string(),
+                    tool_name: xai_grok_code_mode_protocol::ToolName::plain("fixture__echo"),
+                    tool_kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                    input: Some(serde_json::json!({"message": "hello"})),
+                };
+                let result = actor
+                    .run_code_mode_nested_call(
+                        &call,
+                        actor.tool_context.code_mode.current_generation(),
+                    )
+                    .await
+                    .expect("direct MCP call succeeds");
+                assert_eq!(result["content"][0]["text"], "hello");
+            })
+            .await;
     }
 
     /// Finding 3: the client's `PreToolUse` gate now covers nested calls too.
@@ -1397,7 +1614,11 @@ mod code_mode_session_tests {
                 assert!(err.contains("client:cb_0"), "{err}");
                 assert!(err.contains("client policy forbids todo_write"), "{err}");
                 assert_eq!(
-                    seen_input.lock().unwrap().as_ref().map(|v| v["todos"][0]["id"].clone()),
+                    seen_input
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|v| v["todos"][0]["id"].clone()),
                     Some(serde_json::json!("t1")),
                     "the client gate must receive the nested call's real input"
                 );
@@ -1452,7 +1673,10 @@ mod code_mode_session_tests {
                 )
                 .await
                 .expect("the nested gate must not hang");
-                assert!(result.is_ok(), "an allowed nested call must run: {result:?}");
+                assert!(
+                    result.is_ok(),
+                    "an allowed nested call must run: {result:?}"
+                );
             })
             .await;
     }
@@ -1468,8 +1692,7 @@ mod code_mode_session_tests {
             .run_until(async {
                 let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut actor = {
-                    let (persistence_tx, _persistence_rx) =
-                        tokio::sync::mpsc::unbounded_channel();
+                    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
                     create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await
                 };
                 actor.hook_resolved_workspace_root = "/tmp".to_string();
@@ -1675,9 +1898,8 @@ mod code_mode_session_tests {
                     .current_prompt_id
                     .lock()
                     .expect("current_prompt_id mutex poisoned") = Some("rw".to_string());
-                let (item, _rx) = crate::session::acp_session::support::user_item_with_rx(
-                    "rw", "owner",
-                );
+                let (item, _rx) =
+                    crate::session::acp_session::support::user_item_with_rx("rw", "owner");
                 {
                     let mut state = actor.state.lock().await;
                     state.rewindable = true;

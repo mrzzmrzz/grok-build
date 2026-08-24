@@ -7,6 +7,23 @@ use xai_grok_code_mode_protocol::ImageDetail;
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
 const REMOTE_IMAGE_URL_ERROR: &str = "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
+/// V8 string length is UTF-16 code units; at most four UTF-8 bytes can be
+/// produced per unit. This keeps any one callback conversion under roughly
+/// the actor's 8 MiB materialization ceiling before allocating the Rust String.
+const MAX_CALLBACK_STRING_UTF16_UNITS: usize = 2 * 1024 * 1024;
+
+fn bounded_v8_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::String>,
+    what: &str,
+) -> Result<String, String> {
+    if value.length() > MAX_CALLBACK_STRING_UTF16_UNITS {
+        return Err(format!(
+            "{what} exceeds the code-mode per-item output limit"
+        ));
+    }
+    Ok(value.to_rust_string_lossy(scope))
+}
 
 pub(super) fn serialize_output_text(
     scope: &mut v8::PinScope<'_, '_>,
@@ -19,13 +36,18 @@ pub(super) fn serialize_output_text(
         || value.is_big_int()
         || value.is_string()
     {
+        if value.is_string() {
+            let string = v8::Local::<v8::String>::try_from(value)
+                .map_err(|_| "failed to read code-mode text output".to_string())?;
+            return bounded_v8_string(scope, string, "text output");
+        }
         return Ok(value.to_rust_string_lossy(scope));
     }
 
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     if let Some(stringified) = v8::json::stringify(&tc, value) {
-        return Ok(stringified.to_rust_string_lossy(&tc));
+        return bounded_v8_string(&mut tc, stringified, "serialized text output");
     }
     if tc.has_caught() {
         return Err(tc
@@ -43,7 +65,9 @@ pub(super) fn normalize_output_image(
 ) -> Result<FunctionCallOutputContentItem, ()> {
     let result = (|| -> Result<FunctionCallOutputContentItem, String> {
         let (image_url, detail) = if value.is_string() {
-            (value.to_rust_string_lossy(scope), None)
+            let string = v8::Local::<v8::String>::try_from(value)
+                .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
+            (bounded_v8_string(scope, string, "image output")?, None)
         } else if value.is_object() && !value.is_array() {
             let object = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
@@ -113,7 +137,12 @@ fn parse_non_mcp_output_image(
     let detail_key = v8::String::new(scope, "detail")
         .ok_or_else(|| "failed to allocate image helper keys".to_string())?;
     let detail = parse_image_detail_value(scope, object.get(scope, detail_key.into()))?;
-    Ok(Some((image_url.to_rust_string_lossy(scope), detail)))
+    let image_url = v8::Local::<v8::String>::try_from(image_url)
+        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
+    Ok(Some((
+        bounded_v8_string(scope, image_url, "image output")?,
+        detail,
+    )))
 }
 
 fn parse_mcp_output_image(
@@ -190,7 +219,8 @@ pub(super) fn v8_value_to_json(
         }
         return Ok(None);
     };
-    serde_json::from_str(&stringified.to_rust_string_lossy(&tc))
+    let stringified = bounded_v8_string(&mut tc, stringified, "serialized JavaScript value")?;
+    serde_json::from_str(&stringified)
         .map(Some)
         .map_err(|err| format!("failed to serialize JavaScript value: {err}"))
 }

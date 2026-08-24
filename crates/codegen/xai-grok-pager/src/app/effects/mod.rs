@@ -3547,6 +3547,26 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchSessionCache {
+            agent_id,
+            session_id,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                match fetch_session_cache(&session_id, &tx).await {
+                    Ok(cache) => TaskResult::SessionCacheComplete {
+                        agent_id,
+                        session_id,
+                        cache: Box::new(cache),
+                    },
+                    Err(error) => TaskResult::SessionCacheFailed {
+                        agent_id,
+                        session_id,
+                        error,
+                    },
+                }
+            });
+        }
         Effect::FetchCodexUsage { agent_id, nonce } => {
             let tx = acp_tx.clone();
             tasks
@@ -4665,6 +4685,31 @@ async fn fetch_session_usage(
             "invalid session usage response".to_string()
         })?;
     Ok(parsed.usage)
+}
+
+async fn fetch_session_cache(
+    session_id: &acp::SessionId,
+    tx: &AcpAgentTx,
+) -> Result<xai_grok_shell::extensions::cache::SessionCacheResponse, String> {
+    let request = acp::ExtRequest::new(
+        "x.ai/session/cache",
+        serde_json::value::to_raw_value(&serde_json::json!({
+            "sessionId": session_id.0.to_string()
+        }))
+        .expect("serialize session/cache params")
+        .into(),
+    );
+    let response = acp_send(request, tx).await.map_err(|error| {
+        if i32::from(error.code) == i32::from(acp::Error::method_not_found().code) {
+            "not supported by this agent version".to_string()
+        } else {
+            sanitize_user_error(&error.to_string())
+        }
+    })?;
+    serde_json::from_str(response.0.get()).map_err(|error| {
+        tracing::debug!("session cache deser failed: {error}");
+        "invalid session cache response".to_string()
+    })
 }
 /// `x.ai/usage/codex` → Codex account usage. Transport/decode failures are
 /// folded into the response's `error` field so every outcome flows through

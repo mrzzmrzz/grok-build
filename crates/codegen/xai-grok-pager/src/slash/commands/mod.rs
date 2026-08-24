@@ -7,6 +7,7 @@ pub mod always_approve;
 pub mod announcements;
 pub mod auto;
 pub mod btw;
+pub mod cache;
 pub mod cd;
 pub mod compact;
 pub mod compact_mode;
@@ -115,6 +116,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(copy::CopyCommand),
         Arc::new(find::FindCommand),
         Arc::new(usage::UsageCommand),
+        Arc::new(cache::CacheCommand),
         Arc::new(tasks::TasksCommand),
         // Extending the agent.
         Arc::new(plugin::SkillsCommand),

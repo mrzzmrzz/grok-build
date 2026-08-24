@@ -66,6 +66,17 @@ impl UsageTotals {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
+    /// Prompt-cache hit rate in percent, or `None` when no input was recorded.
+    /// `input_tokens` is the full prompt total; cached reads are its subset.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.input_tokens != 0)
+            .then(|| self.cached_read_tokens as f64 / self.input_tokens as f64 * 100.0)
+    }
+
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.cache_hit_rate().unwrap_or(0.0)
+    }
+
     pub fn cost_is_partial(&self) -> bool {
         self.cost_usd_ticks.is_some() && self.cost_missing_calls > 0
     }
@@ -198,5 +209,17 @@ mod tests {
 
         ledger.record_subagent(&[], true);
         assert!(ledger.incomplete);
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_empty_and_partial_usage() {
+        assert_eq!(UsageTotals::default().cache_hit_rate(), None);
+        let totals = UsageTotals {
+            input_tokens: 800,
+            cached_read_tokens: 600,
+            ..Default::default()
+        };
+        assert_eq!(totals.cache_hit_rate(), Some(75.0));
+        assert_eq!(totals.cache_hit_rate_pct(), 75.0);
     }
 }

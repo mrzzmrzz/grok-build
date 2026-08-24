@@ -234,6 +234,8 @@ async fn mcp_snapshot_matches_full_mode_injected_reminder() {
                 .await
                 .expect("servers installed");
             assert_eq!(snapshot.server_count, 1);
+            assert!(!snapshot.text.contains("search_tool"));
+            assert!(!snapshot.text.contains("use_tool"));
             actor
                 .mcp_reminder_dirty
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -248,6 +250,45 @@ async fn mcp_snapshot_matches_full_mode_injected_reminder() {
                 .and_then(|s| s.strip_suffix("\n</system-reminder>"))
                 .unwrap_or_else(|| panic!("unexpected wrapper: {injected}"));
             assert_eq!(body, snapshot.text);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn codex_sessions_skip_mcp_reminders_and_context_accounting() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            install_mcp_servers(&actor);
+            actor.chat_state_handle.mark_ever_used_codex();
+
+            let before = actor.chat_state_handle.get_conversation().await.len();
+            actor
+                .mcp_reminder_dirty
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            actor.maybe_inject_mcp_reminder().await;
+
+            assert_eq!(
+                actor.chat_state_handle.get_conversation().await.len(),
+                before
+            );
+            assert!(
+                !actor
+                    .mcp_reminder_dirty
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            assert!(actor.mcp_announcement_snapshot().await.is_none());
+            assert!(
+                actor
+                    .usage_categories()
+                    .await
+                    .iter()
+                    .all(|row| row.label != "MCP servers")
+            );
         })
         .await;
 }

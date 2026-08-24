@@ -26,6 +26,99 @@ fn summarization_prep_drops_backend_tool_calls() {
     );
     assert_eq!(prepared.len(), 2);
 }
+
+fn opaque_compaction_item() -> ConversationItem {
+    ConversationItem::BackendToolCall(BackendToolCallItem {
+        kind: BackendToolKind::CodexRawInput(xai_grok_sampling_types::CodexRawInputItem {
+            id: "codex-compaction:0".into(),
+            raw: serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            }),
+        }),
+    })
+}
+
+#[test]
+fn remote_compaction_v2_history_keeps_only_real_user_tail_and_opaque_item() {
+    let prompt = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("<user_query>first</user_query>"),
+        ConversationItem::assistant("assistant"),
+        ConversationItem::user_meta("synthetic metadata"),
+        ConversationItem::interjection("steer now"),
+        ConversationItem::user("second"),
+    ];
+
+    let history = build_codex_remote_compaction_v2_history(&prompt, opaque_compaction_item());
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[0].text_content(), "first");
+    assert_eq!(history[1].text_content(), "steer now");
+    assert_eq!(history[2].text_content(), "second");
+    assert!(matches!(
+        &history[3],
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::CodexRawInput(_),
+        })
+    ));
+}
+
+#[test]
+fn remote_compaction_v2_user_tail_is_bounded_and_preserves_images() {
+    let wrapped = ConversationItem::user_with_parts(vec![
+        xai_grok_sampling_types::ContentPart::Text {
+            text: std::sync::Arc::from("<user_query>image question</user_query>"),
+        },
+        xai_grok_sampling_types::ContentPart::Image {
+            url: std::sync::Arc::from("data:image/png;base64,abc"),
+        },
+    ]);
+    let oversized = ConversationItem::user(
+        "x".repeat(usize::try_from(CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS * 4).unwrap()),
+    );
+    let history =
+        build_codex_remote_compaction_v2_history(&[oversized, wrapped], opaque_compaction_item());
+
+    assert_eq!(
+        history.last().unwrap().text_content(),
+        "[OpenAI compacted context]"
+    );
+    let user_items = &history[..history.len() - 1];
+    assert!(
+        user_items
+            .iter()
+            .map(codex_remote_compaction_v2_user_text_tokens)
+            .sum::<u64>()
+            <= CODEX_REMOTE_COMPACTION_V2_RETAINED_USER_TOKENS
+    );
+    let ConversationItem::User(last_user) = user_items.last().unwrap() else {
+        panic!("expected retained user item");
+    };
+    assert_eq!(user_items.last().unwrap().text_content(), "image question");
+    assert!(
+        last_user
+            .content
+            .iter()
+            .any(|part| matches!(part, xai_grok_sampling_types::ContentPart::Image { .. }))
+    );
+}
+
+#[test]
+fn remote_compaction_v2_interjections_require_an_exact_snapshot_prefix() {
+    let snapshot = vec![ConversationItem::user("before")];
+    let current = vec![
+        ConversationItem::user("before"),
+        ConversationItem::assistant("ignored"),
+        ConversationItem::interjection("new steering"),
+        ConversationItem::user_meta("ignored metadata"),
+    ];
+    let appended = codex_remote_compaction_v2_interjections(&snapshot, &current).unwrap();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(appended[0].text_content(), "new steering");
+
+    let changed = vec![ConversationItem::user("changed")];
+    assert!(codex_remote_compaction_v2_interjections(&snapshot, &changed).is_none());
+}
 #[test]
 fn compaction_attempt_serde_roundtrip_and_skips_none() {
     let attempt = CompactionAttempt {
@@ -2987,7 +3080,11 @@ fn budget_truncation_removes_text_from_ordered_parts_on_the_wire() {
     let ConversationItem::ToolResult(t) = &truncated else {
         panic!("expected ToolResult");
     };
-    assert!(t.content.contains("truncated"), "marker missing: {:?}", t.content);
+    assert!(
+        t.content.contains("truncated"),
+        "marker missing: {:?}",
+        t.content
+    );
     for part in &t.parts {
         if let ContentPart::Text { text } = part {
             assert!(
@@ -3004,5 +3101,8 @@ fn budget_truncation_removes_text_from_ordered_parts_on_the_wire() {
         !body.contains("COMPACTION-SECRET-TAIL"),
         "truncated text leaked to the wire: {body}"
     );
-    assert!(body.contains("KEEP"), "the image part must survive truncation");
+    assert!(
+        body.contains("KEEP"),
+        "the image part must survive truncation"
+    );
 }

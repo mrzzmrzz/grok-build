@@ -211,7 +211,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         Ok(map_actor_event(cell_id, initial_event))
     }
 
-    fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.inner.shutdown_token.cancel();
         self.inner.cell_tasks.close();
     }

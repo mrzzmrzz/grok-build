@@ -16,6 +16,23 @@ fn test_json_round_trip() {
     assert_eq!(loaded.version, 1);
 }
 
+#[test]
+fn prompt_context_is_saved_only_for_the_installed_system_prompt() {
+    let rendered = "fresh Codex prompt";
+    assert!(installed_system_matches_rendered_prompt(
+        &[ConversationItem::system(rendered)],
+        rendered
+    ));
+    assert!(!installed_system_matches_rendered_prompt(
+        &[ConversationItem::system("preserved resume prompt")],
+        rendered
+    ));
+    assert!(!installed_system_matches_rendered_prompt(
+        &[ConversationItem::user("no system head")],
+        rendered
+    ));
+}
+
 /// Test that PromptContext survives a JSON write-to-disk / read-from-disk
 /// cycle with field-level fidelity. This exercises serde + filesystem I/O
 /// but not the `save_prompt_context`/`load_prompt_context` wrappers (which

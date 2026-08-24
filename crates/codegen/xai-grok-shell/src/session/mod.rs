@@ -1,5 +1,6 @@
 pub mod acp_types;
 pub mod announcement_state;
+pub mod cache_tracker;
 pub mod commands;
 pub(crate) mod compaction_config;
 pub mod handle;
@@ -11,6 +12,9 @@ pub mod prompt_queue;
 pub mod two_pass;
 pub use self::acp_session::*;
 pub use self::acp_types::*;
+pub use self::cache_tracker::{
+    CacheStatus, CacheSummary, CacheTracker, CacheTurnRecord, PrefixDivergence, RequestSummary,
+};
 pub use self::commands::*;
 pub use self::fork::{ForkSessionRequest, ForkSessionResponse, fork_session};
 pub use self::handle::*;

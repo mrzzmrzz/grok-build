@@ -60,7 +60,12 @@ impl CellActor {
         ),
         String,
     > {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let max_output_tokens = request.max_output_tokens;
+        // Bound runtime→actor events so a tight `text()` loop cannot enqueue
+        // unbounded owned strings faster than the async actor can budget and
+        // drain them. The V8 runtime runs on a dedicated OS thread and uses
+        // `blocking_send`, providing backpressure without blocking Tokio.
+        let (event_tx, event_rx) = mpsc::channel(16);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
         let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
@@ -86,6 +91,7 @@ impl CellActor {
                 response_tx: initial_response_tx,
             },
             task_failure_handler,
+            max_output_tokens,
         );
         let initial_response =
             Box::pin(async move { initial_response_rx.await.unwrap_or(Err(CellError::Closed)) });
@@ -105,13 +111,122 @@ struct Observer {
     response_tx: oneshot::Sender<Result<CellEvent, CellError>>,
 }
 
+const MAX_MATERIALIZED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MATERIALIZED_OUTPUT_ITEMS: usize = 65_536;
+const RUNTIME_OUTPUT_TRUNCATION_MARKER: &str =
+    "[output truncated while the code-mode cell was running]";
+
+/// Enforces the exec output budget while runtime events are received. This is
+/// deliberately below the shell's final token-aware formatter: it prevents
+/// the actor from first materializing an unbounded Vec, while the formatter
+/// still supplies the exact user-facing marker and image accounting.
+struct CellOutputBudget {
+    max_tokens: usize,
+    used_tokens: usize,
+    items: usize,
+    truncated: bool,
+}
+
+impl CellOutputBudget {
+    fn new(max_output_tokens: usize) -> Self {
+        Self {
+            max_tokens: max_output_tokens.min(
+                MAX_MATERIALIZED_OUTPUT_BYTES / xai_token_estimation::BYTES_PER_TOKEN as usize,
+            ),
+            used_tokens: 0,
+            items: 0,
+            truncated: false,
+        }
+    }
+
+    fn text_tokens(text: &str) -> usize {
+        text.len()
+            .saturating_add(xai_token_estimation::BYTES_PER_TOKEN as usize - 1)
+            / xai_token_estimation::BYTES_PER_TOKEN as usize
+    }
+
+    fn item_tokens(item: &OutputItem) -> usize {
+        match item {
+            OutputItem::Text { text } => Self::text_tokens(text),
+            OutputItem::Image { image_url, .. } => {
+                // Charge whichever is larger: the model-facing image estimate
+                // or the encoded payload retained in Rust memory.
+                (xai_token_estimation::IMAGE_TOKEN_ESTIMATE as usize)
+                    .max(Self::text_tokens(image_url))
+            }
+        }
+    }
+
+    fn push(&mut self, item: OutputItem, output: &mut Vec<OutputItem>) {
+        if self.truncated {
+            return;
+        }
+        if self.items >= MAX_MATERIALIZED_OUTPUT_ITEMS {
+            self.mark_truncated(output);
+            return;
+        }
+
+        if matches!(&item, OutputItem::Text { text } if text.is_empty()) {
+            return;
+        }
+        let cost = Self::item_tokens(&item);
+        if self.used_tokens.saturating_add(cost) <= self.max_tokens {
+            self.used_tokens += cost;
+            self.items += 1;
+            output.push(item);
+        } else {
+            self.mark_truncated(output);
+        }
+    }
+
+    fn mark_truncated(&mut self, output: &mut Vec<OutputItem>) {
+        self.truncated = true;
+        let marker_tokens = Self::text_tokens(RUNTIME_OUTPUT_TRUNCATION_MARKER);
+        if marker_tokens > self.max_tokens {
+            output.clear();
+            self.used_tokens = 0;
+            let mut end = self
+                .max_tokens
+                .saturating_mul(xai_token_estimation::BYTES_PER_TOKEN as usize)
+                .min(RUNTIME_OUTPUT_TRUNCATION_MARKER.len());
+            while end > 0 && !RUNTIME_OUTPUT_TRUNCATION_MARKER.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end > 0 {
+                let text = RUNTIME_OUTPUT_TRUNCATION_MARKER[..end].to_owned();
+                self.used_tokens = Self::text_tokens(&text);
+                output.push(OutputItem::Text { text });
+            }
+            return;
+        }
+
+        let content_budget = self.max_tokens - marker_tokens;
+        let mut kept = Vec::new();
+        let mut used = 0usize;
+        for item in output.drain(..) {
+            let cost = Self::item_tokens(&item);
+            if used.saturating_add(cost) > content_budget {
+                break;
+            }
+            used += cost;
+            kept.push(item);
+        }
+        kept.push(OutputItem::Text {
+            text: RUNTIME_OUTPUT_TRUNCATION_MARKER.to_owned(),
+        });
+        *output = kept;
+        self.used_tokens = used + marker_tokens;
+    }
+}
+
 async fn run_cell<H: CellHost>(
     host: Arc<H>,
     context: CellContext,
-    mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    mut event_rx: mpsc::Receiver<RuntimeEvent>,
     command_rx: mpsc::UnboundedReceiver<CellCommand>,
     initial_observer: Observer,
     task_failure_handler: Option<TaskFailureHandler>,
+    max_output_tokens: usize,
 ) {
     let CellContext {
         runtime_tx,
@@ -122,6 +237,7 @@ async fn run_cell<H: CellHost>(
     let cancellation_token = cell_state.cancellation_token();
     let callback_cancellation_token = cancellation_token.child_token();
     let mut content_items = Vec::new();
+    let mut output_budget = CellOutputBudget::new(max_output_tokens);
     let mut pending_tool_call_ids = Vec::new();
     let mut pending_frontier_ready = false;
     let mut observer = Some(initial_observer);
@@ -367,7 +483,9 @@ async fn run_cell<H: CellHost>(
                             runtime_paused = false;
                         }
                     }
-                    RuntimeEvent::ContentItem(item) => content_items.push(output_item(item)),
+                    RuntimeEvent::ContentItem(item) => {
+                        output_budget.push(output_item(item), &mut content_items);
+                    }
                     RuntimeEvent::YieldRequested => {
                         let yield_observer = matches!(
                             observer.as_ref().map(|observer| observer.mode),

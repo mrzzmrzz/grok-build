@@ -1405,15 +1405,14 @@ fn capped_line_reader_discards_overlong_lines_without_shifting_indexes() {
 /// the mark must be inherited unconditionally.
 #[test]
 fn fork_summary_inherits_ever_used_codex_for_full_and_partial_forks() {
-    let mut source =
-        crate::session::persistence::Summary::new(
-            &Info {
-                id: acp::SessionId::new("fork-source"),
-                cwd: "/tmp/fork-source".into(),
-            },
-            default_model_id(),
-        )
-        .expect("source summary");
+    let mut source = crate::session::persistence::Summary::new(
+        &Info {
+            id: acp::SessionId::new("fork-source"),
+            cwd: "/tmp/fork-source".into(),
+        },
+        default_model_id(),
+    )
+    .expect("source summary");
     source.ever_used_codex = true;
     let target_info = Info {
         id: acp::SessionId::new("fork-target"),
@@ -1443,5 +1442,86 @@ fn fork_summary_inherits_ever_used_codex_for_full_and_partial_forks() {
         },
         counters(),
     );
-    assert!(partial.ever_used_codex, "partial fork must inherit the mark");
+    assert!(
+        partial.ever_used_codex,
+        "partial fork must inherit the mark"
+    );
+}
+
+#[test]
+fn fork_summary_inherits_cache_affinity_for_full_same_model_copy_and_resume() {
+    let mut source = crate::session::persistence::Summary::new(
+        &Info {
+            id: acp::SessionId::new("fork-source"),
+            cwd: "/tmp/fork-source".into(),
+        },
+        acp::ModelId::new("codex-model"),
+    )
+    .expect("source summary");
+    source.cache_affinity_id = Some("warmed-parent".into());
+    let target_info = Info {
+        id: acp::SessionId::new("fork-target"),
+        cwd: "/tmp/fork-target".into(),
+    };
+    let counters = || super::ForkCounters {
+        num_messages: 0,
+        num_chat_messages: 0,
+        cwd_switch_bookkeeping_generation: 0,
+        inherited_prefix_len: None,
+    };
+
+    let inherited = super::fork_summary(
+        source.clone(),
+        &target_info,
+        &CopySessionOptions::default(),
+        counters(),
+    );
+    assert_eq!(
+        inherited.cache_affinity_id.as_deref(),
+        Some("warmed-parent")
+    );
+
+    let resumed = super::fork_summary(
+        source.clone(),
+        &target_info,
+        &CopySessionOptions {
+            new_model_id: Some("codex-model".into()),
+            fork_context_source: Some("resumed".into()),
+            ..Default::default()
+        },
+        counters(),
+    );
+    assert_eq!(resumed.cache_affinity_id.as_deref(), Some("warmed-parent"));
+
+    let different_model = super::fork_summary(
+        source,
+        &target_info,
+        &CopySessionOptions {
+            new_model_id: Some("other-model".into()),
+            ..Default::default()
+        },
+        counters(),
+    );
+    assert_eq!(
+        different_model.cache_affinity_id.as_deref(),
+        Some("fork-target")
+    );
+
+    let partial = super::fork_summary(
+        crate::session::persistence::Summary::new(
+            &Info {
+                id: acp::SessionId::new("fork-source"),
+                cwd: "/tmp/fork-source".into(),
+            },
+            acp::ModelId::new("codex-model"),
+        )
+        .expect("source summary"),
+        &target_info,
+        &CopySessionOptions {
+            target_prompt_index: Some(1),
+            ..Default::default()
+        },
+        counters(),
+    );
+    assert_eq!(partial.cache_affinity_id.as_deref(), Some("fork-target"));
 }

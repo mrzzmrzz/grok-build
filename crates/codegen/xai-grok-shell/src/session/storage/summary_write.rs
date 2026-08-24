@@ -81,6 +81,7 @@ pub(crate) struct SummaryPatch {
     pub chat_format_version: Option<u8>,
     pub trace_turn: Option<TraceTurnPatch>,
     pub model: Option<ModelPatch>,
+    pub previous_turn_model: Option<crate::session::PreviousTurnModel>,
     pub git_head: Option<GitHeadPatch>,
     pub collection_id: Option<String>,
     /// Set the session title unconditionally (last-writer-wins). Used by the
@@ -174,6 +175,9 @@ impl Summary {
             if let Some(reasoning_effort) = &model.reasoning_effort {
                 self.reasoning_effort = *reasoning_effort;
             }
+        }
+        if let Some(previous_turn_model) = &patch.previous_turn_model {
+            self.previous_turn_model = Some(previous_turn_model.clone());
         }
         if let Some(git_head) = &patch.git_head {
             self.head_commit = git_head.commit.clone();

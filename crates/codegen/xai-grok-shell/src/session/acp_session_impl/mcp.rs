@@ -10,7 +10,12 @@ fn attach_elicitation_tx(
         client.set_elicitation_tx(Some(tx));
     }
 }
+
 impl SessionActor {
+    fn session_uses_mcp_server_reminders(&self) -> bool {
+        !self.chat_state_handle.ever_used_codex_now()
+    }
+
     /// Wait for MCP tools to be initialized.
     /// If initialization is in progress by another task, this will poll until complete.
     pub(super) async fn wait_for_mcp_initialized(&self) {
@@ -103,6 +108,11 @@ impl SessionActor {
             .unwrap_or(&qualified_name)
             .to_string();
         mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
+        if let Some(output_schema) = reg.output_schema.as_ref() {
+            mcp_state
+                .mcp_tool_output_schemas
+                .insert(qualified_name.clone(), output_schema.clone());
+        }
         if let Some(meta) = reg.meta.as_ref() {
             mcp_state
                 .mcp_tool_meta
@@ -374,13 +384,12 @@ impl SessionActor {
             self.emit_mcp_tools_changed_notifications(all_ui_tools);
         }
     }
-    /// Refresh the MCP tool/search snapshot from current tool bridge state.
+    /// Refresh the MCP metadata snapshot from current tool bridge state.
     /// Called after MCP init and after auth_trigger/retry recovers new servers.
     ///
     /// This updates the model-visible MCP snapshot and marks reminder emission
     /// dirty so `maybe_inject_mcp_reminder` can inject the next
-    /// `<system-reminder>` at a turn boundary. The `search_tool` description
-    /// itself stays static (cacheable).
+    /// `<system-reminder>` at a turn boundary.
     pub(super) async fn refresh_mcp_snapshot_and_schedule_reminder(&self) {
         let disabled_gateway_tools = crate::util::config::get_all_mcp_disabled_tools(
             std::path::Path::new(&self.session_info.cwd),
@@ -446,6 +455,11 @@ impl SessionActor {
             .mcp_reminder_dirty
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            return;
+        }
+        if !self.session_uses_mcp_server_reminders() {
+            self.mcp_reminder_dirty
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         use xai_grok_tools::implementations::search_tool::{
@@ -519,10 +533,7 @@ impl SessionActor {
                 .get_or_insert_with(String::new)
                 .push_str(section);
         }
-        if let Some(mut text) = reminder_text {
-            if let Some(hint) = self.rendered_mcp_hint().await {
-                text.push_str(&hint);
-            }
+        if let Some(text) = reminder_text {
             self.push_system_reminder(&text);
             tracing::info!(
                 servers = server_summaries.len(),
@@ -828,6 +839,9 @@ impl SessionActor {
     }
     pub(super) async fn maybe_inject_mcp_connecting_reminder(&self) {
         if self.mcp_connecting_reminder_injected.get() {
+            return;
+        }
+        if !self.session_uses_mcp_server_reminders() {
             return;
         }
         let connecting: Vec<String> = {
@@ -1642,34 +1656,23 @@ impl SessionActor {
         crate::session::tool_index::Bm25ToolSearchIndex::new(self.tool_metadata_snapshot.clone())
             .list_server_summaries()
     }
-    /// Render the tool usage hint appended to every injected MCP reminder
-    /// body, with the session's tool names substituted. Shared by the
-    /// injector and the `/context` estimate. `None` when the template
-    /// fails to render.
-    async fn rendered_mcp_hint(&self) -> Option<String> {
-        let hint_template = "\nTo use MCP tools, you MUST call `${{ tools.by_kind.search_tool }}` first to retrieve the tool's input schema before calling `${{ tools.by_kind.use_tool }}`. NEVER guess parameter names — always use the exact schema returned by `${{ tools.by_kind.search_tool }}`.";
-        self.tool_bridge_handle()
-            .render_prompt(hint_template, &serde_json::json!({}))
-            .await
-    }
     /// The full MCP announcement for the current server set, for
-    /// `/context` accounting: the server listing plus the tool usage hint,
-    /// as [`Self::maybe_inject_mcp_reminder`] injects in `Full` mode.
+    /// `/context` accounting, as [`Self::maybe_inject_mcp_reminder`] injects
+    /// in `Full` mode.
     ///
     /// Returns `None` when no servers are connected, or when the active
     /// template carries MCP in its first user message rather than in
-    /// reminders. Known approximations: the default reminder mode is
-    /// `Delta`, which injects incremental texts (each carrying its own
-    /// copy of the hint) rather than this full listing; and the transient
-    /// failed or connecting sections and the `<system-reminder>` wrapper
-    /// are not counted.
+    /// reminders. Known approximations: the default reminder mode is `Delta`,
+    /// which injects incremental texts rather than this full listing; and the
+    /// transient failed or connecting sections and the `<system-reminder>`
+    /// wrapper are not counted.
     pub(super) async fn mcp_announcement_snapshot(&self) -> Option<McpAnnouncementSnapshot> {
-        let server_summaries = self.connected_server_summaries();
-        let mut text =
-            xai_grok_tools::implementations::search_tool::build_server_reminder(&server_summaries)?;
-        if let Some(hint) = self.rendered_mcp_hint().await {
-            text.push_str(&hint);
+        if !self.session_uses_mcp_server_reminders() {
+            return None;
         }
+        let server_summaries = self.connected_server_summaries();
+        let text =
+            xai_grok_tools::implementations::search_tool::build_server_reminder(&server_summaries)?;
         Some(McpAnnouncementSnapshot {
             text,
             server_count: server_summaries.len(),
@@ -1679,7 +1682,7 @@ impl SessionActor {
 /// The MCP server announcement as rendered by `mcp_announcement_snapshot`.
 /// The MCP counterpart of `SkillListingSnapshot`.
 pub(super) struct McpAnnouncementSnapshot {
-    /// The announcement body: server listing plus the tool usage hint.
+    /// The announcement body: the connected-server listing.
     pub(super) text: String,
     pub(super) server_count: usize,
 }

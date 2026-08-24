@@ -2722,6 +2722,145 @@ fn writing_tool_call_survives_bg_deferred_stdout_update() {
         "a deferred bg stdout update must not strip the writing label"
     );
 }
+
+// ── Code Mode transport live streams ──────────────────────────────────
+
+fn code_mode_stream_payloads(sb: &ScrollbackState) -> Vec<String> {
+    (0..sb.len())
+        .filter_map(|index| sb.get(index))
+        .filter_map(|entry| match &entry.block {
+            RenderBlock::CodeModeStream(block) => Some(block.payload().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn code_mode_exec_delta_renders_nested_tool_without_transport_or_source() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(!tracker.handle_tool_call_delta(
+        &mut sb,
+        Some("exec"),
+        Some("const results = await Promise.all([to"),
+        0,
+    ));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(tracker.handle_tool_call_delta(
+        &mut sb,
+        None,
+        Some("ols.run_terminal_command({command: 'secret'})]);"),
+        0,
+    ));
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["run_terminal_command".to_string()]
+    );
+    let Some(TurnActivity::WritingToolCall(activity)) = tracker.activity() else {
+        panic!("expected inferred nested-tool activity");
+    };
+    assert_eq!(activity.label(), "Writing command…");
+    assert!(!activity.label().contains("exec"));
+}
+
+#[test]
+fn code_mode_wait_delta_never_creates_visible_payload_or_activity() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    assert!(!tracker.handle_tool_call_delta(&mut sb, Some("wait"), Some("{\"cell_id\":"), 0));
+    assert!(!tracker.handle_tool_call_delta(&mut sb, None, Some("\"private-cell\"}"), 0));
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert_eq!(tracker.activity(), None);
+}
+
+#[test]
+fn canonical_nested_tool_replaces_code_mode_preview() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    tracker.handle_tool_call_delta(
+        &mut sb,
+        Some("exec"),
+        Some("tools.read_file({file_path: 'secret'})"),
+        0,
+    );
+    assert_eq!(
+        code_mode_stream_payloads(&sb),
+        vec!["read_file".to_string()]
+    );
+
+    tracker.handle_update(
+        tool_call("nested-1", acp::ToolKind::Read, "read_file"),
+        &meta(),
+        &mut sb,
+    );
+    assert!(code_mode_stream_payloads(&sb).is_empty());
+    assert!(matches!(
+        &sb.get(sb.len() - 1).expect("canonical nested card").block,
+        RenderBlock::ToolCall(_)
+    ));
+}
+
+#[test]
+fn code_mode_transport_cards_are_suppressed_live_and_replay() {
+    for update in [
+        tool_call("exec-1", acp::ToolKind::Other, "exec"),
+        tool_call("wait-1", acp::ToolKind::Other, "wait"),
+        acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new(Arc::from("exec-variant")), "other")
+                .kind(acp::ToolKind::Execute)
+                .status(acp::ToolCallStatus::Pending)
+                .raw_input(Some(serde_json::json!({ "variant": "CodeModeExec" }))),
+        ),
+    ] {
+        for is_replay in [false, true] {
+            let mut sb = ScrollbackState::new();
+            let mut tracker = AcpUpdateTracker::new();
+            assert!(!tracker.handle_update(
+                update.clone(),
+                &NotificationMeta {
+                    is_replay,
+                    ..NotificationMeta::default()
+                },
+                &mut sb,
+            ));
+            assert_eq!(sb.len(), 0);
+        }
+    }
+}
+
+#[test]
+fn code_mode_stream_state_and_private_payload_are_bounded() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    for index in 0..(MAX_CODE_MODE_STREAMS as u32 + 4) {
+        tracker.handle_tool_call_delta(
+            &mut sb,
+            Some("exec"),
+            Some(&format!("tools.tool_{index}({{}})")),
+            index,
+        );
+    }
+    assert_eq!(tracker.code_mode_streams.len(), MAX_CODE_MODE_STREAMS);
+    assert_eq!(code_mode_stream_payloads(&sb).len(), MAX_CODE_MODE_STREAMS);
+
+    let big = "x".repeat(CODE_MODE_STREAM_TRIM_AT_CHARS + 2_000);
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some(&big), 99);
+    tracker.handle_tool_call_delta(
+        &mut sb,
+        None,
+        Some(";tools.read_file({file_path: 'secret'})"),
+        99,
+    );
+    let state = tracker.code_mode_streams.get(&99).expect("bounded state");
+    assert!(state.payload.chars().count() <= CODE_MODE_STREAM_TRIM_TO_CHARS + 48);
+    assert!(state.dropped_chars > 0);
+    assert!(
+        !code_mode_stream_payloads(&sb)
+            .iter()
+            .any(|payload| payload.contains("secret"))
+    );
+}
+
 /// The blocking bg-plumbing tools are kept out of scrollback but the turn
 /// IS blocked on them — `activity()` must name the wait instead of the old
 /// generic `None` (→ "Waiting…"). Task-output tools only advertise once
@@ -4492,15 +4631,15 @@ fn shell_serialized_code_mode_output_maps_to_exec_block() {
         .raw_output(Some(raw_output));
     match tool_call_to_block(&tc, None) {
         RenderBlock::ToolCall(ToolCallBlock::CodeModeExec(block)) => {
-        assert_eq!(block.source, "text('hi')");
-        assert_eq!(block.cell_id.as_deref(), Some("3"));
-        assert_eq!(block.status.as_deref(), Some("yielded"));
-        assert!(block.error.is_none());
-        assert!(
-            block.output.as_deref().unwrap_or("").contains("partial"),
-            "{:?}",
-            block.output
-        );
+            assert_eq!(block.source, "text('hi')");
+            assert_eq!(block.cell_id.as_deref(), Some("3"));
+            assert_eq!(block.status.as_deref(), Some("yielded"));
+            assert!(block.error.is_none());
+            assert!(
+                block.output.as_deref().unwrap_or("").contains("partial"),
+                "{:?}",
+                block.output
+            );
         }
         other => panic!("expected a CodeModeExec block, got {other:?}"),
     }

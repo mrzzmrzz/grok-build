@@ -39,6 +39,33 @@ fn declared_delivery_tools_demand_delivery_through_them() {
     assert!(!text.contains("Do not attempt to use tools from these servers yet"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn codex_session_does_not_inject_connecting_reminder() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let actor = create_test_actor(0, 100_000, 85, gateway_tx, persistence_tx).await;
+            {
+                let mut state = actor.mcp_state.lock().await;
+                assert!(state.try_start_init());
+                state.mark_servers_initializing(["alpha".to_string()]);
+            }
+            actor.chat_state_handle.mark_ever_used_codex();
+            let before = actor.chat_state_handle.get_conversation().await.len();
+
+            actor.maybe_inject_mcp_connecting_reminder().await;
+
+            assert_eq!(
+                actor.chat_state_handle.get_conversation().await.len(),
+                before
+            );
+            assert!(!actor.mcp_connecting_reminder_injected.get());
+        })
+        .await;
+}
+
 /// A resident `session/load` carrying explicit `startupHints` re-applies the
 /// attaching client's policy (`UpdateAttachPolicy` → `apply_attach_policy`):
 /// the MCP init strategy and delivery tools must track the CURRENT

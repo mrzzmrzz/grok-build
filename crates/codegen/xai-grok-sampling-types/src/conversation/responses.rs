@@ -61,6 +61,32 @@ pub fn response_to_conversation_items_with_client_custom_tools(
             rs::OutputItem::Reasoning(r) => {
                 items.push(ConversationItem::Reasoning(r));
             }
+            rs::OutputItem::Compaction(compaction) => {
+                let rs::CompactionBody {
+                    id,
+                    encrypted_content,
+                    created_by,
+                } = compaction;
+                let local_id = if id.is_empty() {
+                    format!("codex_compaction_{}", items.len())
+                } else {
+                    id.clone()
+                };
+                let mut raw = serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": encrypted_content,
+                });
+                if !id.is_empty() {
+                    raw["id"] = serde_json::Value::String(id);
+                }
+                if let Some(created_by) = created_by {
+                    raw["created_by"] = serde_json::Value::String(created_by);
+                }
+                backend_tool_count += 1;
+                items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+                    kind: BackendToolKind::CodexRawInput(CodexRawInputItem { id: local_id, raw }),
+                }));
+            }
             // Already run server-side; kept so later turns replay the same
             // context.
             rs::OutputItem::WebSearchCall(ws) => {
@@ -71,12 +97,7 @@ pub fn response_to_conversation_items_with_client_custom_tools(
             }
             rs::OutputItem::CustomToolCall(ct) => {
                 if client_custom_tool_names.iter().any(|name| name == &ct.name) {
-                    tool_calls.push(ToolCall::custom(
-                        ct.call_id,
-                        ct.id,
-                        ct.name,
-                        ct.input,
-                    ));
+                    tool_calls.push(ToolCall::custom(ct.call_id, ct.id, ct.name, ct.input));
                 } else {
                     backend_tool_count += 1;
                     items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
@@ -259,19 +280,17 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
 
             for tc in &a.tool_calls {
                 if tc.is_custom() {
-                    let custom_call: rs::CustomToolCall = serde_json::from_value(
-                        serde_json::json!({
+                    let custom_call: rs::CustomToolCall =
+                        serde_json::from_value(serde_json::json!({
                             "call_id": tc.call_id(),
                             "input": tc.arguments.as_ref(),
                             "name": tc.name,
                             "id": tc.custom_item_id().unwrap_or(tc.call_id()),
-                        }),
-                    )
-                    .expect("native custom tool call fields must satisfy the Responses schema");
+                        }))
+                        .expect("native custom tool call fields must satisfy the Responses schema");
                     items.push(rs::InputItem::Item(rs::Item::CustomToolCall(custom_call)));
                 } else {
-                    let arguments =
-                        sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
+                    let arguments = sanitize_tool_arguments(&tc.id, &tc.name, tc.arguments.clone());
                     items.push(rs::InputItem::Item(rs::Item::FunctionCall(
                         rs::FunctionToolCall {
                             call_id: tc.id.as_ref().to_owned(),
@@ -338,9 +357,22 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 BackendToolKind::CodeInterpreter(ci) => {
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
+                // Typed placeholder replaced with the exact raw item by the
+                // sampler after `CreateResponse` serialization.
+                BackendToolKind::CodexRawInput(raw) => {
+                    rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                        r#type: rs::MessageType::Message,
+                        role: rs::Role::Assistant,
+                        content: rs::EasyInputContent::Text(raw.text_summary()),
+                    })
+                }
             }]
         }
     }
+}
+
+pub(super) fn conversation_item_wire_len(item: &ConversationItem) -> usize {
+    conversation_item_to_input_items(item).len()
 }
 
 /// Ordered `InputContent` for a tool result: `parts` verbatim when present,
@@ -408,8 +440,7 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
         .iter()
         .filter(|t| {
             let collides = req.hosted_tools.iter().any(|h| {
-                h.wire_name() == t.name
-                    || h.client_custom_name() == Some(t.name.as_str())
+                h.wire_name() == t.name || h.client_custom_name() == Some(t.name.as_str())
             });
             if collides {
                 tracing::warn!(

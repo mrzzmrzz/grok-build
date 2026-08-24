@@ -9,7 +9,9 @@
 //! render engine — it provides placeholders and discovered sections.
 use crate::config::PromptMode;
 use crate::prompt::agents_md::{self, AgentConfigFile};
-use crate::prompt::template::{apply_patch_template, base_template, subagent_template};
+use crate::prompt::template::{
+    apply_patch_template, base_template, codex_subagent_template, subagent_template,
+};
 use serde::de;
 use serde::{Deserialize, Serialize};
 /// Selects which base template to use for `Extend` mode rendering.
@@ -284,7 +286,11 @@ impl PromptContext {
                 let base = match &self.system_prompt {
                     TemplateOverride::Custom(template) => template.as_str(),
                     TemplateOverride::Codex => {
-                        decrypted = apply_patch_template();
+                        decrypted = if self.audience == PromptAudience::Subagent {
+                            codex_subagent_template()
+                        } else {
+                            apply_patch_template()
+                        };
                         &decrypted
                     }
                     TemplateOverride::None => {
@@ -790,6 +796,16 @@ mod tests {
             ctx.system_prompt == TemplateOverride::None,
             "CURRENT: child has no custom system_prompt (uses BASE_TEMPLATE)"
         );
+    }
+    #[test]
+    fn codex_child_renders_the_compact_codex_subagent_template() {
+        let renderer = TemplateRenderer::new(Default::default(), Default::default());
+        let mut ctx = child_general_purpose_context();
+        ctx.system_prompt = TemplateOverride::Codex;
+        let rendered = ctx.render_with_renderer(&renderer).unwrap();
+        assert!(rendered.starts_with("You are a Codex coding subagent running in Grok Build"));
+        assert!(!rendered.contains("released by xAI"));
+        assert!(!rendered.contains("# How you work"));
     }
     #[test]
     fn parent_vs_child_section_differences() {

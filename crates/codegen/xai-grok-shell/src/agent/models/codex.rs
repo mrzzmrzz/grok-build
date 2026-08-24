@@ -170,6 +170,8 @@ mod tests {
             supported_in_api: false,
             context_window: Some(353_400),
             raw_context_window: Some(372_000),
+            auto_compact_token_limit: None,
+            comp_hash: None,
             effective_context_window_percent: 95,
             default_reasoning_level: Some("medium".to_owned()),
             supported_reasoning_levels: vec![
@@ -215,10 +217,9 @@ mod tests {
                 "effective mode for wire {wire:?}"
             );
             if effective.is_code_mode() {
-                let transport = xai_grok_sampling_types::ProviderProfile::for_provider(
-                    info.provider(),
-                )
-                .code_mode_transport;
+                let transport =
+                    xai_grok_sampling_types::ProviderProfile::for_provider(info.provider())
+                        .code_mode_transport;
                 assert_eq!(
                     transport,
                     xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar,

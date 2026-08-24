@@ -193,10 +193,19 @@ pub(crate) fn session_usage_block_text(
     }
 
     let mut rows = Vec::new();
+    let cache_suffix = if t.input_tokens == 0 {
+        format!(" ({} cached)", group_thousands(t.cached_read_tokens))
+    } else {
+        format!(
+            " ({} cached · {:.1}% hit rate)",
+            group_thousands(t.cached_read_tokens),
+            t.cache_hit_rate_pct(),
+        )
+    };
     rows.push(format!(
-        "  Input tokens:   {} ({} cached)",
+        "  Input tokens:   {}{}",
         group_thousands(t.input_tokens),
-        group_thousands(t.cached_read_tokens),
+        cache_suffix,
     ));
     rows.push(format!(
         "  Output tokens:  {} ({} reasoning)",
@@ -217,8 +226,13 @@ pub(crate) fn session_usage_block_text(
     if usage.model_usage.len() > 1 {
         rows.push("  By model:".to_string());
         for (model, m) in &usage.model_usage {
+            let cache = if m.input_tokens == 0 {
+                String::new()
+            } else {
+                format!(" · {:.1}% cache hit", m.cache_hit_rate_pct())
+            };
             rows.push(format!(
-                "    {model}: {} in / {} out · {}",
+                "    {model}: {} in / {} out{cache} · {}",
                 group_thousands(m.input_tokens),
                 group_thousands(m.output_tokens),
                 format_cost(m),
@@ -236,6 +250,60 @@ pub(crate) fn session_usage_block_text(
     )
 }
 
+/// `/cache` body — Codex Responses cache rate with recent prefix diagnostics.
+pub(crate) fn session_cache_block_text(
+    cache: &xai_grok_shell::extensions::cache::SessionCacheResponse,
+) -> String {
+    let summary = &cache.summary;
+    if summary.total_turns == 0 {
+        return "Codex prompt cache telemetry: no Responses requests recorded yet in this session."
+            .to_string();
+    }
+
+    let mut rows = Vec::new();
+    if summary.steady_input_tokens == 0 {
+        rows.push("  Steady-state hit rate: n/a (cold-start request only)".to_string());
+    } else {
+        rows.push(format!(
+            "  Steady-state hit rate: {:.1}% ({} of {} input tokens cached; cold start excluded)",
+            summary.steady_hit_rate_pct,
+            group_thousands(summary.steady_cached_tokens),
+            group_thousands(summary.steady_input_tokens),
+        ));
+    }
+    rows.push(format!(
+        "  Responses requests: {} ({} hits · {} partial · {} breaks)",
+        summary.total_turns, summary.hits, summary.partial_hits, summary.breaks,
+    ));
+    if let Some(diagnostic) = &summary.last_break_diagnostic {
+        rows.push(format!("  Last break: {diagnostic}"));
+    }
+    if !cache.recent_turns.is_empty() {
+        rows.push("  Recent requests:".to_string());
+        for record in cache.recent_turns.iter().rev().take(10) {
+            match record.status {
+                xai_grok_shell::session::CacheStatus::FirstTurn => rows.push(format!(
+                    "    Turn #{} (loop {}) — cold start ({} input) · {}",
+                    record.turn_idx,
+                    record.loop_index,
+                    group_thousands(u64::from(record.prompt_tokens)),
+                    record.diagnostic,
+                )),
+                _ => rows.push(format!(
+                    "    Turn #{} (loop {}) — {:.1}% hit ({} input, {} cached) · {}",
+                    record.turn_idx,
+                    record.loop_index,
+                    record.cache_hit_rate_pct,
+                    group_thousands(u64::from(record.prompt_tokens)),
+                    group_thousands(u64::from(record.cached_prompt_tokens)),
+                    record.diagnostic,
+                )),
+            }
+        }
+    }
+    join_header_rows("Codex Prompt Cache Telemetry:".to_string(), rows)
+}
+
 /// `/usage` Codex section — account-level OpenAI Codex usage as plain text.
 /// First line is a header (the usage modal styles it bold; minimal mode
 /// commits the whole block to scrollback). "Not connected" and fetch errors
@@ -251,7 +319,10 @@ pub(crate) fn codex_usage_block_text(
         );
     }
     if let Some(error) = &resp.error {
-        return join_header_rows(header, vec![format!("  Couldn't load Codex usage: {error}")]);
+        return join_header_rows(
+            header,
+            vec![format!("  Couldn't load Codex usage: {error}")],
+        );
     }
     let mut rows: Vec<String> = Vec::new();
     if let Some(email) = resp.email.as_deref().filter(|s| !s.is_empty()) {
@@ -284,7 +355,7 @@ pub(crate) fn codex_usage_block_text(
 fn codex_window_row(w: &xai_grok_shell::codex_auth::CodexRateLimitWindow) -> String {
     let used = w.used_percent.clamp(0.0, 100.0).floor() as i64;
     let reset = format_duration(std::time::Duration::from_secs(
-        w.reset_after_seconds.max(0) as u64,
+        w.reset_after_seconds.max(0) as u64
     ));
     format!(
         "  {}: {used}% used \u{b7} resets in {reset}",
@@ -459,6 +530,7 @@ mod tests {
             ..Default::default()
         };
         let text = session_usage_block_text(&usage);
+        assert!(text.contains("81.0% hit rate"), "{text}");
         // Snapshot pins content and column alignment together; single-model
         // sessions must skip the redundant by-model breakdown.
         insta::assert_snapshot!("session_usage_block_full", text);
@@ -506,6 +578,42 @@ mod tests {
         let text = session_usage_block_text(&usage);
         assert!(text.contains("not reported for some calls"), "{text}");
         assert!(text.contains("usage is incomplete"), "{text}");
+    }
+
+    #[test]
+    fn session_cache_block_reports_steady_rate_and_cold_start_exclusion() {
+        let cache = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_input_tokens: 1_800,
+                total_cached_tokens: 600,
+                steady_input_tokens: 800,
+                steady_cached_tokens: 600,
+                steady_hit_rate_pct: 75.0,
+                total_turns: 2,
+                hits: 1,
+                ..Default::default()
+            },
+            recent_turns: Vec::new(),
+        };
+        let text = session_cache_block_text(&cache);
+        assert!(text.contains("75.0%"), "{text}");
+        assert!(text.contains("600 of 800 input tokens cached"), "{text}");
+        assert!(text.contains("cold start excluded"), "{text}");
+    }
+
+    #[test]
+    fn session_cache_block_handles_no_steady_denominator() {
+        let cache = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_input_tokens: 1_000,
+                total_turns: 1,
+                ..Default::default()
+            },
+            recent_turns: Vec::new(),
+        };
+        let text = session_cache_block_text(&cache);
+        assert!(text.contains("n/a (cold-start request only)"), "{text}");
+        assert!(!text.contains("NaN"), "{text}");
     }
 
     #[test]

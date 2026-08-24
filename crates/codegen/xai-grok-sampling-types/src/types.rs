@@ -1209,6 +1209,10 @@ pub struct CreateResponseWrapper {
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
 
+    /// Opaque Codex-native input items to restore after typed Responses
+    /// serialization.
+    pub raw_input_replacements: Vec<crate::RawInputItemReplacement>,
+
     /// Opaque Codex turn-state token, sent as the `x-codex-turn-state`
     /// request header — only under the Codex provider profile.
     pub turn_state: Option<String>,
@@ -1228,6 +1232,7 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
+            raw_input_replacements: vec![],
             turn_state: None,
         }
     }

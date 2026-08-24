@@ -8,6 +8,27 @@
 use super::*;
 use futures::StreamExt;
 use tracing::Instrument;
+
+fn is_code_mode_transport_name(name: &str) -> bool {
+    matches!(
+        name,
+        xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME | xai_grok_code_mode_protocol::WAIT_TOOL_NAME
+    )
+}
+
+#[cfg(test)]
+mod code_mode_transport_tests {
+    use super::is_code_mode_transport_name;
+
+    #[test]
+    fn only_internal_code_mode_wrappers_are_transport_names() {
+        assert!(is_code_mode_transport_name("exec"));
+        assert!(is_code_mode_transport_name("wait"));
+        assert!(!is_code_mode_transport_name("run_terminal_command"));
+        assert!(!is_code_mode_transport_name("wait_tasks"));
+    }
+}
+
 /// Whether a tool name is an MCP `create_pull_request` (qualified
 /// `server__create_pull_request` or bare).
 fn is_mcp_create_pull_request(tool_name: &str) -> bool {
@@ -587,9 +608,6 @@ impl SessionActor {
                 }
             }
         }
-        if approved.iter().any(|p| p.tool_name == "search_tool") {
-            self.retry_auth_required_servers().await;
-        }
         let write_paths: std::collections::HashSet<String> = approved
             .iter()
             .filter(|prepared| !prepared.is_read_only)
@@ -779,11 +797,6 @@ impl SessionActor {
                         )
                         .await?;
                     deferred_followups.extend(followups);
-                    if prepared.tool_name == "search_tool" {
-                        let pi = self.chat_state_handle.get_prompt_index().await as i64;
-                        self.last_search_prompt_index
-                            .store(pi, std::sync::atomic::Ordering::Relaxed);
-                    }
                     ToolLoop::Continue
                 }
                 Err(err) => {
@@ -956,6 +969,7 @@ impl SessionActor {
         deferred_followups: &mut Vec<ConversationItem>,
     ) -> Result<Result<PreparedToolCall, ToolLoop>, acp::Error> {
         let tool_call_id = acp::ToolCallId::new(Arc::from(call.id.clone()));
+        let is_code_mode_transport = is_code_mode_transport_name(&call.function.name);
         let model_id_str = self.current_model_id().await;
         tracing::info!(
             "Model requesting tool: name='{}', call_id='{}'",
@@ -981,17 +995,19 @@ impl SessionActor {
                     serde_json::Value::Bool(bg),
                 );
             }
-            self.send_update(
-                acp::SessionUpdate::ToolCall(
-                    acp::ToolCall::new(tool_call_id.clone(), call.function.name.clone())
-                        .kind(acp::ToolKind::Other)
-                        .status(acp::ToolCallStatus::Pending)
-                        .raw_input(early_raw_input)
-                        .meta(meta),
-                ),
-                None,
-            )
-            .await;
+            if !is_code_mode_transport {
+                self.send_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), call.function.name.clone())
+                            .kind(acp::ToolKind::Other)
+                            .status(acp::ToolCallStatus::Pending)
+                            .raw_input(early_raw_input)
+                            .meta(meta),
+                    ),
+                    None,
+                )
+                .await;
+            }
         }
         let mcp_parts = parse_mcp_tool_name(&call.function.name);
         let is_mcp_tool = mcp_parts.is_some();
@@ -1003,7 +1019,7 @@ impl SessionActor {
                 }
                 McpInitStrategy::Progressive => {
                     let err = anyhow::anyhow!(
-                        "Tool not available. Use search_tool to find available tools."
+                        "MCP tool not available while its server is still initializing. Retry after the tool list refreshes."
                     );
                     let followups = self
                         .handle_tool_error(
@@ -1737,10 +1753,9 @@ impl SessionActor {
             .await;
         SessionActor::maybe_start_running_task(self.clone(), completion_tx).await;
     }
-    /// Refine the initial (minimal) ToolCall that was registered during
-    /// tool preparation.  Now that we have a fully parsed `ToolInput`
-    /// we can send a `ToolCallUpdate` with a human-readable title, the correct
-    /// kind, file locations, and the serialised raw input.
+    /// Refine the initial (minimal) user-facing ToolCall registered during
+    /// preparation. Code Mode's outer exec/wait calls return the same metadata
+    /// to the caller but intentionally emit no ACP card or persisted raw input.
     ///
     /// Returns `(title, kind, raw_input)` so callers can reuse them (e.g. in
     /// the permission-request update for subagent sessions whose prior
@@ -1751,6 +1766,10 @@ impl SessionActor {
         wire_name: &str,
         tool_call_input: ToolInput,
     ) -> Result<(String, acp::ToolKind, serde_json::Value), acp::Error> {
+        let is_code_mode_transport = matches!(
+            &tool_call_input,
+            ToolInput::CodeModeExec(_) | ToolInput::CodeModeWait(_)
+        );
         #[allow(unused_mut)]
         let mut raw_input = serde_json::to_value(&tool_call_input)?;
         let canonical_meta = self.stamp_tool_meta(None, wire_name, Some(&tool_call_input));
@@ -1924,12 +1943,9 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
-            ToolInput::CodeModeExec(_) => (
-                "exec".to_string(),
-                acp::ToolKind::Execute,
-                vec![],
-                vec![],
-            ),
+            ToolInput::CodeModeExec(_) => {
+                ("exec".to_string(), acp::ToolKind::Execute, vec![], vec![])
+            }
             ToolInput::CodeModeWait(ref wait) => (
                 format!("wait: cell {}", wait.cell_id),
                 acp::ToolKind::Execute,
@@ -2105,8 +2121,10 @@ impl SessionActor {
                 .raw_input(Some(raw_input.clone())),
         )
         .meta(canonical_meta);
-        self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_call_update), None)
-            .await;
+        if !is_code_mode_transport {
+            self.send_update(acp::SessionUpdate::ToolCallUpdate(tool_call_update), None)
+                .await;
+        }
         Ok((title, kind, raw_input))
     }
     /// Resolves the path the way the read tool does, so `~` paths and forked sessions still match.
@@ -2196,19 +2214,21 @@ impl SessionActor {
         let message = build_tool_parse_error_message(function_name, &err, raw_arguments);
         let title = (err.kind == xai_tool_runtime::ToolErrorKind::NotFound)
             .then(|| format!("Agent tried calling a tool that doesn't exist: {function_name}"));
-        self.send_update(
-            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                tool_call_id.clone(),
-                acp::ToolCallUpdateFields::new()
-                    .status(Some(acp::ToolCallStatus::Failed))
-                    .title(title)
-                    .content(Some(vec![acp::ToolCallContent::from(
-                        acp::ContentBlock::Text(acp::TextContent::new(message.clone())),
-                    )])),
-            )),
-            None,
-        )
-        .await;
+        if !is_code_mode_transport_name(function_name) {
+            self.send_update(
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    tool_call_id.clone(),
+                    acp::ToolCallUpdateFields::new()
+                        .status(Some(acp::ToolCallStatus::Failed))
+                        .title(title)
+                        .content(Some(vec![acp::ToolCallContent::from(
+                            acp::ContentBlock::Text(acp::TextContent::new(message.clone())),
+                        )])),
+                )),
+                None,
+            )
+            .await;
+        }
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
         self.chat_state_handle.push_tool_result(tool_chat);
         Ok(())
@@ -2449,33 +2469,12 @@ impl SessionActor {
             self.send_update(acp::SessionUpdate::Plan(acp_plan), None)
                 .await;
         }
-        // Code Mode results keep their ordered text/image parts on the wire
-        // (`ToolResultItem.parts`); the `acp_tool_update` table above has no
-        // arm for them, so the terminal ACP update is sent here too.
+        // Code Mode results are transport outputs for the next model sample,
+        // not user-facing ACP tool cards. Nested tools already emit their own
+        // canonical cards, so never persist or broadcast the outer exec/wait
+        // result (which would expose transport payloads in session history).
         if let ToolsToolOutput::CodeMode(ref code_mode_output) = result.output {
             use xai_grok_tools::implementations::code_mode::CodeModePart;
-            let status = if code_mode_output.is_error() {
-                acp::ToolCallStatus::Failed
-            } else {
-                acp::ToolCallStatus::Completed
-            };
-            self.send_update(
-                acp::SessionUpdate::ToolCallUpdate(
-                    acp::ToolCallUpdate::new(
-                        tool_call_id.clone(),
-                        acp::ToolCallUpdateFields::new()
-                            .status(Some(status))
-                            .content(Some(vec![acp::ToolCallContent::from(
-                                acp::ContentBlock::Text(acp::TextContent::new(
-                                    result.prompt_text.clone(),
-                                )),
-                            )]))
-                            .raw_output(serde_json::to_value(&result.output).ok()),
-                    ),
-                ),
-                None,
-            )
-            .await;
             let mut parts: Vec<ContentPart> = code_mode_output
                 .parts
                 .iter()
@@ -2699,22 +2698,24 @@ impl SessionActor {
             }
             _ => format!("Tool `{requested_tool_name}` failed: {err_str}"),
         };
-        self.send_update(
-            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                tool_call_id.clone(),
-                acp::ToolCallUpdateFields::new()
-                    .status(Some(acp::ToolCallStatus::Failed))
-                    .content(Some(vec![acp::ToolCallContent::from(
-                        acp::ContentBlock::Text(acp::TextContent::new(message.clone())),
-                    )]))
-                    .raw_output(Some(json!({
-                        "error": "tool_execution_failed",
-                        "message": err_str,
-                    }))),
-            )),
-            None,
-        )
-        .await;
+        if !is_code_mode_transport_name(requested_tool_name) {
+            self.send_update(
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    tool_call_id.clone(),
+                    acp::ToolCallUpdateFields::new()
+                        .status(Some(acp::ToolCallStatus::Failed))
+                        .content(Some(vec![acp::ToolCallContent::from(
+                            acp::ContentBlock::Text(acp::TextContent::new(message.clone())),
+                        )]))
+                        .raw_output(Some(json!({
+                            "error": "tool_execution_failed",
+                            "message": err_str,
+                        }))),
+                )),
+                None,
+            )
+            .await;
+        }
         let tool_chat = ConversationItem::tool_result(call_id.to_string(), message);
         self.chat_state_handle.push_tool_result(tool_chat);
         vec![]

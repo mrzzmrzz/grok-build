@@ -602,6 +602,17 @@ pub struct FeedbackContext {
 
 // ── Startup hints ───────────────────────────────────────────────────────
 
+/// Model settings recorded after the last completed turn. Restored on resume
+/// so a live Codex `comp_hash` rollover is detected before the next sample.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousTurnModel {
+    pub model_slug: String,
+    pub context_window: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comp_hash: Option<String>,
+}
+
 // `pub` (not `pub(crate)`): carried by the public `SessionCommand` enum
 // (`UpdateAttachPolicy`), whose fields are reachable at `pub` — a
 // `pub(crate)` field type there trips the `private_interfaces` lint.
@@ -635,6 +646,14 @@ pub struct StartupHints {
     /// holds the parent's System and overwriting it would bust the cache prefix.
     #[serde(default)]
     pub preserve_inherited_system: bool,
+    /// Stable prompt-cache identity restored from `summary.json` or inherited
+    /// by a same-model verbatim fork. Runtime-only: clients cannot inject it.
+    #[serde(skip)]
+    pub cache_affinity_id: Option<String>,
+    /// Persisted previous-turn model state. Runtime-only for incoming ACP
+    /// requests; restored from this session's `summary.json` by spawn.
+    #[serde(skip)]
+    pub previous_turn_model: Option<PreviousTurnModel>,
     /// Monotonic Codex provenance inherited at spawn: `true` when the parent
     /// session ever sampled through the Codex provider, so a fresh subagent
     /// child (whose forked/summarized context derives from Codex output)
@@ -672,6 +691,15 @@ impl StartupHints {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_hints_ignore_client_cache_affinity_id() {
+        let hints: StartupHints = serde_json::from_value(serde_json::json!({
+            "cacheAffinityId": "client-controlled"
+        }))
+        .unwrap();
+        assert!(hints.cache_affinity_id.is_none());
+    }
 
     #[test]
     fn should_show_model_fingerprint_truth_table() {

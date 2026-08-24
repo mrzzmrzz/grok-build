@@ -257,6 +257,7 @@ pub(super) fn handle_session_notification_with_origin(
         } => apply_image_compressed(agent, images, message),
         XaiSessionUpdate::ToolCallDeltaChunk {
             ref name,
+            ref arguments_delta,
             tool_index,
             ..
         } => {
@@ -264,10 +265,22 @@ pub(super) fn handle_session_notification_with_origin(
                 false
             } else {
                 let had_activity_before = agent.session.tracker.activity().is_some();
-                let changed = agent
-                    .session
-                    .tracker
-                    .note_tool_call_arguments_delta(name.as_deref(), tool_index);
+                let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
+                    !matches!(name, "exec" | "wait")
+                        && agent
+                            .session
+                            .available_tools
+                            .as_ref()
+                            .is_some_and(|tools| tools.contains(name))
+                });
+                let changed = apply_tool_call_delta_chunk(
+                    &mut agent.session.tracker,
+                    &mut agent.scrollback,
+                    name.as_deref(),
+                    arguments_delta.as_deref(),
+                    tool_index,
+                    registered_ordinary_tool,
+                );
                 if !had_activity_before && agent.session.tracker.activity().is_some() {
                     note_first_turn_activity(agent);
                 }
@@ -1336,6 +1349,7 @@ pub(super) fn handle_child_session_notification(
         }
         XaiSessionUpdate::ToolCallDeltaChunk {
             ref name,
+            ref arguments_delta,
             tool_index,
             ..
         } => {
@@ -1352,11 +1366,22 @@ pub(super) fn handle_child_session_notification(
             if !row_live {
                 return false;
             }
-            if !child_view
-                .session
-                .tracker
-                .note_tool_call_arguments_delta(name.as_deref(), tool_index)
-            {
+            let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
+                !matches!(name, "exec" | "wait")
+                    && child_view
+                        .session
+                        .available_tools
+                        .as_ref()
+                        .is_some_and(|tools| tools.contains(name))
+            });
+            if !apply_tool_call_delta_chunk(
+                &mut child_view.session.tracker,
+                &mut child_view.scrollback,
+                name.as_deref(),
+                arguments_delta.as_deref(),
+                tool_index,
+                registered_ordinary_tool,
+            ) {
                 return false;
             }
             let activity_label = subagent_activity_label(child_view);
@@ -1366,6 +1391,21 @@ pub(super) fn handle_child_session_notification(
         _ => false,
     }
 }
+
+fn apply_tool_call_delta_chunk(
+    tracker: &mut crate::acp::tracker::AcpUpdateTracker,
+    scrollback: &mut crate::scrollback::state::ScrollbackState,
+    name: Option<&str>,
+    arguments_delta: Option<&str>,
+    tool_index: u32,
+    registered_ordinary_tool: bool,
+) -> bool {
+    if registered_ordinary_tool {
+        return tracker.note_registered_tool_call_arguments_delta(scrollback, name, tool_index);
+    }
+    tracker.handle_tool_call_delta(scrollback, name, arguments_delta, tool_index)
+}
+
 /// Apply one xAI session event to a child view: the scrollback/session
 /// rendering shared by the live child routing above and the from-disk child
 /// replay (`crate::app::subagent::replay_inherited_updates`), so a rebuilt

@@ -1097,6 +1097,14 @@ pub trait StorageAdapter: Send + Sync {
         reasoning_effort: Option<Option<ReasoningEffort>>,
     ) -> io::Result<()>;
 
+    async fn update_previous_turn_model(
+        &self,
+        _info: &Info,
+        _previous_turn_model: crate::session::PreviousTurnModel,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Monotonically persist `Summary::ever_used_codex` (the session has
     /// sampled through the Codex provider at least once). Never cleared.
     /// Default: no-op for adapters without a persisted summary.

@@ -113,6 +113,13 @@ struct CodexAccountModels {
     /// `codex_models::account_fingerprint` of the producing account.
     fingerprint: String,
     entries: IndexMap<String, ModelEntry>,
+    compaction_metadata: IndexMap<String, CodexCompactionMetadata>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CodexCompactionMetadata {
+    pub auto_compact_token_limit: Option<u64>,
+    pub comp_hash: Option<String>,
 }
 
 /// Catalog fields written together under one lock, so readers never see a torn mix.
@@ -361,10 +368,7 @@ impl ModelsManagerBuilder {
     }
 
     #[cfg(test)]
-    pub(crate) fn codex_logged_in(
-        mut self,
-        probe: Arc<dyn Fn() -> bool + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn codex_logged_in(mut self, probe: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.codex_logged_in = probe;
         self
     }
@@ -698,6 +702,20 @@ impl ModelsManager {
         self.set_codex_models_fenced(entries, fingerprint, generation)
     }
 
+    /// Account-fenced live Codex compaction metadata for `model_id`.
+    pub(crate) fn codex_compaction_metadata(
+        &self,
+        model_id: &str,
+    ) -> Option<CodexCompactionMetadata> {
+        let current = (self.inner.codex_account)()?;
+        let catalog = self.inner.catalog.read();
+        let models = catalog
+            .codex_models
+            .as_ref()
+            .filter(|models| models.fingerprint == current)?;
+        models.compaction_metadata.get(model_id).cloned()
+    }
+
     pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffort> {
         *self.inner.current_reasoning_effort.read()
     }
@@ -723,10 +741,7 @@ impl ModelsManager {
     pub(crate) fn model_auth_state(
         &self,
         model_id: &str,
-    ) -> Option<(
-        config::ModelAuthFacts,
-        Option<crate::auth::AuthProviderRef>,
-    )> {
+    ) -> Option<(config::ModelAuthFacts, Option<crate::auth::AuthProviderRef>)> {
         self.with_catalog_entry(model_id, |entry| {
             (
                 config::model_auth_facts_for_entry(entry),
@@ -1217,7 +1232,25 @@ impl ModelsManager {
             return;
         }
         let fingerprint = fingerprint.to_owned();
-        self.set_codex_models_fenced(codex_catalog_entries(&catalog), fingerprint, generation);
+        let compaction_metadata = catalog
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    model.slug.clone(),
+                    CodexCompactionMetadata {
+                        auto_compact_token_limit: model.auto_compact_token_limit,
+                        comp_hash: model.comp_hash.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.set_codex_models_with_metadata_fenced(
+            codex_catalog_entries(&catalog),
+            compaction_metadata,
+            fingerprint,
+            generation,
+        );
     }
 
     /// Store mapped live Codex entries for `fingerprint` and rebuild the
@@ -1231,6 +1264,21 @@ impl ModelsManager {
     fn set_codex_models_fenced(
         &self,
         entries: IndexMap<String, ModelEntry>,
+        fingerprint: String,
+        generation: u64,
+    ) -> bool {
+        self.set_codex_models_with_metadata_fenced(
+            entries,
+            IndexMap::new(),
+            fingerprint,
+            generation,
+        )
+    }
+
+    fn set_codex_models_with_metadata_fenced(
+        &self,
+        entries: IndexMap<String, ModelEntry>,
+        compaction_metadata: IndexMap<String, CodexCompactionMetadata>,
         fingerprint: String,
         generation: u64,
     ) -> bool {
@@ -1251,6 +1299,7 @@ impl ModelsManager {
                 current.fingerprint == fingerprint
                     && serde_json::to_string(&current.entries).ok()
                         == serde_json::to_string(&entries).ok()
+                    && current.compaction_metadata == compaction_metadata
             });
             if same_content {
                 false
@@ -1259,6 +1308,7 @@ impl ModelsManager {
                 cat.codex_models = Some(CodexAccountModels {
                     fingerprint,
                     entries,
+                    compaction_metadata,
                 });
                 let codex_models = cat
                     .codex_models

@@ -79,6 +79,7 @@ pub(crate) struct CreateCellRequest {
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
+    pub(crate) max_output_tokens: usize,
 }
 
 /// Tool metadata exposed to code running inside a cell.

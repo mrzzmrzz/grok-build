@@ -84,6 +84,7 @@ impl ChatStateActor {
     ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let ever_used_codex_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let xai_aux_egress_barrier = std::sync::Arc::new(tokio::sync::RwLock::new(()));
 
         let actor = ChatStateActor {
             state: ChatState::new(initial_conversation, sampling_config),
@@ -97,7 +98,7 @@ impl ChatStateActor {
 
         tokio::spawn(actor.run());
 
-        ChatStateHandle::new(cmd_tx, ever_used_codex_latch)
+        ChatStateHandle::new(cmd_tx, ever_used_codex_latch, xai_aux_egress_barrier)
     }
 
     /// Set the monotonic Codex-provenance mark, keeping the synchronous latch

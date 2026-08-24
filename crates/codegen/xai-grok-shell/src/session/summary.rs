@@ -26,6 +26,10 @@ enum State {
 pub(crate) struct SummaryConfig {
     pub(crate) sampling_client: OaiCompatClient,
     pub(crate) model: String,
+    /// True only for an unpinned xAI-hosted helper. Explicit local pins are
+    /// consent-grade and Codex-native summary clients are not xAI egress.
+    pub(crate) revoke_on_codex: bool,
+    pub(crate) codex_guard: Option<xai_chat_state::ChatStateHandle>,
     /// Channel back to the persistence actor for sequential storage writes.
     /// Weak: a strong sender here would keep the actor's own channel and task alive.
     pub(crate) persistence_tx: mpsc::WeakUnboundedSender<PersistenceMsg>,
@@ -48,6 +52,10 @@ impl SummaryGenerator {
             state: State::Idle,
             config,
         }
+    }
+
+    pub(crate) fn set_codex_guard(&mut self, guard: xai_chat_state::ChatStateHandle) {
+        self.config.codex_guard = Some(guard);
     }
 
     /// Generate a session summary from the first content chunk.
@@ -73,13 +81,20 @@ impl SummaryGenerator {
                 let sampling_client = self.config.sampling_client.clone();
                 let model = self.config.model.clone();
                 let persistence_tx = self.config.persistence_tx.clone();
+                let revoke_on_codex = self.config.revoke_on_codex;
+                let codex_guard = self.config.codex_guard.clone();
 
                 // Spawn title generation as a background task so the
                 // persistence actor can continue processing messages
                 // (updates, flushes) without waiting for the LLM call.
                 tokio::spawn(async move {
-                    let mut title =
-                        generate_session_summary(content.clone(), sampling_client, &model).await;
+                    let mut title = generate_session_summary(
+                        content.clone(),
+                        sampling_client,
+                        &model,
+                        revoke_on_codex.then_some(codex_guard).flatten(),
+                    )
+                    .await;
                     if title.trim().is_empty() {
                         title =
                             crate::session::helpers::session_summary::title_fallback_from_user_text(
@@ -239,6 +254,8 @@ mod tests {
         let mut generator = SummaryGenerator::new(SummaryConfig {
             sampling_client,
             model: String::new(),
+            revoke_on_codex: false,
+            codex_guard: None,
             persistence_tx: tx.downgrade(),
         });
         assert!(generator.is_idle());

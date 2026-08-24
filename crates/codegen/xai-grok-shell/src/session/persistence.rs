@@ -235,6 +235,7 @@ pub enum PersistenceMsg {
         agent_name: Option<String>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
     },
+    PreviousTurnModel(crate::session::PreviousTurnModel),
     PlanState(TodoState),
     /// Plan mode lifecycle state to persist
     PlanModeState(crate::session::plan_mode::PlanModeSnapshot),
@@ -327,6 +328,9 @@ pub enum PersistenceMsg {
     /// remote/relay sync of session content to xAI backends for this actor.
     /// There is deliberately no way to clear the mark.
     MarkEverUsedCodex,
+    /// Install the live session provenance latch used to fence the cached
+    /// automatic-summary client at its actual request boundary.
+    SetSummaryCodexGuard(xai_chat_state::ChatStateHandle),
     /// Enable remote writeback for a session created `Local` before remote
     /// settings resolved (non-blocking startup); backfills its local history.
     UpgradeToWriteback {
@@ -953,6 +957,13 @@ pub struct Summary {
     /// committed value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_recap: Option<String>,
+    /// Stable prompt-cache identity. Fresh sessions pin their own id; a
+    /// same-model verbatim fork may inherit the warmed parent's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_affinity_id: Option<String>,
+    /// Last completed turn's model/compaction compatibility settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_turn_model: Option<crate::session::PreviousTurnModel>,
     /// Monotonic: `true` once this session has ever sampled through the
     /// Codex provider. Set via [`SummaryPatch`]'s OR-merge (never cleared),
     /// inherited by forks/resumes, and used to keep Codex-derived session
@@ -972,6 +983,34 @@ pub(crate) fn grok_home_string() -> Option<String> {
 
 pub fn default_model_id() -> acp::ModelId {
     acp::ModelId::new(crate::models::default_model())
+}
+
+fn nonempty_cache_affinity(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+pub(crate) fn resolve_prompt_cache_affinity_id(
+    session_id: &str,
+    persisted: Option<&str>,
+) -> String {
+    nonempty_cache_affinity(persisted).unwrap_or_else(|| session_id.to_owned())
+}
+
+pub(crate) fn cache_affinity_from_session_dir(dir: &Path) -> Option<String> {
+    serde_json::from_slice::<Summary>(&std::fs::read(dir.join("summary.json")).ok()?)
+        .ok()?
+        .restore_cache_affinity_id()
+}
+
+pub(crate) fn previous_turn_model_from_session_dir(
+    dir: &Path,
+) -> Option<crate::session::PreviousTurnModel> {
+    serde_json::from_slice::<Summary>(&std::fs::read(dir.join("summary.json")).ok()?)
+        .ok()?
+        .previous_turn_model
 }
 
 impl Summary {
@@ -1020,8 +1059,25 @@ impl Summary {
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,
+            cache_affinity_id: nonempty_cache_affinity(Some(info.id.0.as_ref())),
+            previous_turn_model: None,
             ever_used_codex: false,
         })
+    }
+
+    /// Restore the persisted identity. Legacy verbatim forks recover the
+    /// parent id; ordinary user forks keep their own-id fallback.
+    pub fn restore_cache_affinity_id(&self) -> Option<String> {
+        nonempty_cache_affinity(self.cache_affinity_id.as_deref()).or_else(|| {
+            (self.fork_context_source.as_deref() == Some("forked_verbatim"))
+                .then(|| nonempty_cache_affinity(self.parent_session_id.as_deref()))
+                .flatten()
+        })
+    }
+
+    pub fn prompt_cache_affinity_id(&self) -> String {
+        self.restore_cache_affinity_id()
+            .unwrap_or_else(|| self.info.id.0.to_string())
     }
 
     /// Whether this session should be excluded from history listings.
@@ -1662,6 +1718,9 @@ impl SessionPersistence {
                         }
                     }
                 }
+                PersistenceMsg::SetSummaryCodexGuard(guard) => {
+                    self.summary.set_codex_guard(guard);
+                }
                 PersistenceMsg::UpgradeToWriteback { auth_manager } => {
                     self.upgrade_to_writeback(auth_manager).await;
                 }
@@ -1787,6 +1846,15 @@ impl SessionPersistence {
                     }
                     if let Some(sync) = &self.remote_sync {
                         sync.set_model_id(model_id.0.to_string());
+                    }
+                }
+                PersistenceMsg::PreviousTurnModel(previous_turn_model) => {
+                    if let Err(error) = self
+                        .storage
+                        .update_previous_turn_model(&self.info, previous_turn_model)
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to persist previous-turn model");
                     }
                 }
                 PersistenceMsg::PlanState(state) => {
@@ -2329,6 +2397,7 @@ pub(crate) struct SessionDeps {
     pub(crate) relay_sync: Option<crate::relay::RelaySync>,
     pub(crate) gateway: Option<GatewaySender>,
     pub(crate) session_summary_model: String,
+    pub(crate) summary_revoke_on_codex: bool,
     pub(crate) registry_title_sync: Option<RegistryGeneratedTitleSync>,
     pub(crate) search_index: crate::session::storage::search::SharedSearchIndex,
 }
@@ -2345,6 +2414,7 @@ pub(crate) async fn new(
         relay_sync,
         gateway,
         session_summary_model,
+        summary_revoke_on_codex,
         registry_title_sync,
         search_index,
     } = deps;
@@ -2380,6 +2450,8 @@ pub(crate) async fn new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
+                    revoke_on_codex: summary_revoke_on_codex,
+                    codex_guard: None,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2412,6 +2484,7 @@ pub(crate) async fn new_with_explicit_dir(
     model_id: acp::ModelId,
     sampling_client: OaiCompatClient,
     session_summary_model: String,
+    summary_revoke_on_codex: bool,
 ) -> io::Result<PersistenceHandle> {
     let summary_path = target_dir.join("summary.json");
     let storage: Box<dyn StorageAdapter> =
@@ -2450,6 +2523,8 @@ pub(crate) async fn new_with_explicit_dir(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
+                    revoke_on_codex: summary_revoke_on_codex,
+                    codex_guard: None,
                     persistence_tx: summary_tx,
                 },
             ),
@@ -2526,6 +2601,7 @@ pub(crate) async fn load(
         relay_sync,
         gateway,
         session_summary_model,
+        summary_revoke_on_codex,
         registry_title_sync,
         search_index,
     } = deps;
@@ -2568,6 +2644,8 @@ pub(crate) async fn load(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
+                revoke_on_codex: summary_revoke_on_codex,
+                codex_guard: None,
                 persistence_tx: summary_tx,
             },
         );
@@ -2611,6 +2689,7 @@ pub(crate) async fn load_light(
         relay_sync,
         gateway,
         session_summary_model,
+        summary_revoke_on_codex,
         registry_title_sync,
         search_index,
     } = deps;
@@ -2660,6 +2739,8 @@ pub(crate) async fn load_light(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
+                revoke_on_codex: summary_revoke_on_codex,
+                codex_guard: None,
                 persistence_tx: summary_tx,
             },
         );

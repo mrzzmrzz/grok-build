@@ -970,12 +970,24 @@ impl SessionActor {
                 self.client_identifier.clone(),
                 Some(self.max_retries),
             );
+        let describe_is_xai =
+            sampler_config.provider_profile.provider == xai_grok_sampling_types::ModelProvider::Xai;
         let client = xai_grok_sampler::SamplingClient::new(sampler_config).map_err(|e| {
             acp::Error::internal_error().data(format!(
                 "failed to build image-describe sampling client: {e}"
             ))
         })?;
         let model = &describe_model;
+        let _xai_egress_guard = if describe_is_xai {
+            let guard = self.chat_state_handle.xai_aux_egress_guard().await;
+            if self.chat_state_handle.ever_used_codex_now() {
+                return Err(acp::Error::internal_error()
+                    .data("image transcription through xAI was withheld after Codex provenance"));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let limit = crate::session::image_describe::IMAGE_DESCRIPTION_PROCESSING_LIMIT;
         let skip_count = persisted.len().saturating_sub(limit);
         if skip_count > 0 {

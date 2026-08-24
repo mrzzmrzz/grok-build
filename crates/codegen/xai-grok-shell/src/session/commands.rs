@@ -496,6 +496,13 @@ pub enum SessionCommand {
         prompt_id: Option<String>,
         respond_to: oneshot::Sender<Option<crate::extensions::notification::PromptUsage>>,
     },
+    /// Query Codex prompt-cache telemetry for the live session.
+    GetCacheInfo {
+        respond_to: oneshot::Sender<(
+            crate::session::CacheSummary,
+            Vec<crate::session::CacheTurnRecord>,
+        )>,
+    },
     /// Persist the monotonic telemetry turn counter ("next trace turn") for the session.
     SetNextTraceTurn {
         next_trace_turn: u64,

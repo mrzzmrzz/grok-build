@@ -357,6 +357,7 @@ impl BackendToolCallItem {
             BackendToolKind::WebSearch(ws) => ws.id.as_str(),
             BackendToolKind::XSearch(ct) => ct.id.as_str(),
             BackendToolKind::CodeInterpreter(ci) => ci.id.as_str(),
+            BackendToolKind::CodexRawInput(item) => item.id.as_str(),
         }
     }
 
@@ -393,7 +394,89 @@ impl BackendToolCallItem {
                     .unwrap_or_default();
                 format!("[backend code_interpreter] {code_preview}")
             }
+            BackendToolKind::CodexRawInput(item) => item.text_summary(),
         }
+    }
+
+    /// Approximate serialized content size for context accounting. Opaque
+    /// Codex compaction payloads are intentionally hidden from user-visible
+    /// text, but their encrypted bytes still consume model context.
+    pub fn estimated_content_len(&self) -> usize {
+        match &self.kind {
+            BackendToolKind::CodexRawInput(item) => item.estimated_model_visible_len(),
+            _ => self.text_summary().len(),
+        }
+    }
+}
+
+/// One opaque input-ready item returned by OpenAI Codex compaction.
+///
+/// The provider owns this wire format. Keeping the raw JSON lets subsequent
+/// Codex turns replay it exactly even when the typed Responses dependency
+/// does not yet model a newer item variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRawInputItem {
+    /// Stable local identity for persistence and deduplication. Some provider
+    /// compaction items legitimately omit their wire `id`.
+    pub id: String,
+    /// Exact provider item to splice back into the next Responses input.
+    pub raw: serde_json::Value,
+}
+
+impl CodexRawInputItem {
+    fn estimated_model_visible_len(&self) -> usize {
+        let item_type = self.raw.get("type").and_then(serde_json::Value::as_str);
+        if matches!(
+            item_type,
+            Some("compaction" | "context_compaction" | "reasoning")
+        ) && let Some(encoded) = self
+            .raw
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str)
+        {
+            return (encoded.len().saturating_mul(3) / 4).saturating_sub(650);
+        }
+        self.raw.to_string().len()
+    }
+
+    fn text_summary(&self) -> String {
+        let item_type = self
+            .raw
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("item");
+        if item_type == "message" {
+            let role = self
+                .raw
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("context");
+            let text = compact_message_text(&self.raw);
+            if !text.is_empty() {
+                return format!("[OpenAI retained {role} context] {text}");
+            }
+        }
+        if matches!(item_type, "compaction" | "context_compaction") {
+            "[OpenAI compacted context]".to_owned()
+        } else {
+            format!("[OpenAI retained {item_type} context]")
+        }
+    }
+}
+
+fn compact_message_text(value: &serde_json::Value) -> String {
+    match value.get("content") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -410,6 +493,8 @@ pub enum BackendToolKind {
     XSearch(rs::CustomToolCall),
     /// Server-side code interpreter execution.
     CodeInterpreter(rs::CodeInterpreterToolCall),
+    /// Opaque replacement-history item returned by OpenAI Codex compaction.
+    CodexRawInput(CodexRawInputItem),
 }
 
 // ============================================================================
@@ -596,8 +681,7 @@ impl ToolCall {
 
     /// Provider call id for either a custom or ordinary function call.
     pub fn call_id(&self) -> &str {
-        decode_custom_tool_call_id(&self.id)
-            .map_or(self.id.as_ref(), |(call_id, _)| call_id)
+        decode_custom_tool_call_id(&self.id).map_or(self.id.as_ref(), |(call_id, _)| call_id)
     }
 
     /// Responses output-item id for a native custom call.
@@ -636,8 +720,12 @@ pub struct CustomToolSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostedTool {
-    WebSearch { options: Option<WebSearchOptions> },
-    XSearch { options: Option<XSearchOptions> },
+    WebSearch {
+        options: Option<WebSearchOptions>,
+    },
+    XSearch {
+        options: Option<XSearchOptions>,
+    },
     /// A client-executed native Responses custom tool, such as Code Mode's
     /// free-form JavaScript `exec` tool.
     ClientCustom(CustomToolSpec),
@@ -753,11 +841,88 @@ pub struct ConversationRequest {
     pub turn_state: Option<String>,
 }
 
+/// Exact Responses input item that replaces the typed placeholder at
+/// `input_item_index` after request serialization.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawInputItemReplacement {
+    pub input_item_index: usize,
+    pub value: serde_json::Value,
+}
+
 impl ConversationRequest {
     /// Strip every image; returns the stripped URLs.
     pub fn strip_images(&mut self) -> Vec<Arc<str>> {
         strip_images_where(&mut self.items, |_| true)
     }
+
+    /// Locate opaque Codex-native history items in the flattened Responses
+    /// input. Counting through the same conversion as the serializer keeps
+    /// indexes stable when an assistant expands to multiple wire items.
+    pub fn raw_codex_input_replacements(&self) -> Vec<RawInputItemReplacement> {
+        let mut replacements = Vec::new();
+        let mut input_item_index = 0usize;
+        for item in &self.items {
+            if let ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::CodexRawInput(raw),
+            }) = item
+            {
+                replacements.push(RawInputItemReplacement {
+                    input_item_index,
+                    value: raw.raw.clone(),
+                });
+            }
+            input_item_index = input_item_index.saturating_add(
+                crate::conversation::responses::conversation_item_wire_len(item),
+            );
+        }
+        replacements
+    }
+}
+
+/// Preserve the input-ready replacement history returned by OpenAI Codex
+/// compaction. Unsupported transient items are deliberately dropped using
+/// the same retention boundary as codex-rs.
+pub fn codex_compact_output_to_conversation_items(
+    output: Vec<serde_json::Value>,
+) -> std::result::Result<Vec<ConversationItem>, String> {
+    let mut retained = Vec::new();
+    for (index, raw) in output.into_iter().enumerate() {
+        let object = raw
+            .as_object()
+            .ok_or_else(|| format!("compact output item {index} is not an object"))?;
+        let item_type = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("compact output item {index} has no type"))?;
+        let keep = match item_type {
+            "message" => matches!(
+                object.get("role").and_then(serde_json::Value::as_str),
+                Some("user" | "assistant")
+            ),
+            "agent_message" | "compaction" | "context_compaction" => true,
+            _ => false,
+        };
+        if !keep {
+            continue;
+        }
+        let provider_id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("codex_compact_{index}_{item_type}"));
+        retained.push(ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                id: provider_id,
+                raw,
+            }),
+        }));
+    }
+    if retained.is_empty() {
+        return Err("compact output contained no supported replacement history".to_owned());
+    }
+    Ok(retained)
 }
 
 /// Strip only `urls`. Unlisted images (compaction, newer turns) stay.
@@ -910,6 +1075,17 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Prompt-cache hit rate in percent, or `None` when the prompt is empty.
+    /// Responses reports `prompt_tokens` as the full input denominator.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.prompt_tokens != 0)
+            .then(|| f64::from(self.cached_prompt_tokens) / f64::from(self.prompt_tokens) * 100.0)
+    }
+
+    pub fn cache_hit_rate_pct(&self) -> f64 {
+        self.cache_hit_rate().unwrap_or(0.0)
+    }
+
     pub fn record_on_span(&self, span: &tracing::Span) {
         span.record("prompt_tokens", self.prompt_tokens);
         span.record("completion_tokens", self.completion_tokens);
@@ -2586,7 +2762,9 @@ mod custom_tool_call_id_tests {
         assert!(is_reserved_custom_tool_call_id(
             "custom_tool_call.v2:6:call_1fc_9"
         ));
-        assert!(is_reserved_custom_tool_call_id("custom_tool_call:call_1:fc_9"));
+        assert!(is_reserved_custom_tool_call_id(
+            "custom_tool_call:call_1:fc_9"
+        ));
         assert!(!is_reserved_custom_tool_call_id("call_ordinary"));
         assert!(!is_reserved_custom_tool_call_id("fc_123"));
     }
@@ -2720,10 +2898,10 @@ mod custom_tool_call_id_tests {
         // Near-misses inside the reserved prefix stay ordinary calls: the
         // decode is total only for well-formed length-prefixed payloads.
         for id in [
-            "custom_tool_call.v2",         // bare prefix stem, no colon
-            "custom_tool_call.v2:99:ab",   // declared length exceeds payload
-            "custom_tool_call.v2:-1:ab",   // negative length
-            "custom_tool_call.v2:2.0:ab",  // non-integer length
+            "custom_tool_call.v2",        // bare prefix stem, no colon
+            "custom_tool_call.v2:99:ab",  // declared length exceeds payload
+            "custom_tool_call.v2:-1:ab",  // negative length
+            "custom_tool_call.v2:2.0:ab", // non-integer length
         ] {
             let call = ToolCall {
                 id: id.into(),
@@ -2779,7 +2957,9 @@ mod tool_result_parts_tests {
         let item = ConversationItem::tool_result_with_parts(
             "call_1",
             vec![
-                ContentPart::Image { url: "img-1".into() },
+                ContentPart::Image {
+                    url: "img-1".into(),
+                },
                 ContentPart::Text { text: "t".into() },
             ],
         );
@@ -2827,7 +3007,9 @@ mod tool_result_parts_tests {
             "call_1",
             vec![
                 ContentPart::Text { text: "a".into() },
-                ContentPart::Image { url: "img-1".into() },
+                ContentPart::Image {
+                    url: "img-1".into(),
+                },
                 ContentPart::Text { text: "b".into() },
             ],
         )];

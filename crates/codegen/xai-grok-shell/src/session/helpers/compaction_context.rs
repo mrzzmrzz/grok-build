@@ -21,16 +21,11 @@ use xai_grok_compaction::reminder::{
     self, ActiveAgentReminderState, BackgroundTask, RunningSubagent, TodoItem, TodoStatus,
 };
 
-/// Resolved model-facing tool names for the MCP usage hint in compaction
-/// reminders.
-///
-/// Resolved at runtime via `TemplateRenderer` from `ToolKind::SearchTool`
-/// and `ToolKind::UseTool`. Never hard-code tool names -- they can be
-/// renamed by the client.
+/// Legacy compatibility input for callers that still pass MCP dispatcher
+/// names. Codex exposes registered MCP tools directly, so compaction ignores
+/// these fields and emits no search/use guidance.
 pub struct McpToolNames {
-    /// Model-facing name of the search/discover tool (e.g. "search_tool").
     pub search: String,
-    /// Model-facing name of the dispatch/call tool (e.g. "use_tool").
     pub call: String,
 }
 
@@ -114,7 +109,7 @@ fn to_system_reminder_inner(
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     memory_results: &[xai_grok_tools::types::memory_backend::MemorySearchResult],
     subagent_tool_names: Option<&SubagentToolNames>,
-    mcp_tool_names: Option<&McpToolNames>,
+    _mcp_tool_names: Option<&McpToolNames>,
     workflow_listing: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
@@ -221,19 +216,7 @@ fn to_system_reminder_inner(
             .iter()
             .map(|s| format_compaction_server_line(&s.name, s.tool_count, &s.description))
             .collect();
-        let hint = if let Some(names) = mcp_tool_names {
-            format!(
-                "\nTo use MCP tools, you MUST call `{}` first to retrieve the tool's input schema before calling `{}`. NEVER guess parameter names — always use the exact schema returned by `{}`.",
-                names.search, names.call, names.search
-            )
-        } else {
-            String::new()
-        };
-        sections.push(format!(
-            "## Connected MCP Servers\n{}{}",
-            servers.trim_end(),
-            hint
-        ));
+        sections.push(format!("## Connected MCP Servers\n{}", servers.trim_end()));
     }
 
     // Relevant memory from past sessions (post-compaction recovery; shell-only)
@@ -313,7 +296,11 @@ mod tests {
             running_subagents: vec![],
             todos: vec![],
         };
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
+        let legacy_dispatchers = McpToolNames {
+            search: "search_tool".to_string(),
+            call: "use_tool".to_string(),
+        };
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, Some(&legacy_dispatchers), None);
         let text = result.expect("should produce a reminder");
         let expected = "\
 <system-reminder>
@@ -322,6 +309,8 @@ mod tests {
 - linear (12 tools)
 </system-reminder>";
         assert_eq!(text, expected, "got:\n{text}");
+        assert!(!text.contains("search_tool"));
+        assert!(!text.contains("use_tool"));
     }
 
     /// Regression: task IDs in the post-compaction reminder must be rendered

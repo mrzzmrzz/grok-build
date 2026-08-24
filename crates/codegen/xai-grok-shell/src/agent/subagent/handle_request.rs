@@ -27,12 +27,24 @@ pub(super) fn task_model_override_error(
 /// session (`MvpAgent::get_trace_context`) gates the child: `spawn_provenance`
 /// covers a Codex initial provider and the inherited parent mark,
 /// `ever_used_codex` a mid-run switch onto Codex.
-pub(super) fn subagent_trace_upload_allowed(
-    spawn_provenance: bool,
-    ever_used_codex: bool,
-) -> bool {
+pub(super) fn subagent_trace_upload_allowed(spawn_provenance: bool, ever_used_codex: bool) -> bool {
     !spawn_provenance && !ever_used_codex
 }
+
+pub(super) fn apply_codex_subagent_system_prompt(
+    definition: &mut xai_grok_agent::config::AgentDefinition,
+    provider: xai_grok_sampling_types::ModelProvider,
+    preserve_inherited_system: bool,
+) {
+    if provider == xai_grok_sampling_types::ModelProvider::Codex
+        && !preserve_inherited_system
+        && definition.prompt_mode == xai_grok_agent::config::PromptMode::Extend
+        && definition.system_prompt == xai_grok_agent::prompt::context::TemplateOverride::None
+    {
+        definition.system_prompt = xai_grok_agent::prompt::context::TemplateOverride::Codex;
+    }
+}
+
 /// Runtime adapter for one shell child. Shared lifecycle state is owned by the
 /// `xai-grok-tools` coordinator actor and reached only through `reporter`.
 #[tracing::instrument(
@@ -521,6 +533,12 @@ pub(crate) async fn run_shell_child(
     };
     let verbatim_mirror_fork =
         context_source == InitialContextSource::Forked && context_verbatim_fork;
+    apply_codex_subagent_system_prompt(
+        &mut definition,
+        effective_sampling_config.provider_profile.provider,
+        verbatim_mirror_fork,
+    );
+    let inherit_parent_cache_affinity = verbatim_mirror_fork && effective_model_id == ctx.model_id;
     let task_prompt_text = prompt.clone();
     let (mut forked_conversation, mut inherited_prefix_len) =
         (forked_conversation, inherited_prefix_len.unwrap_or(0));
@@ -619,10 +637,10 @@ pub(crate) async fn run_shell_child(
         let method = upload_method.clone();
         let auth_for_spawn = ctx.auth_manager.clone();
         tokio::spawn(async move {
-            upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
+            upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn, None).await;
         });
     }
-    let gcs_upload_ctx = GcsUploadContext {
+    let mut gcs_upload_ctx = GcsUploadContext {
         bucket_url: gcs_bucket_url.clone(),
         upload_method: gcs_upload_method.clone(),
         model_id: Some(effective_model_id.0.to_string()),
@@ -637,6 +655,7 @@ pub(crate) async fn run_shell_child(
             .as_ref()
             .map(|m| format!("{m:?}")),
         depth: child_depth,
+        codex_provenance_guard: None,
     };
     emit_subagent_notification(
         &gateway,
@@ -675,6 +694,7 @@ pub(crate) async fn run_shell_child(
         parent_prompt_id: request.parent_prompt_id.clone(),
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
+        codex_provenance_guard: None,
     };
     let sampling_client = match crate::sampling::Client::new(effective_sampling_config.clone()) {
         Ok(c) => c,
@@ -697,6 +717,8 @@ pub(crate) async fn run_shell_child(
         effective_model_id.clone(),
         sampling_client,
         effective_sampling_config.model.clone(),
+        effective_sampling_config.provider_profile.provider
+            == xai_grok_sampling_types::ModelProvider::Xai,
     )
     .await
     {
@@ -1067,6 +1089,14 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
+            cache_affinity_id: if inherit_parent_cache_affinity {
+                Some(super::parent_prompt_cache_affinity(&ctx))
+            } else {
+                crate::session::persistence::cache_affinity_from_session_dir(&child_session_dir)
+            },
+            previous_turn_model: crate::session::persistence::previous_turn_model_from_session_dir(
+                &child_session_dir,
+            ),
             ever_used_codex: parent_ever_used_codex,
             ..Default::default()
         },
@@ -1077,6 +1107,7 @@ pub(crate) async fn run_shell_child(
         ctx.resolve_compaction_verbatim_input(),
         ctx.resolve_compaction_tool_choice(),
         false,
+        true,
         None,
         None,
         std::sync::Arc::new(parking_lot::Mutex::new(
@@ -1217,6 +1248,7 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
+    gcs_upload_ctx.codex_provenance_guard = Some(child_handle.chat_state_handle.clone());
     let promoted = reporter
         .started(StartedChild {
             child_session_id: child_session_id.0.to_string(),
@@ -1301,10 +1333,8 @@ pub(crate) async fn run_shell_child(
     } = trace;
     // The upload context is already `None` for a child that started with Codex
     // provenance; this also covers a mid-run switch onto a Codex model.
-    let trace_upload_allowed = subagent_trace_upload_allowed(
-        child_codex_provenance,
-        child_ever_used_codex,
-    );
+    let trace_upload_allowed =
+        subagent_trace_upload_allowed(child_codex_provenance, child_ever_used_codex);
     if !trace_upload_allowed && gcs_upload_ctx.upload_method.is_some() {
         tracing::info!(
             subagent_id = %subagent_id,
@@ -1323,17 +1353,15 @@ pub(crate) async fn run_shell_child(
         .upload_method
         .as_ref()
         .filter(|_| trace_upload_allowed)
-        .map(
-            |method| crate::session::repo_changes::TraceExportConfig {
-                bucket_url: gcs_upload_ctx.bucket_url.clone(),
-                service_account_key: None,
-                prefix_dir: None,
-                gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),
-                absolute_paths: false,
-                archive_name_override: None,
-                upload_method: method.clone(),
-            },
-        )
+        .map(|method| crate::session::repo_changes::TraceExportConfig {
+            bucket_url: gcs_upload_ctx.bucket_url.clone(),
+            service_account_key: None,
+            prefix_dir: None,
+            gcs_prefix: Some(format!("{}/turn_0", child_session_id.0)),
+            absolute_paths: false,
+            archive_name_override: None,
+            upload_method: method.clone(),
+        })
     {
         let (copy_tx, session_copy_rx) = tokio::sync::oneshot::channel();
         let _ = child_handle.cmd_tx.send(SessionCommand::CopyFile {
@@ -1494,7 +1522,15 @@ pub(crate) async fn run_shell_child(
         }
     }
     completion_data.set_persisted_output_dir(persist_subagent_output(&subagent_meta_dir, &result));
-    persist_subagent_completion(&subagent_meta_dir, &result, &gcs_upload_ctx);
+    // A child can switch to Codex after its xAI upload context was created.
+    // Keep the local completion metadata, but revoke the xAI-only completion
+    // upload just as we revoke its turn trace above.
+    let mut completion_gcs_upload_ctx = gcs_upload_ctx.clone();
+    if child_ever_used_codex {
+        completion_gcs_upload_ctx.bucket_url = None;
+        completion_gcs_upload_ctx.upload_method = None;
+    }
+    persist_subagent_completion(&subagent_meta_dir, &result, &completion_gcs_upload_ctx);
     let final_status = result.status().to_string();
     let snapshot_dispose_enabled = ctx.resolve_subagent_worktree_snapshot_enabled();
     let telemetry_tokens = if result.tool_calls > 0 || result.success {

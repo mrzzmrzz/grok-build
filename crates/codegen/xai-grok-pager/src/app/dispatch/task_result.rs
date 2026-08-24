@@ -43,7 +43,7 @@ use super::session::modal::remove_agent_and_cleanup;
 use super::settings::ui::apply_setting_rollback;
 use super::status::{
     handle_codex_usage_loaded, handle_coding_data_sharing_failed,
-    handle_coding_data_sharing_updated, handle_context_info_complete,
+    handle_coding_data_sharing_updated, handle_context_info_complete, handle_session_cache_result,
     handle_session_usage_result, scrub_error_for_toast, usage_modal_state_mut,
 };
 use super::transcript::{
@@ -1182,6 +1182,26 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             &session_id,
             format!("Couldn't load session usage: {error}"),
             nonce,
+        ),
+        TaskResult::SessionCacheComplete {
+            agent_id,
+            session_id,
+            cache,
+        } => handle_session_cache_result(
+            app,
+            agent_id,
+            &session_id,
+            crate::app::status_blocks::session_cache_block_text(&cache),
+        ),
+        TaskResult::SessionCacheFailed {
+            agent_id,
+            session_id,
+            error,
+        } => handle_session_cache_result(
+            app,
+            agent_id,
+            &session_id,
+            format!("Couldn't load prompt cache telemetry: {error}"),
         ),
         TaskResult::CodexUsageLoaded {
             agent_id,

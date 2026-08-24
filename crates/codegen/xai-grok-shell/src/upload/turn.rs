@@ -65,6 +65,25 @@ pub(crate) struct PromptTraceContext {
     pub(crate) auth_manager: std::sync::Arc<crate::auth::AuthManager>,
 }
 impl PromptTraceContext {
+    /// Serialize one final xAI egress boundary with the monotonic Codex
+    /// revocation. The caller must hold the returned read guard through the
+    /// HTTP send or durable queue admission.
+    pub(crate) async fn xai_egress_guard(
+        &self,
+        artifact: &str,
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let guard = self
+            .session_handle
+            .chat_state_handle
+            .xai_aux_egress_guard()
+            .await;
+        if self.refuse_upload_on_codex_provenance(artifact) {
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
     /// Whether this context has been revoked by Codex provenance landing on
     /// the session AFTER the context was admitted.
     ///

@@ -9,8 +9,8 @@ use crate::codex_auth::{self, CODEX_ORIGINATOR, CodexCredentials};
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use reqwest::header::{ETAG, IF_NONE_MATCH, USER_AGENT};
 use reqwest::StatusCode;
+use reqwest::header::{ETAG, IF_NONE_MATCH, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::Write;
@@ -21,7 +21,7 @@ use url::Url;
 
 pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
 pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "GROK_CODEX_CLIENT_VERSION";
-pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.149.1";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
@@ -38,7 +38,10 @@ pub(crate) fn codex_client_version() -> String {
 fn normalize_whole_semver(value: &str) -> Option<String> {
     let value = value.trim().strip_prefix('v').unwrap_or(value.trim());
     let version = semver::Version::parse(value).ok()?;
-    Some(format!("{}.{}.{}", version.major, version.minor, version.patch))
+    Some(format!(
+        "{}.{}.{}",
+        version.major, version.minor, version.patch
+    ))
 }
 
 /// Visibility supplied by the Codex catalog.
@@ -80,6 +83,10 @@ pub(crate) struct CodexCatalogModel {
     pub supported_in_api: bool,
     pub context_window: Option<u64>,
     pub raw_context_window: Option<u64>,
+    #[serde(default)]
+    pub auto_compact_token_limit: Option<u64>,
+    #[serde(default)]
+    pub comp_hash: Option<String>,
     pub effective_context_window_percent: i64,
     #[serde(default)]
     pub default_reasoning_level: Option<String>,
@@ -167,6 +174,10 @@ struct CodexWireModel {
     context_window: Option<i64>,
     #[serde(default)]
     max_context_window: Option<i64>,
+    #[serde(default)]
+    auto_compact_token_limit: Option<i64>,
+    #[serde(default)]
+    comp_hash: Option<String>,
     #[serde(default = "default_effective_context_window_percent")]
     effective_context_window_percent: i64,
     #[serde(default)]
@@ -659,6 +670,13 @@ fn convert_model(wire: CodexWireModel) -> Option<CodexCatalogModel> {
         supported_in_api: false,
         context_window,
         raw_context_window,
+        auto_compact_token_limit: wire
+            .auto_compact_token_limit
+            .and_then(|value| u64::try_from(value).ok()),
+        comp_hash: wire
+            .comp_hash
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
         effective_context_window_percent: wire.effective_context_window_percent,
         default_reasoning_level: wire
             .default_reasoning_level
@@ -724,15 +742,15 @@ fn safe_error_excerpt(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::extract::{Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
-    use axum::Router;
     use serde_json::json;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
 
@@ -839,7 +857,11 @@ mod tests {
         statuses: impl IntoIterator<Item = StatusCode>,
         body: serde_json::Value,
         gate: Option<(Arc<Notify>, Arc<Notify>)>,
-    ) -> (String, Arc<Mutex<Vec<ObservedRequest>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        Arc<Mutex<Vec<ObservedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         spawn_server_with_etag(statuses, body, None, gate).await
     }
 
@@ -848,7 +870,11 @@ mod tests {
         body: serde_json::Value,
         etag: Option<&str>,
         gate: Option<(Arc<Notify>, Arc<Notify>)>,
-    ) -> (String, Arc<Mutex<Vec<ObservedRequest>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        Arc<Mutex<Vec<ObservedRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -893,6 +919,8 @@ mod tests {
                 "supported_in_api": true,
                 "priority": 1,
                 "context_window": 372000,
+                "auto_compact_token_limit": 300000,
+                "comp_hash": "3000",
                 "effective_context_window_percent": 95,
                 "supports_search_tool": true,
                 "tool_mode": "code_mode_only",
@@ -928,14 +956,22 @@ mod tests {
 
         let requests = observed.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer codex-token"));
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer codex-token")
+        );
         assert_eq!(requests[0].account_id.as_deref(), Some("account-1"));
         assert_eq!(requests[0].originator.as_deref(), Some(CODEX_ORIGINATOR));
-        assert_eq!(requests[0].user_agent.as_deref(), Some("codex_cli_rs/1.2.3"));
+        assert_eq!(
+            requests[0].user_agent.as_deref(),
+            Some("codex_cli_rs/1.2.3")
+        );
         assert_eq!(requests[0].version.as_deref(), Some("1.2.3"));
         assert_eq!(catalog.models.len(), 2);
         assert!(catalog.is_authoritative());
         assert_eq!(catalog.models[0].context_window, Some(353400));
+        assert_eq!(catalog.models[0].auto_compact_token_limit, Some(300000));
+        assert_eq!(catalog.models[0].comp_hash.as_deref(), Some("3000"));
         assert!(catalog.models[0].supports_search_tool);
         assert_eq!(catalog.models[0].supported_in_api, false);
         assert!(client.cache_path().exists());
@@ -943,9 +979,12 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_refreshes_only_codex_credentials_once() {
-        let (base_url, observed, server) =
-            spawn_server([StatusCode::UNAUTHORIZED, StatusCode::OK], model_response(), None)
-                .await;
+        let (base_url, observed, server) = spawn_server(
+            [StatusCode::UNAUTHORIZED, StatusCode::OK],
+            model_response(),
+            None,
+        )
+        .await;
         let temp = tempfile::tempdir().unwrap();
         let old = credentials("old-token", "account-1");
         let new = credentials("new-token", "account-1");
@@ -963,8 +1002,14 @@ mod tests {
         assert_eq!(auth.force_calls.load(Ordering::SeqCst), 1);
         let requests = observed.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer old-token"));
-        assert_eq!(requests[1].authorization.as_deref(), Some("Bearer new-token"));
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer old-token")
+        );
+        assert_eq!(
+            requests[1].authorization.as_deref(),
+            Some("Bearer new-token")
+        );
     }
 
     #[tokio::test]
@@ -1033,18 +1078,24 @@ mod tests {
             force_calls: AtomicUsize::new(0),
         });
         let client = test_client(&temp, base_url, auth);
-        let model = convert_model(serde_json::from_value(json!({
-            "slug": "cached",
-            "display_name": "Cached",
-            "visibility": "list",
-            "context_window": 100000
-        })).unwrap()).unwrap();
+        let model = convert_model(
+            serde_json::from_value(json!({
+                "slug": "cached",
+                "display_name": "Cached",
+                "visibility": "list",
+                "context_window": 100000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let stale_catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("\"other-account-etag\"".to_owned()),
             account_fingerprint: Some(account_fingerprint(&account_a).unwrap()),
         };
-        client.persist(&stale_catalog, &account_a, Utc::now()).unwrap();
+        client
+            .persist(&stale_catalog, &account_a, Utc::now())
+            .unwrap();
 
         let fetched = client.fetch_and_cache().await.unwrap().unwrap();
         server.abort();
@@ -1080,12 +1131,16 @@ mod tests {
             force_calls: AtomicUsize::new(0),
         });
         let client = test_client(&temp, base_url, auth);
-        let model = convert_model(serde_json::from_value(json!({
-            "slug": "cached",
-            "display_name": "Cached",
-            "visibility": "list",
-            "context_window": 100000
-        })).unwrap()).unwrap();
+        let model = convert_model(
+            serde_json::from_value(json!({
+                "slug": "cached",
+                "display_name": "Cached",
+                "visibility": "list",
+                "context_window": 100000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let cached_catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("\"catalog-v1\"".to_owned()),
@@ -1153,13 +1208,21 @@ mod tests {
             refreshed: None,
             force_calls: AtomicUsize::new(0),
         });
-        let client = test_client(&temp, "https://chatgpt.example/codex".to_owned(), auth.clone());
-        let model = convert_model(serde_json::from_value(json!({
-            "slug": "cached",
-            "display_name": "Cached",
-            "visibility": "list",
-            "context_window": 100000
-        })).unwrap()).unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".to_owned(),
+            auth.clone(),
+        );
+        let model = convert_model(
+            serde_json::from_value(json!({
+                "slug": "cached",
+                "display_name": "Cached",
+                "visibility": "list",
+                "context_window": 100000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let catalog = CodexModelsCatalog {
             models: vec![model],
             etag: Some("etag".to_owned()),
@@ -1193,11 +1256,15 @@ mod tests {
             force_calls: AtomicUsize::new(0),
         });
         let client = test_client(&temp, "https://chatgpt.example/codex".to_owned(), auth);
-        let model = convert_model(serde_json::from_value(json!({
-            "slug": "cached",
-            "display_name": "Cached",
-            "visibility": "list"
-        })).unwrap()).unwrap();
+        let model = convert_model(
+            serde_json::from_value(json!({
+                "slug": "cached",
+                "display_name": "Cached",
+                "visibility": "list"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let catalog = CodexModelsCatalog {
             models: vec![model],
             etag: None,
@@ -1216,7 +1283,10 @@ mod tests {
 
     #[test]
     fn compatibility_version_normalizes() {
-        assert_eq!(normalize_whole_semver(" v0.144.5-alpha+build"), Some("0.144.5".to_owned()));
+        assert_eq!(
+            normalize_whole_semver(" v0.144.5-alpha+build"),
+            Some("0.144.5".to_owned())
+        );
         assert_eq!(normalize_whole_semver("nope"), None);
     }
 

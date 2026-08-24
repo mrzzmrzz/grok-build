@@ -736,9 +736,7 @@ fn inherited_model_auth_facts(
     ctx.models_manager
         .model_auth_state(model)
         .map(|(facts, _)| facts)
-        .unwrap_or_else(|| {
-            crate::agent::config::resolve_model_auth_facts_and_provider(model).0
-        })
+        .unwrap_or_else(|| crate::agent::config::resolve_model_auth_facts_and_provider(model).0)
 }
 /// [`session_bearer_resolver`] for an inherited config, where only the model
 /// string is known: BYOK comes from the live catalog (static config as
@@ -896,9 +894,7 @@ async fn read_parent_sampling_config(
             fallback.api_key = None;
             if fallback.bearer_resolver.is_none() {
                 fallback.bearer_resolver = Some(std::sync::Arc::new(
-                    crate::codex_auth::CodexBearerResolver::from_headers(
-                        &fallback.extra_headers,
-                    ),
+                    crate::codex_auth::CodexBearerResolver::from_headers(&fallback.extra_headers),
                 ));
             }
         }
@@ -966,32 +962,31 @@ fn resolve_model_override_to_config(
         ctx.sampling_config.deployment_id.clone(),
         ctx.sampling_config.user_id.clone(),
     );
-    config.bearer_resolver = if config.provider_profile.provider
-        == xai_grok_sampling_types::ModelProvider::Codex
-    {
-        // Codex pin: OAuth sessions mount the Codex resolver via the identity
-        // anchor sampling_config_for_model placed; explicit-key pins keep the
-        // static key. The xAI session-token resolver never applies.
-        crate::codex_auth::has_oauth_identity_anchor(&config.extra_headers).then(|| {
-            std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_headers(
-                &config.extra_headers,
-            )) as xai_grok_sampler::SharedBearerResolver
-        })
-    } else if !ctx.would_strip_fallback_key(config.api_key.as_deref())
-        && resolved_auth_type == xai_chat_state::AuthType::SessionToken
-    {
-        session_bearer_resolver(
-            ctx,
-            if entry.has_own_credentials() {
-                crate::agent::auth_method::ModelByok::Byok
-            } else {
-                crate::agent::auth_method::ModelByok::NotByok
-            },
-            &config.base_url,
-        )
-    } else {
-        None
-    };
+    config.bearer_resolver =
+        if config.provider_profile.provider == xai_grok_sampling_types::ModelProvider::Codex {
+            // Codex pin: OAuth sessions mount the Codex resolver via the identity
+            // anchor sampling_config_for_model placed; explicit-key pins keep the
+            // static key. The xAI session-token resolver never applies.
+            crate::codex_auth::has_oauth_identity_anchor(&config.extra_headers).then(|| {
+                std::sync::Arc::new(crate::codex_auth::CodexBearerResolver::from_headers(
+                    &config.extra_headers,
+                )) as xai_grok_sampler::SharedBearerResolver
+            })
+        } else if !ctx.would_strip_fallback_key(config.api_key.as_deref())
+            && resolved_auth_type == xai_chat_state::AuthType::SessionToken
+        {
+            session_bearer_resolver(
+                ctx,
+                if entry.has_own_credentials() {
+                    crate::agent::auth_method::ModelByok::Byok
+                } else {
+                    crate::agent::auth_method::ModelByok::NotByok
+                },
+                &config.base_url,
+            )
+        } else {
+            None
+        };
     xai_grok_telemetry::unified_log::debug(
         "subagent resolve_model_override_to_config",
         None,
@@ -1168,6 +1163,22 @@ fn verbatim_or_normalize_fork(
 fn fork_context_normalized(source: &InitialContextSource, verbatim_fork: bool) -> bool {
     matches!(source, InitialContextSource::Forked) && !verbatim_fork
 }
+
+fn parent_prompt_cache_affinity(ctx: &SubagentSpawnContext) -> String {
+    let parent_dir = ctx
+        .parent_session_info
+        .as_ref()
+        .map(session::persistence::session_dir)
+        .unwrap_or_else(|| {
+            session::persistence::session_dir(&SessionInfo {
+                id: acp::SessionId::new(ctx.parent_session_id.clone()),
+                cwd: ctx.parent_cwd.to_string_lossy().into_owned(),
+            })
+        });
+    session::persistence::cache_affinity_from_session_dir(&parent_dir)
+        .unwrap_or_else(|| ctx.parent_session_id.clone())
+}
+
 /// Stamp `subagent_fork` / `forked` on the child summary (live path; disk copy already stamps).
 fn stamp_live_fork_session_metadata(
     child_session_info: &SessionInfo,
@@ -1176,6 +1187,7 @@ fn stamp_live_fork_session_metadata(
     model_id: &str,
     inherited_prefix_len: Option<usize>,
     fork_context_source: &str,
+    cache_affinity_id: Option<String>,
 ) {
     let dir = match session::persistence::ensure_owner_only_session_dir(child_session_info) {
         Ok(dir) => dir,
@@ -1200,6 +1212,9 @@ fn stamp_live_fork_session_metadata(
     summary.fork_parent_prompt_id = parent_prompt_id;
     summary.inherited_prefix_len = inherited_prefix_len;
     summary.forked_at = Some(chrono::Utc::now());
+    if let Some(cache_affinity_id) = cache_affinity_id {
+        summary.cache_affinity_id = Some(cache_affinity_id);
+    }
     if let Ok(bytes) = serde_json::to_vec_pretty(summary)
         && let Err(e) = std::fs::write(&summary_path, bytes)
     {
@@ -1341,6 +1356,8 @@ async fn bootstrap_initial_context(
                 effective_model_id,
                 ctx_out.prefix_len,
                 marker,
+                (ctx_out.verbatim_fork && effective_model_id == ctx.model_id.0.as_ref())
+                    .then(|| parent_prompt_cache_affinity(ctx)),
             );
         }
         return BootstrapInitialContext::Ready(ctx_out);
@@ -2411,6 +2428,7 @@ struct GcsUploadContext {
     parent_prompt_id: Option<String>,
     depth: u32,
     auth_manager: std::sync::Arc<crate::auth::AuthManager>,
+    codex_provenance_guard: Option<xai_chat_state::ChatStateHandle>,
 }
 /// Persist the durable worktree `snapshot_ref` into the on-disk `meta.json`
 /// after completion, so `resumable_source_for` can rehydrate the disposed
@@ -2472,8 +2490,16 @@ fn persist_subagent_completion(dir: &Path, result: &SubagentResult, gcs_ctx: &Gc
             let bucket = bucket.clone();
             let method = method.clone();
             let auth_for_spawn = gcs_ctx.auth_manager.clone();
+            let codex_provenance_guard = gcs_ctx.codex_provenance_guard.clone();
             tokio::spawn(async move {
-                upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
+                upload_subagent_metadata(
+                    &gcs_meta,
+                    &bucket,
+                    method,
+                    auth_for_spawn,
+                    codex_provenance_guard,
+                )
+                .await;
             });
         }
     }

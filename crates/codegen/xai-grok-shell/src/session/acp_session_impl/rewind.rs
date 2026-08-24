@@ -294,9 +294,19 @@ impl SessionActor {
         // Unconditional: a `FilesOnly` rewind reverts exactly the files a live
         // cell may still be writing, and a `ConversationOnly` rewind discards
         // the turns whose `store()` state the runtime is holding.
-        self.tool_context
-            .code_mode
-            .shutdown_detached("explicit rewind");
+        if let Err(error) = self.tool_context.code_mode.shutdown_for_rewind().await {
+            tracing::warn!(%error, "rewind aborted while draining Code Mode nested tools");
+            return Ok(RewindResponse {
+                success: false,
+                target_prompt_index: target_index,
+                mode,
+                reverted_files: vec![],
+                clean_files,
+                conflicts,
+                prompt_text: None,
+                error: Some(error),
+            });
+        }
 
         // Execute file revert
         let mut reverted_files = Vec::new();

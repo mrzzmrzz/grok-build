@@ -21,6 +21,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 v8 = { workspace = true }
 xai-grok-code-mode-protocol = { path = "../xai-grok-code-mode-protocol" }
+xai-token-estimation = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

@@ -384,6 +384,50 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     effects
 }
 
+pub(super) fn dispatch_show_cache(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let session_id = app
+        .agents
+        .get(&id)
+        .and_then(|agent| agent.session.session_id.clone());
+    match session_id {
+        Some(session_id) => vec![Effect::FetchSessionCache {
+            agent_id: id,
+            session_id,
+        }],
+        None => {
+            if let Some(agent) = app.agents.get_mut(&id) {
+                push_and_page_flip(
+                    &mut agent.scrollback,
+                    RenderBlock::system(
+                        "Prompt cache telemetry is unavailable until the session starts."
+                            .to_string(),
+                    ),
+                );
+            }
+            vec![]
+        }
+    }
+}
+
+pub(super) fn handle_session_cache_result(
+    app: &mut AppView,
+    agent_id: AgentId,
+    session_id: &acp::SessionId,
+    text: String,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    if agent.session.session_id.as_ref() != Some(session_id) {
+        return vec![];
+    }
+    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    vec![]
+}
+
 /// Route a Codex usage result (already formatted text) into the open usage
 /// modal, or into scrollback in minimal mode. Stale modal results (nonce
 /// mismatch, modal closed) are dropped.

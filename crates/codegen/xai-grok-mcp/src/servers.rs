@@ -469,6 +469,10 @@ pub struct McpState {
     pub generation: u64,
     /// Qualified tool name → `_meta` from MCP tools/list. Populated during init.
     pub mcp_tool_meta: HashMap<String, serde_json::Value>,
+    /// Qualified tool name → MCP-advertised outputSchema. Retained separately
+    /// from the model-facing input schema so Code Mode can publish the real
+    /// JavaScript return contract.
+    pub mcp_tool_output_schemas: HashMap<String, serde_json::Value>,
     /// Qualified tool name → protocol `icons` from MCP tools/list.
     pub mcp_tool_icons: HashMap<String, Vec<McpIcon>>,
     /// HTTP servers that support OAuth but haven't been authenticated yet.
@@ -531,6 +535,7 @@ impl McpState {
             init_progress: InitProgress::default(),
             generation: 0,
             mcp_tool_meta: HashMap::new(),
+            mcp_tool_output_schemas: HashMap::new(),
             mcp_tool_icons: HashMap::new(),
             auth_required: std::collections::HashSet::new(),
             init_failed: HashMap::new(),
@@ -693,6 +698,7 @@ impl McpState {
         // Clear owned clients only — shared (inherited) clients are untouched.
         self.owned_clients.clear();
         self.mcp_tool_meta.clear();
+        self.mcp_tool_output_schemas.clear();
         self.mcp_tool_icons.clear();
         self.disabled_tool_registrations.clear();
         self.configs = new_configs;
@@ -713,6 +719,8 @@ impl McpState {
         self.init_progress.mark_handshake_complete(name);
         let prefix = format!("{}{}", name, MCP_TOOL_NAME_DELIMITER);
         self.mcp_tool_meta.retain(|k, _| !k.starts_with(&prefix));
+        self.mcp_tool_output_schemas
+            .retain(|k, _| !k.starts_with(&prefix));
         self.mcp_tool_icons.retain(|k, _| !k.starts_with(&prefix));
         self.disabled_tool_registrations
             .retain(|k, _| !k.starts_with(&prefix));
@@ -1315,6 +1323,7 @@ pub struct McpTool {
     server_name: String,
     mcp_state: Arc<Mutex<McpState>>,
     schema: serde_json::Value,
+    output_schema: Option<serde_json::Value>,
     meta: Option<serde_json::Value>,
 }
 
@@ -1332,6 +1341,7 @@ pub struct McpToolRegistration {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
     pub tool: McpErasedTool,
     pub meta: Option<serde_json::Value>,
     pub icons: Vec<McpIcon>,
@@ -1355,6 +1365,7 @@ impl McpTool {
             server_name,
             mcp_state,
             schema,
+            output_schema: None,
             meta,
         }
     }
@@ -1391,6 +1402,7 @@ impl McpTool {
 
         let description = self.description.clone();
         let input_schema = self.schema.clone();
+        let output_schema = self.output_schema.clone();
         let meta = self.meta.clone();
 
         let model_visible = meta
@@ -1405,6 +1417,7 @@ impl McpTool {
             name: qualified_name,
             description,
             input_schema,
+            output_schema,
             tool: McpErasedTool { tool: self },
             meta,
             icons: Vec::new(),
@@ -1543,6 +1556,10 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         };
 
         let is_error = call_result.is_error.unwrap_or(false);
+        // Keep the protocol result before the prompt renderer consumes its
+        // content. Code Mode needs the real CallToolResult shape rather than
+        // a best-effort reconstruction from flattened text.
+        let raw_call_tool_result = serde_json::to_value(&call_result).ok();
         let mut output = if is_error {
             let error_msg = call_result
                 .content
@@ -1589,6 +1606,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             mcp_out.auth_retry_attempted = auth_retry_attempted;
             mcp_out.reconnect_attempted = reconnect_attempted;
             mcp_out.is_timeout = is_timeout;
+            mcp_out.call_tool_result = raw_call_tool_result;
         }
 
         let success = !is_error;
@@ -4238,6 +4256,11 @@ impl McpClient {
                         .or_insert_with(|| serde_json::json!({}));
                 }
 
+                let output_schema = tool
+                    .output_schema
+                    .as_ref()
+                    .and_then(|schema| serde_json::to_value(schema.as_ref()).ok());
+
                 let icons = McpIcon::from_rmcp_list(tool.icons);
                 let mcp_tool = McpTool {
                     name,
@@ -4245,6 +4268,7 @@ impl McpClient {
                     server_name: self.server_name.clone(),
                     mcp_state: Arc::clone(&mcp_state),
                     schema,
+                    output_schema,
                     meta,
                 };
                 // Invalid tools (bad names) return None and are skipped

@@ -257,10 +257,18 @@ fn output_parts(content_items: Vec<FunctionCallOutputContentItem>) -> Vec<CodeMo
 /// Estimated token cost of one part, in the same units
 /// [`truncate_parts_to_budget`] spends. Kept as one function so the
 /// pre-pass in [`budgeted_parts`] and the truncation loop can never drift.
+fn text_cost(text: &str) -> u64 {
+    (text.len() as u64).saturating_add(xai_token_estimation::BYTES_PER_TOKEN - 1)
+        / xai_token_estimation::BYTES_PER_TOKEN
+}
+
 fn part_cost(part: &CodeModePart) -> u64 {
     match part {
         CodeModePart::Image { .. } => xai_token_estimation::IMAGE_TOKEN_ESTIMATE,
-        CodeModePart::Text { text } => xai_token_estimation::estimate_tokens(text),
+        // Round each emitted fragment up. Using the shared floor(bytes / 4)
+        // independently made any number of 1-3 byte `text()` calls free and
+        // allowed a zero-token cap to return unbounded text.
+        CodeModePart::Text { text } => text_cost(text),
     }
 }
 
@@ -309,7 +317,7 @@ fn truncate_parts_to_budget(
                 out.push(CodeModePart::Image { image_url, detail });
             }
             CodeModePart::Text { text } => {
-                let cost = xai_token_estimation::estimate_tokens(&text);
+                let cost = text_cost(&text);
                 if used.saturating_add(cost) <= budget {
                     used += cost;
                     out.push(CodeModePart::Text { text });
@@ -360,7 +368,7 @@ fn budgeted_parts(
         return parts;
     }
     let marker = truncation_marker(max_tokens);
-    let marker_cost = xai_token_estimation::estimate_tokens(&marker);
+    let marker_cost = text_cost(&marker);
     if marker_cost > budget {
         let keep_bytes = xai_token_estimation::estimate_chars(budget) as usize;
         let clipped = clip_to_bytes(&marker, keep_bytes);
@@ -467,10 +475,7 @@ impl xai_tool_runtime::Tool for ExecTool {
         &self,
         _ctx: &xai_tool_runtime::ListToolsContext,
     ) -> xai_tool_types::ToolDescription {
-        xai_tool_types::ToolDescription::new(
-            EXEC_TOOL_NAME,
-            self.sanitized_description_template(),
-        )
+        xai_tool_types::ToolDescription::new(EXEC_TOOL_NAME, self.sanitized_description_template())
     }
 
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
@@ -548,10 +553,7 @@ impl xai_tool_runtime::Tool for WaitTool {
         &self,
         _ctx: &xai_tool_runtime::ListToolsContext,
     ) -> xai_tool_types::ToolDescription {
-        xai_tool_types::ToolDescription::new(
-            WAIT_TOOL_NAME,
-            self.sanitized_description_template(),
-        )
+        xai_tool_types::ToolDescription::new(WAIT_TOOL_NAME, self.sanitized_description_template())
     }
 
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
@@ -646,7 +648,7 @@ mod tests {
     /// Finding-12 boundary: the advertised token budget clips text at the
     /// estimated boundary and drops whole images that no longer fit.
     #[test]
-    fn output_budget_truncates_text_and_drops_images()  {
+    fn output_budget_truncates_text_and_drops_images() {
         let parts = vec![
             CodeModePart::Text {
                 text: "x".repeat(40), // ~10 tokens
@@ -721,7 +723,7 @@ mod tests {
         // Exactly the marker's cost: the marker is returned whole and no
         // content rides along with it.
         let marker_only = truncation_marker(0);
-        let exact = xai_token_estimation::estimate_tokens(&marker_only) as usize;
+        let exact = text_cost(&marker_only) as usize;
         let parts = budgeted_parts(big(), exact);
         assert!(parts_cost(&parts) <= exact as u64, "{parts:?}");
 
@@ -744,6 +746,17 @@ mod tests {
         let parts = budgeted_parts(vec![text_item("short")], 20_000);
         assert_eq!(parts.len(), 1, "{parts:?}");
         assert!(matches!(&parts[0], CodeModePart::Text { text } if text == "short"));
+    }
+
+    #[test]
+    fn fragmented_short_text_is_not_free() {
+        let fragments = (0..100_000).map(|_| text_item("abc")).collect();
+        let parts = budgeted_parts(fragments, 0);
+        assert!(parts.is_empty(), "a zero-token budget must return no text");
+
+        let fragments = (0..100).map(|_| text_item("a")).collect();
+        let parts = budgeted_parts(fragments, 10);
+        assert!(parts_cost(&parts) <= 10, "{parts:?}");
     }
 
     /// A clip lands on a char boundary and stays inside the *byte* budget the
@@ -891,15 +904,18 @@ mod tests {
             &ExecTool,
             ctx_with(Some(handle.clone())),
             ExecToolInput {
-                source: "// @exec: {\"yield_time_ms\": 1}\ntext('early'); await new Promise(() => {});"
-                    .to_string(),
+                source:
+                    "// @exec: {\"yield_time_ms\": 1}\ntext('early'); await new Promise(() => {});"
+                        .to_string(),
             },
         )
         .await
         .expect("exec should yield");
         assert_eq!(output.status, CodeModeCellStatus::Yielded);
         assert!(
-            output.to_prompt_format().contains("Script running with cell ID"),
+            output
+                .to_prompt_format()
+                .contains("Script running with cell ID"),
             "{}",
             output.to_prompt_format()
         );
@@ -944,7 +960,11 @@ mod tests {
         .expect("wait dispatch should succeed");
         assert!(output.is_error());
         assert!(
-            output.error_text.as_deref().unwrap_or("").contains("not found"),
+            output
+                .error_text
+                .as_deref()
+                .unwrap_or("")
+                .contains("not found"),
             "{:?}",
             output.error_text
         );

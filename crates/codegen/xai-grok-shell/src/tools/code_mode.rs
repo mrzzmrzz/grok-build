@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use xai_grok_code_mode::{InProcessCodeModeSession, V8JitMode, initialize_v8};
@@ -82,9 +83,14 @@ struct CodeModeInner {
     /// work before dispatch, so a call queued under a previous runtime can
     /// never execute after the invalidation point.
     generation: std::sync::atomic::AtomicU64,
+    /// Read-held for the duration of every nested dispatch. Rewind takes the
+    /// write side after invalidating the generation, so it cannot restore a
+    /// snapshot while an already-admitted write can still land afterwards.
+    nested_dispatch_barrier: Arc<tokio::sync::RwLock<()>>,
     /// Per-path locks serializing concurrent nested writes to the same file
     /// (`Promise.all` parity with the batch path's per-file mutexes).
-    nested_path_locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    nested_path_locks:
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for CodeModeSessionState {
@@ -95,6 +101,7 @@ impl Default for CodeModeSessionState {
                 runtime: parking_lot::Mutex::new(None),
                 live_cells: Arc::new(parking_lot::Mutex::new(HashSet::new())),
                 generation: std::sync::atomic::AtomicU64::new(0),
+                nested_dispatch_barrier: Arc::new(tokio::sync::RwLock::new(())),
                 nested_path_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             }),
         }
@@ -112,6 +119,8 @@ impl std::fmt::Debug for CodeModeSessionState {
 }
 
 impl CodeModeSessionState {
+    const REWIND_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub(crate) fn plan(&self) -> CodeModeTurnPlan {
         self.inner.plan.lock().clone()
     }
@@ -148,6 +157,14 @@ impl CodeModeSessionState {
             .clone()
     }
 
+    /// Hold this guard from the final generation check through completion of
+    /// the nested tool effect. A rewind waits on the matching write guard.
+    pub(crate) async fn nested_dispatch_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.inner.nested_dispatch_barrier)
+            .read_owned()
+            .await
+    }
+
     /// Lazily create the V8-backed session (jitless). On first creation the
     /// caller receives the bridge receiver (tagged with the new runtime
     /// generation) to consume on its `LocalSet`.
@@ -174,12 +191,14 @@ impl CodeModeSessionState {
             tx: bridge_tx,
             live_cells: Arc::clone(&self.inner.live_cells),
         });
-        let session = Arc::new(InProcessCodeModeSession::with_delegate_and_task_failure_handler(
-            delegate,
-            Arc::new(|reason| {
-                tracing::error!(reason = %reason, "code mode runtime task failed");
-            }),
-        ));
+        let session = Arc::new(
+            InProcessCodeModeSession::with_delegate_and_task_failure_handler(
+                delegate,
+                Arc::new(|reason| {
+                    tracing::error!(reason = %reason, "code mode runtime task failed");
+                }),
+            ),
+        );
         let handle = CodeModeHandle {
             session: session.clone() as Arc<dyn protocol::CodeModeSession>,
             enabled_tools: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -248,6 +267,66 @@ impl CodeModeSessionState {
             // Dropping the session afterwards also cancels anything left via
             // `SessionRuntime`'s `Drop`.
         });
+    }
+
+    /// Invalidate Code Mode and wait until every nested tool dispatch that
+    /// crossed the old generation fence has completed. Rewind must use this
+    /// form before restoring files; otherwise an old write can finish after
+    /// the snapshot and overwrite the requested state.
+    pub(crate) async fn shutdown_for_rewind(&self) -> Result<(), String> {
+        self.inner
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let runtime = self.inner.runtime.lock().take();
+        self.inner.live_cells.lock().clear();
+
+        // Publish runtime cancellation before waiting on the dispatch write
+        // side. A nested call parked in the bridge consumer may release its
+        // read guard only when this token fires; waiting first would deadlock.
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.session.begin_shutdown();
+        }
+        if let Some(runtime) = runtime {
+            tracing::info!(
+                reason = "explicit rewind",
+                "shutting down code mode runtime"
+            );
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    runtime.session.shutdown(),
+                )
+                .await;
+            });
+        }
+
+        // The write guard is fair: stale calls that were still waiting on a
+        // path lock may queue here, but once they pass it they observe the
+        // bumped generation and return without dispatching. Fail the rewind
+        // instead of waiting forever if an external tool ignores cancellation;
+        // the caller must not restore files without this exclusion boundary.
+        let _dispatch_guard = self
+            .wait_for_nested_dispatches(Self::REWIND_DISPATCH_DRAIN_TIMEOUT)
+            .await?;
+        self.inner.nested_path_locks.lock().clear();
+        Ok(())
+    }
+
+    async fn wait_for_nested_dispatches(
+        &self,
+        timeout: Duration,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+        tokio::time::timeout(
+            timeout,
+            Arc::clone(&self.inner.nested_dispatch_barrier).write_owned(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "rewind aborted: a Code Mode nested tool did not stop within {} seconds",
+                timeout.as_secs_f64()
+            )
+        })
     }
 }
 
@@ -446,5 +525,19 @@ mod tests {
         state.shutdown_detached("reset");
         let a3 = state.nested_path_lock("/repo/a.rs");
         assert!(!Arc::ptr_eq(&a1, &a3), "invalidation clears the lock map");
+    }
+
+    /// A nested dispatch that ignores cancellation cannot make rewind hang
+    /// forever. The write-side drain fails closed, so the caller can refuse to
+    /// restore the snapshot while the old effect is still live.
+    #[tokio::test]
+    async fn rewind_dispatch_drain_times_out_on_hung_dispatch() {
+        let state = CodeModeSessionState::default();
+        let _hung_dispatch = state.nested_dispatch_guard().await;
+        let error = state
+            .wait_for_nested_dispatches(Duration::from_millis(10))
+            .await
+            .expect_err("a held dispatch guard must time out");
+        assert!(error.contains("rewind aborted"), "{error}");
     }
 }

@@ -2472,6 +2472,11 @@ impl Config {
     pub(crate) fn is_two_pass_compaction_enabled(&self) -> bool {
         self.is_feature_enabled(Feature::TwoPassCompaction)
     }
+    pub(crate) fn is_remote_compaction_v2_enabled(&self) -> bool {
+        xai_grok_config::env_bool("GROK_REMOTE_COMPACTION_V2")
+            .or(self.features.remote_compaction_v2)
+            .unwrap_or(true)
+    }
     pub(crate) fn resolve_telemetry_mode(&self) -> Resolved<TelemetryMode> {
         if let Some(mode) = self.requirements.telemetry.pinned() {
             return Resolved::new(mode, ConfigSource::Requirement);
@@ -3861,9 +3866,7 @@ struct DefaultModelJson {
 /// `[model.*]` config, or a live catalog); **absent always means
 /// [`ToolMode::Classic`]** so the capability fails closed for every model
 /// source that does not explicitly opt in.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMode {
     /// Ordinary function tools only (the default).
@@ -3884,10 +3887,7 @@ impl ToolMode {
 /// Effective tool mode for `model_id` resolved against the merged,
 /// account-scoped catalog `models` (the same source that supplied the picker
 /// entry). Unknown models fail closed to [`ToolMode::Classic`].
-pub(crate) fn model_tool_mode(
-    models: &IndexMap<String, ModelEntry>,
-    model_id: &str,
-) -> ToolMode {
+pub(crate) fn model_tool_mode(models: &IndexMap<String, ModelEntry>, model_id: &str) -> ToolMode {
     find_model_by_id(models, model_id)
         .and_then(|entry| entry.info().tool_mode)
         .unwrap_or(ToolMode::Classic)
@@ -4812,6 +4812,10 @@ pub struct Features {
     /// env (`GROK_COMPACTION_MODE`). Parsed via `CompactionMode::parse`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_mode: Option<String>,
+    /// Codex streaming remote compaction protocol. `None` defaults to true;
+    /// `GROK_REMOTE_COMPACTION_V2` takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_compaction_v2: Option<bool>,
     /// `none` | `minimal` | `balanced` | `verbose` (default). `None` = defer to
     /// env (`GROK_COMPACTION_DETAIL`). The `segments` verbatim detail level.
     #[serde(default, skip_serializing_if = "Option::is_none")]

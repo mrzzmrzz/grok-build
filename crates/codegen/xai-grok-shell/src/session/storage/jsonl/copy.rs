@@ -502,6 +502,18 @@ fn fork_summary(
     options: &CopySessionOptions,
     counters: ForkCounters,
 ) -> Summary {
+    let source_model = source.current_model_id.clone();
+    let target_model = options
+        .new_model_id
+        .clone()
+        .map(acp::ModelId::new)
+        .unwrap_or_else(|| source_model.clone());
+    let cache_affinity_id = if options.target_prompt_index.is_none() && target_model == source_model
+    {
+        Some(source.prompt_cache_affinity_id())
+    } else {
+        Some(target_info.id.0.to_string())
+    };
     Summary {
         info: target_info.clone(),
         cwd_generation: source.cwd_generation,
@@ -513,11 +525,7 @@ fn fork_summary(
         updated_at: chrono::Utc::now(),
         num_messages: counters.num_messages,
         num_chat_messages: counters.num_chat_messages,
-        current_model_id: options
-            .new_model_id
-            .clone()
-            .map(acp::ModelId::new)
-            .unwrap_or(source.current_model_id),
+        current_model_id: target_model,
         parent_session_id: options.parent_session_id.clone(),
         forked_at: Some(chrono::Utc::now()),
         collection_id: None,
@@ -570,6 +578,8 @@ fn fork_summary(
         } else {
             source.last_recap
         },
+        cache_affinity_id,
+        previous_turn_model: source.previous_turn_model,
         // Monotonic and unconditional: even a partial fork inherits the
         // parent's Codex-derived history (any retained prefix may contain
         // Codex output), so the mark must ride every fork shape.

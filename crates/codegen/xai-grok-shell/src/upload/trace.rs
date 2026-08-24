@@ -19,7 +19,15 @@ pub(crate) async fn upload_tool_definitions(
     auth_manager: Option<Arc<crate::auth::AuthManager>>,
     tool_definitions: &[ToolDefinition],
     artifact_tracker: Option<&super::manifest::ArtifactTracker>,
+    codex_provenance_guard: Option<xai_chat_state::ChatStateHandle>,
 ) {
+    if codex_provenance_guard
+        .as_ref()
+        .is_some_and(xai_chat_state::ChatStateHandle::ever_used_codex_now)
+    {
+        tracing::warn!("tool-definition trace upload refused: the session was marked Codex");
+        return;
+    }
     let Some(prefix) = gcs_config.gcs_prefix.as_deref() else {
         tracing::debug!("Skipping tool definitions upload: gcs_prefix is not set");
         return;
@@ -38,6 +46,22 @@ pub(crate) async fn upload_tool_definitions(
         format!("{prefix}/tool_definitions.json")
     };
     use crate::upload::gcs::WithAuth as _;
+    // This helper performs the HTTP upload directly rather than passing
+    // through `PromptTraceContext`, so serialize its final egress boundary
+    // with a concurrent model switch as well as checking at task admission.
+    let _egress_guard = if let Some(handle) = codex_provenance_guard.as_ref() {
+        let guard = handle.xai_aux_egress_guard().await;
+        if handle.ever_used_codex_now() {
+            tracing::warn!(
+                object_path = %object_path,
+                "tool-definition trace upload refused at egress: the session was marked Codex"
+            );
+            return;
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let ok = xai_file_utils::gcs::upload_bytes(
         &gcs_config.with_auth(auth_manager),
         &object_path,
@@ -344,6 +368,7 @@ pub(crate) async fn upload_subagent_metadata(
     bucket_url: &str,
     upload_method: crate::session::repo_changes::UploadMethod,
     auth_manager: std::sync::Arc<crate::auth::AuthManager>,
+    codex_provenance_guard: Option<xai_chat_state::ChatStateHandle>,
 ) {
     let json = match serde_json::to_vec_pretty(metadata) {
         Ok(j) => j,
@@ -368,6 +393,19 @@ pub(crate) async fn upload_subagent_metadata(
     };
     use crate::upload::gcs::WithAuth as _;
     let config = base_config.with_auth(Some(auth_manager));
+    let _egress_guard = if let Some(handle) = codex_provenance_guard.as_ref() {
+        let guard = handle.xai_aux_egress_guard().await;
+        if handle.ever_used_codex_now() {
+            tracing::warn!(
+                session_id = %metadata.child_session_id,
+                "subagent trace upload refused: the session was marked Codex"
+            );
+            return;
+        }
+        Some(guard)
+    } else {
+        None
+    };
     if let Err(e) =
         xai_file_utils::gcs::upload_bytes(&config, &gcs_path, &json, "application/json").await
     {
@@ -541,11 +579,9 @@ pub(crate) async fn upload_artifact_to_gcs(
     content_type: &str,
     artifact: &str,
 ) -> Option<String> {
-    // Final egress boundary: re-check provenance here, not just where the
-    // context was admitted (see `PromptTraceContext::codex_provenance_revoked`).
-    if ctx.refuse_upload_on_codex_provenance(artifact) {
-        return None;
-    }
+    // Final egress boundary: hold the shared read guard through the HTTP
+    // future so a Codex switch cannot land between the check and send.
+    let _egress_guard = ctx.xai_egress_guard(artifact).await?;
     let _upload_start = std::time::Instant::now();
     let config = ctx.gcs_config.with_auth(Some(ctx.auth_manager.clone()));
     match upload_bytes(&config, gcs_path, content, content_type).await {
@@ -1391,14 +1427,16 @@ pub(crate) async fn upload_trace_artifact_deferred(
     artifact_name: &str,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
-    // Enqueueing is egress: the queue worker uploads asynchronously, so a
-    // revoked context must not hand it bytes either.
-    if ctx.refuse_upload_on_codex_provenance(artifact_name) {
-        return Err(anyhow::anyhow!(
-            "trace upload refused: session marked Codex after the trace context was created"
-        ));
-    }
     if let Some(queue) = &ctx.upload_queue {
+        // Queue admission is the final egress boundary for a background
+        // worker. Hold the guard until the queue durably owns (or rejects)
+        // the bytes, then release it before any direct fallback acquires its
+        // own guard.
+        let Some(_egress_guard) = ctx.xai_egress_guard(artifact_name).await else {
+            return Err(anyhow::anyhow!(
+                "trace upload refused: session marked Codex after the trace context was created"
+            ));
+        };
         let session_id = ctx.session_info.id.0.to_string();
         let outcome = queue
             .enqueue_bytes_blocking(
@@ -1475,11 +1513,10 @@ pub(crate) async fn upload_trace_artifact(
     content_type: &str,
     artifact_name: &str,
 ) {
-    // Enqueueing is egress — see `upload_trace_artifact_deferred`.
-    if ctx.refuse_upload_on_codex_provenance(artifact_name) {
-        return;
-    }
     let (ok, err_msg) = if let Some(queue) = &ctx.upload_queue {
+        let Some(_egress_guard) = ctx.xai_egress_guard(artifact_name).await else {
+            return;
+        };
         let session_id = ctx.session_info.id.0.to_string();
         match queue
             .enqueue(

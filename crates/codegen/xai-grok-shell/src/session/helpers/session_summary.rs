@@ -149,6 +149,7 @@ pub async fn generate_session_summary(
     user_message: String,
     client: OaiCompatClient,
     model: &str,
+    codex_guard: Option<xai_chat_state::ChatStateHandle>,
 ) -> String {
     let clean_message = title_source_text(&user_message);
     let request = ConversationRequest::from_items(vec![
@@ -188,6 +189,24 @@ Just generate the session_title and nothing else"#,
     .with_max_output_tokens(100)
     .with_temperature(1.0)
     .with_tool_choice(ConversationToolChoice::Function("session_title".to_owned()));
+
+    // The summary client is cached for the persistence actor's lifetime. A
+    // session may have switched from xAI to Codex since it was built; perform
+    // the live monotonic check at the actual side-call boundary.
+    let _xai_egress_guard = match codex_guard.as_ref() {
+        Some(guard) => {
+            let egress = guard.xai_aux_egress_guard().await;
+            if guard.ever_used_codex_now() {
+                tracing::info!(
+                    model = %model,
+                    "session title generation withheld after Codex provenance; using local fallback"
+                );
+                return title_fallback_from_user_text(&clean_message);
+            }
+            Some(egress)
+        }
+        None => None,
+    };
 
     match client.conversation_collect(request).await {
         Ok(response) => {

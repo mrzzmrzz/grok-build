@@ -135,6 +135,30 @@ async fn test_jsonl_round_trip() {
     assert_eq!(loaded.updates.len(), 1);
     assert!(loaded.plan_state.is_some());
 }
+
+#[tokio::test]
+async fn previous_turn_model_persists_without_clobbering_codex_provenance() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    adapter.mark_ever_used_codex(&info).await.unwrap();
+
+    let previous = crate::session::PreviousTurnModel {
+        model_slug: "gpt-5.6-sol".into(),
+        context_window: 353_400,
+        comp_hash: Some("3000".into()),
+    };
+    adapter
+        .update_previous_turn_model(&info, previous.clone())
+        .await
+        .unwrap();
+
+    let loaded = adapter.read_summary_sync(&info).unwrap();
+    let stored = loaded.previous_turn_model.expect("previous turn model");
+    assert_eq!(stored, previous);
+    assert!(loaded.ever_used_codex);
+}
 /// Resume from updates.jsonl alone: when chat_history.jsonl is missing, load
 /// rebuilds it from the ACP update stream (the durable source of truth).
 #[tokio::test]
@@ -1232,6 +1256,8 @@ fn write_test_summary(
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
         last_recap: None,
+        cache_affinity_id: Some(session_id.to_string()),
+        previous_turn_model: None,
         ever_used_codex: false,
     };
     let json = serde_json::to_vec_pretty(&summary).unwrap();

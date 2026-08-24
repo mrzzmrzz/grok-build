@@ -362,6 +362,8 @@ pub(super) fn test_summary(
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
         last_recap: None,
+        cache_affinity_id: Some(session_id.to_string()),
+        previous_turn_model: None,
         ever_used_codex: false,
     }
 }

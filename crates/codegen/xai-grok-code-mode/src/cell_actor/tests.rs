@@ -17,6 +17,40 @@ use xai_grok_code_mode_protocol::ToolName;
 use super::*;
 use crate::session_runtime::OutputItem;
 
+#[test]
+fn receive_budget_rejects_fragmented_zero_cost_output() {
+    let mut budget = CellOutputBudget::new(0);
+    let mut output = Vec::new();
+    for _ in 0..100_000 {
+        budget.push(
+            OutputItem::Text {
+                text: "abc".to_owned(),
+            },
+            &mut output,
+        );
+    }
+    assert!(output.is_empty(), "zero tokens must materialize no output");
+    assert!(budget.truncated);
+}
+
+#[test]
+fn receive_budget_caps_items_before_the_actor_vec_can_grow() {
+    let mut budget = CellOutputBudget::new(100_000);
+    let mut output = Vec::new();
+    for _ in 0..=MAX_MATERIALIZED_OUTPUT_ITEMS {
+        budget.push(
+            OutputItem::Text {
+                text: "x".to_owned(),
+            },
+            &mut output,
+        );
+    }
+    assert!(budget.truncated);
+    assert!(output.len() <= MAX_MATERIALIZED_OUTPUT_ITEMS + 1);
+    assert!(matches!(output.last(), Some(OutputItem::Text { text })
+        if text.contains("output truncated")));
+}
+
 struct TestHost;
 
 #[derive(Default)]
@@ -88,12 +122,12 @@ impl CellHost for RecordingHost {
 }
 
 struct CellActorHarness {
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
     handle: CellHandle,
     initial_event_rx: oneshot::Receiver<Result<CellEvent, CellError>>,
     task: tokio::task::JoinHandle<()>,
     runtime_control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
-    _runtime_event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    _runtime_event_rx: mpsc::Receiver<RuntimeEvent>,
 }
 
 fn spawn_cell_actor_harness(initial_observe_mode: ObserveMode) -> CellActorHarness {
@@ -116,10 +150,10 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     host: Arc<H>,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> CellActorHarness {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(256);
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (initial_event_tx, initial_event_rx) = oneshot::channel();
-    let (runtime_event_tx, runtime_event_rx) = mpsc::unbounded_channel();
+    let (runtime_event_tx, runtime_event_rx) = mpsc::channel(256);
     let (runtime_tx, _runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
         HashMap::new(),
         ExecuteRequest {
@@ -152,6 +186,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             response_tx: initial_event_tx,
         },
         task_failure_handler,
+        xai_grok_code_mode_protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
     ));
 
     CellActorHarness {
@@ -198,7 +233,7 @@ async fn runtime_thread_panic_remains_a_cell_error_without_owner_supervision() {
     let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
     harness
         .event_tx
-        .send(RuntimeEvent::ThreadPanicked)
+        .try_send(RuntimeEvent::ThreadPanicked)
         .expect("runtime panic event");
     drop(harness.event_tx);
 
@@ -225,10 +260,10 @@ async fn wait_for_notification(host: &RecordingHost) {
 #[tokio::test]
 async fn yield_timer_preempts_buffered_runtime_output() {
     let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::ZERO));
-    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    harness.event_tx.try_send(RuntimeEvent::Started).unwrap();
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
+        .try_send(RuntimeEvent::ContentItem(
             FunctionCallOutputContentItem::InputText {
                 text: "queued output".to_string(),
             },
@@ -260,7 +295,7 @@ async fn queued_termination_preempts_unobserved_runtime_completion() {
     let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
     harness
         .event_tx
-        .send(RuntimeEvent::Result {
+        .try_send(RuntimeEvent::Result {
             stored_value_writes: HashMap::new(),
             error_text: None,
         })
@@ -282,7 +317,10 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
         ObserveMode::YieldAfter(Duration::from_secs(60)),
         Arc::clone(&host),
     );
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    harness
+        .event_tx
+        .try_send(RuntimeEvent::YieldRequested)
+        .unwrap();
     assert!(harness.initial_event_rx.await.unwrap().is_ok());
 
     drop(
@@ -292,16 +330,19 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
     );
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
+        .try_send(RuntimeEvent::ContentItem(
             FunctionCallOutputContentItem::InputText {
                 text: "survives pre-dequeue cancellation".to_string(),
             },
         ))
         .unwrap();
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     harness
         .event_tx
-        .send(RuntimeEvent::Notify {
+        .try_send(RuntimeEvent::YieldRequested)
+        .unwrap();
+    harness
+        .event_tx
+        .try_send(RuntimeEvent::Notify {
             call_id: "after-dropped-command".to_string(),
             text: "barrier".to_string(),
         })
@@ -338,7 +379,10 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
         ObserveMode::YieldAfter(Duration::from_secs(60)),
         Arc::clone(&host),
     );
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    harness
+        .event_tx
+        .try_send(RuntimeEvent::YieldRequested)
+        .unwrap();
     assert!(harness.initial_event_rx.await.unwrap().is_ok());
 
     let dropped_observation = harness
@@ -354,16 +398,19 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
     drop(dropped_observation);
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
+        .try_send(RuntimeEvent::ContentItem(
             FunctionCallOutputContentItem::InputText {
                 text: "survives active cancellation".to_string(),
             },
         ))
         .unwrap();
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     harness
         .event_tx
-        .send(RuntimeEvent::Notify {
+        .try_send(RuntimeEvent::YieldRequested)
+        .unwrap();
+    harness
+        .event_tx
+        .try_send(RuntimeEvent::Notify {
             call_id: "after-dropped-observer".to_string(),
             text: "barrier".to_string(),
         })
@@ -400,7 +447,10 @@ async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observatio
         ObserveMode::YieldAfter(Duration::from_secs(60)),
         Arc::clone(&host),
     );
-    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    harness
+        .event_tx
+        .try_send(RuntimeEvent::YieldRequested)
+        .unwrap();
     assert!(harness.initial_event_rx.await.unwrap().is_ok());
 
     let dropped_observation = harness.handle.observe(ObserveMode::PendingFrontier);
@@ -411,7 +461,7 @@ async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observatio
     drop(dropped_observation);
     harness
         .event_tx
-        .send(RuntimeEvent::ToolCall {
+        .try_send(RuntimeEvent::ToolCall {
             id: "tool-1".to_string(),
             name: ToolName {
                 name: "echo".to_string(),
@@ -421,10 +471,10 @@ async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observatio
             input: Some(serde_json::json!({})),
         })
         .unwrap();
-    harness.event_tx.send(RuntimeEvent::Pending).unwrap();
+    harness.event_tx.try_send(RuntimeEvent::Pending).unwrap();
     harness
         .event_tx
-        .send(RuntimeEvent::Notify {
+        .try_send(RuntimeEvent::Notify {
             call_id: "after-dropped-pending".to_string(),
             text: "barrier".to_string(),
         })

@@ -16,7 +16,7 @@ use crate::types::{
 
 /// Handle to communicate with ChatStateActor.
 /// This is cheap to clone and can be shared across tasks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChatStateHandle {
     cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
     /// Synchronous mirror of the actor's monotonic `ever_used_codex` latch,
@@ -32,6 +32,10 @@ pub struct ChatStateHandle {
     /// [`Self::mark_ever_used_codex`] sets the atomic BEFORE it enqueues the
     /// command, so the latch is never behind the actor, only ever ahead.
     ever_used_codex: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes xAI-hosted auxiliary HTTP calls with the one-way switch to
+    /// Codex. Aux calls hold a read guard across send; the switch takes the
+    /// write guard before publishing the monotonic revocation latch.
+    xai_aux_egress_barrier: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ChatStateHandle {
@@ -39,10 +43,12 @@ impl ChatStateHandle {
     pub(crate) fn new(
         cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
         ever_used_codex: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        xai_aux_egress_barrier: std::sync::Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
             cmd_tx,
             ever_used_codex,
+            xai_aux_egress_barrier,
         }
     }
 
@@ -53,6 +59,7 @@ impl ChatStateHandle {
         Self {
             cmd_tx,
             ever_used_codex: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            xai_aux_egress_barrier: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -573,6 +580,24 @@ impl ChatStateHandle {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Admit one xAI-hosted auxiliary call. Keep the returned guard alive
+    /// through the HTTP future and check [`Self::ever_used_codex_now`] after
+    /// acquisition.
+    pub async fn xai_aux_egress_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        std::sync::Arc::clone(&self.xai_aux_egress_barrier)
+            .read_owned()
+            .await
+    }
+
+    /// One-way model-switch barrier. Acquiring this waits for an already
+    /// admitted xAI aux call to finish; while held, no new one can pass its
+    /// final provenance check.
+    pub async fn xai_aux_revocation_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        std::sync::Arc::clone(&self.xai_aux_egress_barrier)
+            .write_owned()
+            .await
+    }
+
     /// Whether the session has ever sampled through the Codex provider.
     /// Defaults to `true` (fail-closed) if the actor is gone.
     pub async fn ever_used_codex(&self) -> bool {
@@ -786,5 +811,30 @@ mod tests {
         let handle = ChatStateHandle::noop();
         let clone = handle.clone();
         clone.push_user_message(ConversationItem::user("from clone"));
+    }
+
+    #[tokio::test]
+    async fn codex_revocation_waits_for_admitted_xai_egress() {
+        let handle = ChatStateHandle::noop();
+        let egress = handle.xai_aux_egress_guard().await;
+        let switch_handle = handle.clone();
+        let switching = tokio::spawn(async move {
+            let _revocation = switch_handle.xai_aux_revocation_guard().await;
+            switch_handle.mark_ever_used_codex();
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !switching.is_finished(),
+            "the Codex mark must wait until the admitted xAI send completes"
+        );
+        assert!(!handle.ever_used_codex_now());
+
+        drop(egress);
+        tokio::time::timeout(std::time::Duration::from_secs(1), switching)
+            .await
+            .expect("revocation should proceed after egress releases")
+            .expect("revocation task should not panic");
+        assert!(handle.ever_used_codex_now());
     }
 }

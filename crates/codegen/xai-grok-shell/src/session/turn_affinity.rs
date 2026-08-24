@@ -26,10 +26,10 @@ use xai_grok_sampling_types::{ConversationRequest, ModelProvider};
 ///
 /// The key is a pure function of provider + session id: stable within a
 /// session, and free of bearers and user prompt content by construction.
-pub(crate) fn derive_prompt_cache_key(provider: ModelProvider, session_id: &str) -> String {
+pub(crate) fn derive_prompt_cache_key(provider: ModelProvider, affinity_id: &str) -> String {
     match provider {
-        ModelProvider::Xai => session_id.to_string(),
-        ModelProvider::Codex => format!("codex-{session_id}"),
+        ModelProvider::Xai => affinity_id.to_string(),
+        ModelProvider::Codex => format!("codex-{affinity_id}"),
     }
 }
 
@@ -43,13 +43,13 @@ pub(crate) fn derive_prompt_cache_key(provider: ModelProvider, session_id: &str)
 pub(crate) fn apply_turn_affinity(
     request: &mut ConversationRequest,
     provider: ModelProvider,
-    session_id: &str,
+    affinity_id: &str,
     turn_state: Option<String>,
 ) {
     match provider {
         ModelProvider::Codex => {
             request.turn_state = turn_state.filter(|s| !s.is_empty());
-            request.prompt_cache_key = Some(derive_prompt_cache_key(provider, session_id));
+            request.prompt_cache_key = Some(derive_prompt_cache_key(provider, affinity_id));
         }
         ModelProvider::Xai => {
             request.turn_state = None;
@@ -133,6 +133,14 @@ mod tests {
         let a = derive_prompt_cache_key(ModelProvider::Codex, "sess-1");
         let b = derive_prompt_cache_key(ModelProvider::Codex, "sess-1");
         assert_eq!(a, b, "same session must derive the same key");
+    }
+
+    #[test]
+    fn codex_cache_key_uses_restored_parent_affinity() {
+        assert_eq!(
+            derive_prompt_cache_key(ModelProvider::Codex, "warmed-parent"),
+            "codex-warmed-parent"
+        );
     }
 
     #[test]

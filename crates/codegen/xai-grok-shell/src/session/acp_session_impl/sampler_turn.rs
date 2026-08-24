@@ -11,9 +11,7 @@ const CLASSIFIER_REQUEST_TOKEN_RESERVE: u64 = 16_384;
 fn code_mode_turn_specs(plan: &crate::tools::code_mode::CodeModeTurnPlan) -> Vec<ToolSpec> {
     let wait_spec = ToolSpec {
         name: xai_grok_code_mode_protocol::WAIT_TOOL_NAME.to_string(),
-        description: Some(
-            xai_grok_code_mode_protocol::build_wait_tool_description().to_string(),
-        ),
+        description: Some(xai_grok_code_mode_protocol::build_wait_tool_description().to_string()),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -38,9 +36,7 @@ fn code_mode_turn_specs(plan: &crate::tools::code_mode::CodeModeTurnPlan) -> Vec
             "additionalProperties": false
         }),
     };
-    if plan.transport
-        == Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar)
-    {
+    if plan.transport == Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar) {
         return vec![wait_spec];
     }
     let exec_spec = ToolSpec {
@@ -62,6 +58,20 @@ fn code_mode_turn_specs(plan: &crate::tools::code_mode::CodeModeTurnPlan) -> Vec
 }
 fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bool {
     input_tokens <= context_window.saturating_sub(CLASSIFIER_REQUEST_TOKEN_RESERVE)
+}
+
+/// Build the Codex-visible tool surface from the live registry.
+///
+/// MCP tools are registered under their real qualified names and therefore
+/// travel with their own input schemas. The Grok-only BM25 dispatcher pair is
+/// intentionally hidden: Codex either uses native deferred discovery or, in
+/// this shell, the correct fallback of calling the real tools directly.
+fn codex_visible_tool_definitions(mut defs: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    defs.retain(|definition| {
+        definition.function.name != xai_grok_tools::SEARCH_TOOL_NAME
+            && definition.function.name != xai_grok_tools::USE_TOOL_NAME
+    });
+    defs
 }
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
@@ -206,9 +216,7 @@ impl SessionActor {
             .filter(|td| !backend_search_active || td.function.name != "web_search")
             // Defensive: the Code Mode tools are session-registered; they
             // must never leak into a classic-mode manifest.
-            .filter(|td| {
-                xai_grok_code_mode_protocol::is_code_mode_nested_tool(&td.function.name)
-            })
+            .filter(|td| xai_grok_code_mode_protocol::is_code_mode_nested_tool(&td.function.name))
             .cloned()
             .map(ToolSpec::from)
             .collect()
@@ -296,7 +304,7 @@ impl SessionActor {
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let defs = bridge.tool_definitions_builtins_only().await;
+        let defs = codex_visible_tool_definitions(bridge.tool_definitions().await);
         let plan_active = self.plan_mode.lock().is_active();
         let mut defs = filter_cursor_tools_by_plan_mode(defs, plan_active);
         // Provider isolation (spec §12.2): the single place every consumer of
@@ -468,7 +476,7 @@ impl SessionActor {
     /// by an OAuth rotation), when the refresh fails, or when the refreshed
     /// credentials belong to a different account than the one this session
     /// was configured with.
-    async fn try_codex_401_recovery(&self) -> bool {
+    pub(crate) async fn try_codex_401_recovery(&self) -> bool {
         self.try_codex_401_recovery_with(crate::codex_auth::force_refresh)
             .await
     }
@@ -484,7 +492,9 @@ impl SessionActor {
     pub(super) async fn try_codex_401_recovery_with<F, Fut>(&self, force_refresh: F) -> bool
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<Option<crate::codex_auth::CodexCredentials>>>,
+        Fut: std::future::Future<
+                Output = anyhow::Result<Option<crate::codex_auth::CodexCredentials>>,
+            >,
     {
         if !claim_codex_401_recovery(&self.codex_401_recovery_spent) {
             tracing::warn!(
@@ -531,10 +541,8 @@ impl SessionActor {
                 return false;
             }
         };
-        let identity_matches = crate::codex_auth::credentials_match_identity_anchor(
-            &cfg.extra_headers,
-            &credentials,
-        );
+        let identity_matches =
+            crate::codex_auth::credentials_match_identity_anchor(&cfg.extra_headers, &credentials);
         if identity_matches != Some(true) {
             tracing::warn!(
                 session_id = %self.session_info.id.0,
@@ -644,8 +652,7 @@ impl SessionActor {
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         // Provider comes from catalog model_family via the memoized facts;
         // a Codex model must never mount the xAI session-token resolver.
-        let is_codex = model_facts.model_provider
-            == xai_grok_sampling_types::ModelProvider::Codex;
+        let is_codex = model_facts.model_provider == xai_grok_sampling_types::ModelProvider::Codex;
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
@@ -849,6 +856,7 @@ impl SessionActor {
                     None => None,
                 };
                 let result = async {
+                    let using_xai_aux = live_aux.is_some();
                     let (sampling_client, model, context_window) = match live_aux {
                         Some((client, model, context_window)) => {
                             (client.clone(), model.clone(), *context_window)
@@ -909,6 +917,20 @@ impl SessionActor {
                         x_grok_session_id: Some(session_id),
                         x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
                         ..ConversationRequest::default()
+                    };
+                    let _xai_egress_guard = if using_xai_aux {
+                        let guard = session.chat_state_handle.xai_aux_egress_guard().await;
+                        if session.chat_state_handle.ever_used_codex_now() {
+                            return Err(
+                                xai_grok_workspace::permission::ClassifierFailure::TransportError(
+                                    "xAI auxiliary classifier withheld after Codex provenance"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
+                        Some(guard)
+                    } else {
+                        None
                     };
                     let fut = sampling_client.conversation_collect(request);
                     let response = tokio::time::timeout(classify_timeout, fut)
@@ -1277,34 +1299,33 @@ impl SessionActor {
         } else {
             None
         };
-        let auth_recovery_eligible = !failed_model_is_codex
-            && matches!(error.kind, SamplingErrorKind::Auth)
-            && {
-            let gate = self.auth_gate(&failed_model_id, &failed_base_url);
-            let eligible = gate.active();
-            self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
-            if !eligible && auth_provider.is_none() {
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    is_session_based = gate.is_session_based,
-                    model_byok = gate.model_byok.as_str(),
-                    endpoint_is_first_party = gate.endpoint_is_first_party,
-                    "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
-                );
-                xai_grok_telemetry::unified_log::warn(
-                    "auth recovery: sampler 401 not eligible (api-key auth)",
-                    Some(self.session_info.id.0.as_ref()),
-                    Some(serde_json::json!({
-                        "kind": error.kind.as_str(),
-                        "status_code": error.status_code,
-                        "is_session_based": gate.is_session_based,
-                        "model_byok": gate.model_byok.as_str(),
-                        "endpoint_is_first_party": gate.endpoint_is_first_party,
-                    })),
-                );
-            }
-            eligible
-        };
+        let auth_recovery_eligible =
+            !failed_model_is_codex && matches!(error.kind, SamplingErrorKind::Auth) && {
+                let gate = self.auth_gate(&failed_model_id, &failed_base_url);
+                let eligible = gate.active();
+                self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
+                if !eligible && auth_provider.is_none() {
+                    tracing::warn!(
+                        session_id = %self.session_info.id.0,
+                        is_session_based = gate.is_session_based,
+                        model_byok = gate.model_byok.as_str(),
+                        endpoint_is_first_party = gate.endpoint_is_first_party,
+                        "auth recovery: sampler 401 not refreshable (api-key auth) — surfacing 401",
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: sampler 401 not eligible (api-key auth)",
+                        Some(self.session_info.id.0.as_ref()),
+                        Some(serde_json::json!({
+                            "kind": error.kind.as_str(),
+                            "status_code": error.status_code,
+                            "is_session_based": gate.is_session_based,
+                            "model_byok": gate.model_byok.as_str(),
+                            "endpoint_is_first_party": gate.endpoint_is_first_party,
+                        })),
+                    );
+                }
+                eligible
+            };
         debug_assert!(
             !(auth_recovery_eligible && auth_provider.is_some()),
             "a provider-backed model must not be session-recovery-eligible"

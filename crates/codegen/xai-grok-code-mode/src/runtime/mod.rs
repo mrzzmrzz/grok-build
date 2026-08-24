@@ -104,7 +104,7 @@ pub(crate) enum RuntimeEvent {
 pub(crate) fn spawn_runtime(
     stored_values: HashMap<String, JsonValue>,
     request: ExecuteRequest,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
     pending_mode: PendingRuntimeMode,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> Result<
@@ -152,7 +152,7 @@ pub(crate) fn spawn_runtime(
 }
 
 fn spawn_supervised_runtime_thread(
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
     task_failure_handler: Option<TaskFailureHandler>,
     runtime: impl FnOnce() + Send + 'static,
 ) {
@@ -161,7 +161,7 @@ fn spawn_supervised_runtime_thread(
             if let Some(task_failure_handler) = task_failure_handler {
                 task_failure_handler("code-mode V8 runtime thread panicked".to_string());
             }
-            let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
+            let _ = event_tx.blocking_send(RuntimeEvent::ThreadPanicked);
         }
     });
 }
@@ -175,7 +175,7 @@ struct RuntimeConfig {
 }
 
 pub(super) struct RuntimeState {
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
@@ -200,7 +200,7 @@ pub(super) enum CompletionState {
 
 fn run_runtime(
     config: RuntimeConfig,
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
     command_rx: std_mpsc::Receiver<RuntimeCommand>,
     control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
     pending_mode: PendingRuntimeMode,
@@ -243,7 +243,7 @@ fn run_runtime(
         return;
     }
 
-    let _ = event_tx.send(RuntimeEvent::Started);
+    let _ = event_tx.blocking_send(RuntimeEvent::Started);
 
     let pending_promise = match module_loader::evaluate_main_module(scope, &config.source) {
         Ok(pending_promise) => pending_promise,
@@ -317,7 +317,7 @@ fn run_runtime(
 }
 
 fn next_runtime_command(
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &mpsc::Sender<RuntimeEvent>,
     command_rx: &std_mpsc::Receiver<RuntimeCommand>,
     control_rx: &std_mpsc::Receiver<RuntimeControlCommand>,
     pending_mode: PendingRuntimeMode,
@@ -329,7 +329,7 @@ fn next_runtime_command(
             Err(std_mpsc::TryRecvError::Empty) => {}
         }
 
-        let _ = event_tx.send(RuntimeEvent::Pending);
+        let _ = event_tx.blocking_send(RuntimeEvent::Pending);
         match pending_mode {
             #[cfg(test)]
             PendingRuntimeMode::Continue => return command_rx.recv().ok(),
@@ -344,7 +344,7 @@ fn next_runtime_command(
 
 fn capture_scope_send_error(
     scope: &mut v8::PinScope<'_, '_>,
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &mpsc::Sender<RuntimeEvent>,
     error_text: Option<String>,
 ) {
     let stored_value_writes = scope
@@ -356,11 +356,11 @@ fn capture_scope_send_error(
 }
 
 fn send_result(
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    event_tx: &mpsc::Sender<RuntimeEvent>,
     stored_value_writes: HashMap<String, JsonValue>,
     error_text: Option<String>,
 ) {
-    let _ = event_tx.send(RuntimeEvent::Result {
+    let _ = event_tx.blocking_send(RuntimeEvent::Result {
         stored_value_writes,
         error_text,
     });
@@ -438,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_thread_panic_before_initialization_is_reported_directly() {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(256);
         drop(event_rx);
         let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
         spawn_supervised_runtime_thread(
@@ -460,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_thread_panic_is_forwarded_without_owner_supervision() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
         spawn_supervised_runtime_thread(
             event_tx,
             /*task_failure_handler*/ None,
@@ -477,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_execution_stops_cpu_bound_module() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
         let (_runtime_tx, _runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
             HashMap::new(),
             execute_request("while (true) {}"),
@@ -514,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_mode_freezes_runtime_commands_until_resume() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
         let (runtime_tx, runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
             HashMap::new(),
             execute_request(

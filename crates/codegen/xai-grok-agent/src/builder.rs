@@ -962,7 +962,6 @@ impl AgentBuilder {
                     tool_id_matches(&definition.tools, &tc.id)
                         || tc.kind.is_some_and(|k| allow_kinds.contains(&k))
                         || (has_agent_entry && task_deps.contains(&short_tool_name(&tc.id)))
-                        || matches!(tc.kind, Some(ToolKind::SearchTool | ToolKind::UseTool))
                 });
                 tracing::debug!(agent = %definition.name, allowed = ?definition.tools, "tools allowlist applied");
             } else {
@@ -1043,6 +1042,16 @@ impl AgentBuilder {
                 }
             }
         }
+        // Codex addresses MCP tools by their registered qualified names.
+        // Remove Grok's legacy BM25/meta-dispatch pair even when a custom or
+        // externally registered preset still includes it; keeping a hidden
+        // implementation alive would let stale history dispatch it.
+        tool_config.tools.retain(|tool| {
+            !matches!(
+                short_tool_name(&tool.id),
+                xai_grok_tools::SEARCH_TOOL_NAME | xai_grok_tools::USE_TOOL_NAME
+            )
+        });
         let use_backend_search = self.backend_search;
         let web_search_enabled = self.web_search_config.is_enabled();
         let tool_bridge = ToolBridge::finalize_builder(
@@ -1913,6 +1922,37 @@ mod tests {
         .await
         .unwrap()
     }
+
+    #[tokio::test]
+    async fn builder_strips_explicit_legacy_mcp_dispatchers() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+        let mut def = crate::config::AgentDefinition::codex();
+        def.tool_config.tools.extend([
+            (&xai_grok_tools::implementations::search_tool::SearchTool).into(),
+            (&xai_grok_tools::implementations::use_tool::UseTool).into(),
+        ]);
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(def)
+        .build()
+        .await
+        .expect("agent should build");
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .iter()
+            .map(|definition| definition.function.name.clone())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "search_tool" || name == "use_tool")
+        );
+    }
     /// Build a default agent under a session allowlist + the agent's own
     /// allowlist, returning the effective (short) tool names.
     async fn session_clamp_tool_names(
@@ -2252,11 +2292,10 @@ mod tests {
             "Edit must be excluded; got: {names:?}"
         );
     }
-    /// A restrictive allowlist must never strip MCP access. Compat allowlists
-    /// treat `mcp__*` as always-on, so grok keeps the MCP meta-tools
-    /// (`search_tool` / `use_tool`) regardless of what the allowlist names.
+    /// Direct MCP tools are registered under qualified names; the retired Grok
+    /// dispatcher pair must not survive even a custom tool allowlist.
     #[tokio::test]
-    async fn restrictive_allowlist_keeps_mcp_access() {
+    async fn restrictive_allowlist_drops_legacy_mcp_dispatchers() {
         let agent = build_with_tools(vec!["Read".into()], vec![]).await;
         let names: Vec<String> = agent
             .tool_definitions()
@@ -2269,8 +2308,9 @@ mod tests {
             "Read→read_file; got: {names:?}"
         );
         assert!(
-            names.contains(&"search_tool".to_string()) && names.contains(&"use_tool".to_string()),
-            "search_tool/use_tool (MCP access) must not be stripped; got: {names:?}"
+            !names
+                .iter()
+                .any(|name| name == "search_tool" || name == "use_tool")
         );
         assert!(
             !names.contains(&"search_replace".to_string()),
@@ -2368,8 +2408,9 @@ mod tests {
             "Skill→read_file; got: {names:?}"
         );
         assert!(
-            names.contains(&"search_tool".to_string()) && names.contains(&"use_tool".to_string()),
-            "MCP access must be kept; got: {names:?}"
+            !names
+                .iter()
+                .any(|name| name == "search_tool" || name == "use_tool")
         );
         assert!(
             !names.contains(&"search_replace".to_string())
@@ -2378,7 +2419,7 @@ mod tests {
         );
     }
     /// `Read` and `Skill` both map to `ToolKind::Read`, but the allowlist phase
-    /// `read_file` (plus always-on MCP access) without falling back to the full
+    /// `read_file` without falling back to the full
     /// single base `read_file` entry is kept exactly once, never double-registered.
     #[tokio::test]
     async fn read_and_skill_allowlist_keeps_single_read_file() {
@@ -2395,10 +2436,10 @@ mod tests {
             "read_file must be registered exactly once for tools: [Read, Skill]; got: {names:?}"
         );
     }
-    /// A compat-style `mcp__server__tool` allowlist entry is always allowed: it
-    /// neither triggers the full-toolset fallback nor strips MCP access.
+    /// A compat-style `mcp__server__tool` allowlist entry does not revive the
+    /// retired Grok MCP dispatcher pair.
     #[tokio::test]
-    async fn mcp_prefixed_allowlist_entry_keeps_mcp_access() {
+    async fn mcp_prefixed_allowlist_entry_does_not_revive_grok_dispatchers() {
         let tools = vec!["mcp__github__create_issue".into(), "Read".into()];
         let agent = build_with_tools(tools, vec![]).await;
         let names: Vec<String> = agent
@@ -2412,8 +2453,9 @@ mod tests {
             "Read must be kept; got: {names:?}"
         );
         assert!(
-            names.contains(&"search_tool".to_string()) && names.contains(&"use_tool".to_string()),
-            "MCP access must be kept; got: {names:?}"
+            !names
+                .iter()
+                .any(|name| name == "search_tool" || name == "use_tool")
         );
         assert!(
             !names.contains(&"search_replace".to_string())
@@ -2421,11 +2463,10 @@ mod tests {
             "no full-toolset fallback — unlisted tools must be excluded; got: {names:?}"
         );
     }
-    /// Compat `ToolSearch` meta-tool maps to grok's `search_tool` (MCP
-    /// is a filter (`retain`) over a `HashSet` of kinds, not an inserter — so the
-    /// falling back to the full toolset.
+    /// A stale compat `ToolSearch` allowlist cannot re-register Grok's retired
+    /// MCP dispatcher.
     #[tokio::test]
-    async fn tool_search_allowlist_maps_to_search_tool() {
+    async fn tool_search_allowlist_does_not_revive_search_tool() {
         let agent = build_with_tools(vec!["ToolSearch".into()], vec![]).await;
         let names: Vec<String> = agent
             .tool_definitions()
@@ -2434,8 +2475,9 @@ mod tests {
             .map(|d| d.function.name.clone())
             .collect();
         assert!(
-            names.contains(&"search_tool".to_string()),
-            "ToolSearch→search_tool; got: {names:?}"
+            !names
+                .iter()
+                .any(|name| name == "search_tool" || name == "use_tool")
         );
         assert!(
             !names.contains(&"search_replace".to_string()),

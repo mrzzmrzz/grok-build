@@ -220,6 +220,12 @@ impl InProcessCodeModeSession {
             .await
             .map_err(|error| error.to_string())
     }
+
+    /// Publish cancellation synchronously before a caller waits for work that
+    /// may itself be blocked on the runtime's cancellation token.
+    pub fn begin_shutdown(&self) {
+        self.runtime.begin_shutdown();
+    }
 }
 
 impl Default for InProcessCodeModeSession {
@@ -302,6 +308,9 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
 }
 
 fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
+    let max_output_tokens = request
+        .max_output_tokens
+        .unwrap_or(xai_grok_code_mode_protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
     runtime::CreateCellRequest {
         tool_call_id: request.tool_call_id,
         enabled_tools: request
@@ -321,6 +330,7 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
+        max_output_tokens,
     }
 }
 

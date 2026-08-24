@@ -13,6 +13,47 @@ use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, CompletionDisposition,
 };
 #[test]
+fn codex_child_uses_codex_prompt_without_overwriting_inherited_or_custom_prompts() {
+    use xai_grok_agent::config::{AgentDefinition, PromptMode};
+    use xai_grok_agent::prompt::context::TemplateOverride;
+    use xai_grok_sampling_types::ModelProvider;
+
+    let mut fresh = AgentDefinition::general_purpose();
+    fresh.prompt_mode = PromptMode::Extend;
+    fresh.system_prompt = TemplateOverride::None;
+    super::handle_request::apply_codex_subagent_system_prompt(
+        &mut fresh,
+        ModelProvider::Codex,
+        false,
+    );
+    assert_eq!(fresh.system_prompt, TemplateOverride::Codex);
+
+    let mut verbatim = AgentDefinition::general_purpose();
+    super::handle_request::apply_codex_subagent_system_prompt(
+        &mut verbatim,
+        ModelProvider::Codex,
+        true,
+    );
+    assert_eq!(verbatim.system_prompt, TemplateOverride::None);
+
+    let mut custom = AgentDefinition::general_purpose();
+    custom.system_prompt = TemplateOverride::Custom("custom".to_string());
+    super::handle_request::apply_codex_subagent_system_prompt(
+        &mut custom,
+        ModelProvider::Codex,
+        false,
+    );
+    assert_eq!(custom.system_prompt, TemplateOverride::Custom("custom".to_string()));
+
+    let mut xai = AgentDefinition::general_purpose();
+    super::handle_request::apply_codex_subagent_system_prompt(
+        &mut xai,
+        ModelProvider::Xai,
+        false,
+    );
+    assert_eq!(xai.system_prompt, TemplateOverride::None);
+}
+#[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
     let totals = xai_chat_state::UsageTotals {
         input_tokens: 100,
@@ -1469,6 +1510,7 @@ fn test_gcs_context(ctx: &SubagentSpawnContext) -> GcsUploadContext {
         parent_prompt_id: None,
         depth: 0,
         auth_manager: ctx.auth_manager.clone(),
+        codex_provenance_guard: None,
     }
 }
 #[tokio::test]

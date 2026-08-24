@@ -424,7 +424,8 @@ impl MvpAgent {
             &session_id,
             EffortTarget::SummaryClient,
         );
-        let (summary_client, summary_model) = self.build_summary_client(&session_sampling)?;
+        let (summary_client, summary_model, summary_revoke_on_codex) =
+            self.build_summary_client(&session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let model_id = match &session_initial_model {
             Some(chat_model) => acp::ModelId::new(chat_model.clone()),
@@ -448,6 +449,7 @@ impl MvpAgent {
                     relay_sync,
                     gateway: Some(self.gateway.clone()),
                     session_summary_model: summary_model,
+                    summary_revoke_on_codex,
                     registry_title_sync,
                     search_index: self.search_index_cell(),
                 },
@@ -772,7 +774,8 @@ impl MvpAgent {
             &session_id,
             EffortTarget::SummaryClient,
         );
-        let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
+        let (summary_client, summary_model, summary_revoke_on_codex) =
+            self.build_summary_client(&load_session_sampling)?;
         let relay_sync = self.start_relay_sync(&session_id, &session_info);
         let mut persistence_timer = crate::instrumentation_timer!("session.load_light");
         persistence_timer.with_field("session_id", session_id.0.as_ref());
@@ -792,6 +795,7 @@ impl MvpAgent {
                 relay_sync,
                 gateway: Some(self.gateway.clone()),
                 session_summary_model: summary_model,
+                summary_revoke_on_codex,
                 registry_title_sync,
                 search_index: self.search_index_cell(),
             },
