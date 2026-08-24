@@ -11,6 +11,33 @@ impl SessionActor {
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
+        let new_provider = sampling_config.provider_profile.provider;
+        // Provenance is marked at the switch itself, before ANY other work in
+        // this function — before the next prompt is persisted or sampled, and
+        // before an in-flight turn can reach its next egress boundary. Waiting
+        // for a Codex response header would leave a window where the prompt
+        // reaches xAI remote/relay sync.
+        //
+        // `mark_ever_used_codex` sets the synchronous latch before it enqueues
+        // the actor command, so this single call also *revokes* every
+        // already-created `PromptTraceContext` for the session: each upload
+        // boundary re-reads that latch
+        // (`PromptTraceContext::codex_provenance_revoked`) and refuses,
+        // including artifacts already handed to the upload queue's enqueue
+        // path. There is no trace-context registry to walk, and the context is
+        // owned by a concurrently running prompt task we cannot reach; the
+        // monotonic latch is the revocation.
+        if new_provider == xai_grok_sampling_types::ModelProvider::Codex {
+            self.chat_state_handle.mark_ever_used_codex();
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(crate::session::persistence::PersistenceMsg::MarkEverUsedCodex);
+        }
+        // Web search is provider-bound the same way (spec §12.2): the helper
+        // was resolved from the provider active at spawn, so re-gate it
+        // against the provider we are switching TO.
+        self.apply_web_search_provider_gate(new_provider).await;
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -37,18 +64,6 @@ impl SessionActor {
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
             .set(sampling_config.compaction_at_tokens);
-        // Provenance is marked at the switch itself, before the next prompt
-        // is persisted or sampled — waiting for a Codex response header would
-        // leave a window where the prompt reaches xAI remote/relay sync.
-        if sampling_config.provider_profile.provider
-            == xai_grok_sampling_types::ModelProvider::Codex
-        {
-            self.chat_state_handle.mark_ever_used_codex();
-            let _ = self
-                .notifications
-                .persistence_tx
-                .send(crate::session::persistence::PersistenceMsg::MarkEverUsedCodex);
-        }
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
@@ -190,6 +205,64 @@ impl SessionActor {
         }
         Ok(model_id)
     }
+    /// Re-gate the xAI-hosted `web_search` helper against `new_provider`
+    /// (spec §12.2).
+    ///
+    /// The session's `WebSearchConfig` bakes in the endpoint, key and headers
+    /// of whatever provider was active at spawn, so leaving it in place across
+    /// a switch means a Codex-derived query would be sent to xAI. Availability
+    /// must therefore follow the *effective* provider, and it must be
+    /// reversible: switching back to xAI (or onto a model the user explicitly
+    /// pinned the helper for) restores it.
+    ///
+    /// Both halves of the gate move together:
+    /// - the tool definition is filtered out of every request built while the
+    ///   gate is closed (`prepare_tool_definitions_inner`), so the model never
+    ///   sees the tool; and
+    /// - the `WebSearchClient` resource is removed from the toolset, so a call
+    ///   the previous provider's model already emitted cannot dispatch either.
+    pub(crate) async fn apply_web_search_provider_gate(
+        &self,
+        new_provider: xai_grok_sampling_types::ModelProvider,
+    ) {
+        let allowed = self.web_search_pin.allows_aux_helper(new_provider);
+        if allowed == self.web_search_provider_allowed.get() {
+            return;
+        }
+        self.web_search_provider_allowed.set(allowed);
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            provider = ?new_provider,
+            allowed,
+            "web_search provider gate updated for model switch"
+        );
+        self.park_or_restore_web_search_client().await;
+    }
+
+    /// Move the `WebSearchClient` between the toolset and
+    /// [`Self::parked_web_search_client`] to match
+    /// [`Self::web_search_provider_allowed`]. Idempotent.
+    pub(crate) async fn park_or_restore_web_search_client(&self) {
+        use xai_grok_tools::implementations::web_search::client::WebSearchClient;
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        if self.web_search_provider_allowed.get() {
+            let Some(client) = self.parked_web_search_client.lock().take() else {
+                return;
+            };
+            bridge.update_resource(client).await;
+            return;
+        }
+        let mut taken: Option<WebSearchClient> = None;
+        bridge
+            .update_resources_with(|resources| {
+                taken = resources.remove::<WebSearchClient>();
+            })
+            .await;
+        if let Some(client) = taken {
+            *self.parked_web_search_client.lock() = Some(client);
+        }
+    }
+
     /// Handle [`SessionCommand::RebuildAgentForDefinition`].
     ///
     /// Builds a fresh [`xai_grok_agent::Agent`] from the cached
@@ -303,6 +376,12 @@ impl SessionActor {
                 bridge.update_resource(gate).await;
             }
             self.inject_deny_read_globs().await;
+            // The rebuilt bridge minted a fresh `WebSearchClient` from the
+            // spawn-time config, which would silently re-open a closed
+            // provider gate. Drop the now-stale parked client and re-apply the
+            // gate to the new bridge.
+            self.parked_web_search_client.lock().take();
+            self.park_or_restore_web_search_client().await;
         }
         {
             let notified = self.mcp_handshakes_done.notified();

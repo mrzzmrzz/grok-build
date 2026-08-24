@@ -3938,8 +3938,10 @@ fn model_overrides_aux_pins_unpinned_when_defaults_apply() {
     });
 }
 
-/// toml and remote sources both record as an explicit `Pinned` provenance,
-/// local beating remote exactly like the resolved value does.
+/// A local `[models]` entry records as an explicit `Pinned` provenance; a
+/// remote-settings entry records as `Remote` — it still sets the model value
+/// (local beating remote exactly like the resolved value does) but is service
+/// configuration, never the user's cross-provider consent.
 #[test]
 fn model_overrides_aux_pins_record_local_and_remote_sources() {
     with_model_overrides_env(None, None, None, || {
@@ -3965,10 +3967,50 @@ fn model_overrides_aux_pins_record_local_and_remote_sources() {
         );
         assert_eq!(
             cfg.image_description_pin,
-            AuxModelPin::Pinned("remote-id".to_owned())
+            AuxModelPin::Remote("remote-id".to_owned()),
+            "a server-delivered slug is not a user pin"
         );
         assert_eq!(cfg.session_summary_pin.explicit_model(), Some("local-ss"));
+        // The remote pin still carries the model value it resolved...
+        assert_eq!(cfg.image_description.as_deref(), Some("remote-id"));
+        assert_eq!(cfg.image_description_pin.any_model(), Some("remote-id"));
+        // ...but is not consent, so a non-xAI session may not use it.
+        assert!(!cfg.image_description_pin.is_explicit());
+        assert_eq!(cfg.image_description_pin.explicit_model(), None);
+        assert!(!cfg
+            .image_description_pin
+            .allows_aux_helper(xai_grok_sampling_types::ModelProvider::Codex));
+        assert!(
+            cfg.image_description_pin
+                .allows_aux_helper(xai_grok_sampling_types::ModelProvider::Xai),
+            "an xAI session is provider-consistent regardless of provenance"
+        );
     });
+}
+
+/// The consent rule in one table: only CLI / env / local TOML authorize a
+/// Codex session to reach an xAI-hosted auxiliary helper.
+#[test]
+fn aux_pin_consent_is_local_sources_only() {
+    use xai_grok_sampling_types::ModelProvider::{Codex, Xai};
+    let cases = [
+        (AuxModelPin::Env("m".to_owned()), true),
+        (AuxModelPin::Pinned("m".to_owned()), true),
+        (AuxModelPin::Remote("m".to_owned()), false),
+        (AuxModelPin::Unpinned, false),
+    ];
+    for (pin, consents) in cases {
+        assert_eq!(pin.is_explicit(), consents, "is_explicit for {pin:?}");
+        assert_eq!(
+            pin.allows_aux_helper(Codex),
+            consents,
+            "Codex session gate for {pin:?}"
+        );
+        assert!(
+            pin.allows_aux_helper(Xai),
+            "an xAI session always allows the xAI helper ({pin:?})"
+        );
+    }
 }
 
 /// Env vars record as `Env` provenance and beat local + remote; a blank env
@@ -4011,6 +4053,73 @@ fn model_overrides_aux_pins_env_wins_and_blank_env_clears() {
             cfg.session_summary.as_deref(),
             Some(crate::models::default_session_summary_model())
         );
+    });
+}
+
+/// The pins must reach the shell `Config` its consumers read, from every
+/// source: `[models]` and env through `new_from_toml_cfg`, remote settings
+/// through the runtime resolve.
+#[test]
+fn aux_pins_reach_agent_config_from_toml_env_and_remote() {
+    let config: toml::Value = toml::from_str(
+        r#"
+            [models]
+            session_summary = "local-ss"
+            "#,
+    )
+    .unwrap();
+    with_model_overrides_env(None, None, None, || {
+        let cfg = crate::agent::config::Config::new_from_toml_cfg(&config).unwrap();
+        assert_eq!(
+            cfg.session_summary_pin,
+            AuxModelPin::Pinned("local-ss".to_owned())
+        );
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Unpinned);
+        assert_eq!(cfg.image_description_pin, AuxModelPin::Unpinned);
+        assert!(!cfg.image_description_pin.is_explicit());
+    });
+    with_model_overrides_env(Some("env-ws"), None, Some("env-id"), || {
+        let cfg = crate::agent::config::Config::new_from_toml_cfg(&config).unwrap();
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Env("env-ws".to_owned()));
+        assert_eq!(
+            cfg.image_description_pin,
+            AuxModelPin::Env("env-id".to_owned())
+        );
+    });
+    with_model_overrides_env(None, None, None, || {
+        let remote = crate::util::config::RemoteSettings {
+            image_description_model: Some("remote-id".to_owned()),
+            ..Default::default()
+        };
+        let mut cfg = crate::agent::config::Config::new_from_toml_cfg(&config).unwrap();
+        cfg.resolve_runtime_fields(&crate::agent::config::RuntimeResolutionContext {
+            raw_config: &config,
+            remote_settings: Some(&remote),
+            is_headless: true,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: Some("cli-ss"),
+            memory_enabled_override: None,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert_eq!(
+            cfg.image_description_pin,
+            AuxModelPin::Remote("remote-id".to_owned()),
+            "remote settings set the model value but are not user consent"
+        );
+        assert!(
+            !cfg.image_description_pin.is_explicit(),
+            "a remote pin must never authorize a cross-provider aux call"
+        );
+        assert_eq!(
+            cfg.session_summary_pin,
+            AuxModelPin::Pinned("cli-ss".to_owned()),
+            "the CLI flag wins over the local pin"
+        );
+        assert_eq!(cfg.web_search_pin, AuxModelPin::Unpinned);
     });
 }
 

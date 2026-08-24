@@ -817,6 +817,9 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
         agent_config.web_search_model = overrides.web_search;
         agent_config.session_summary_model = overrides.session_summary;
         agent_config.image_description_model = overrides.image_description;
+        agent_config.web_search_pin = overrides.web_search_pin;
+        agent_config.session_summary_pin = overrides.session_summary_pin;
+        agent_config.image_description_pin = overrides.image_description_pin;
         agent_config.prompt_suggest_model_pin = overrides.prompt_suggestion;
     }
     // Recompute the campaign overlay + `pre_campaign_default` (the catalog-miss

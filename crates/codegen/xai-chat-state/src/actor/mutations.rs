@@ -621,7 +621,11 @@ impl ChatStateActor {
         self.state.credentials = snap.credentials;
         // Monotonic: a snapshot taken before the first Codex turn must not
         // clear the mark on restore (e.g. rewind across a provider switch).
-        self.state.ever_used_codex |= snap.ever_used_codex;
+        // Routed through the setter so the synchronous latch the egress gates
+        // read is published too.
+        if snap.ever_used_codex {
+            self.set_ever_used_codex();
+        }
         // Drop abandoned prompt billing; session ledger is lifetime.
         self.state.prompt_usage = None;
     }

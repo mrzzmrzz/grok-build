@@ -251,7 +251,11 @@ impl MvpAgent {
             terminal,
             session_env,
             memory_config: self.memory_config.clone(),
-            web_search_sampling_config: self.prepare_web_search_sampling_config(),
+            // Ungated on purpose: a child may override the model (in either
+            // direction), so the provider gate runs child-side once its
+            // effective config is resolved.
+            web_search_sampling_config: self.resolve_web_search_sampling_config(),
+            web_search_pin: self.cfg.borrow().web_search_pin.clone(),
             web_fetch_config: self.prepare_web_fetch_config(),
             image_gen_config: self.prepare_image_gen_config(),
             video_gen_config: self.prepare_video_gen_config(),
@@ -309,6 +313,7 @@ impl MvpAgent {
                 am.clone(),
             ))),
             image_description_model: self.resolve_image_description_model(),
+            image_description_pin: self.cfg.borrow().image_description_pin.clone(),
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,

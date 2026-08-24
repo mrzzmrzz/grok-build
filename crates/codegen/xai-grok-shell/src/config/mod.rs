@@ -522,26 +522,61 @@ impl Default for ModelOverrideConfig {
 /// alongside the legacy fields (which keep their historical resolution and
 /// default-filling) so existing consumers are untouched; provenance-aware
 /// consumers read the pin.
+///
+/// **Consent is local-only.** Only sources the user controls on this machine —
+/// a CLI flag, a `GROK_*_MODEL` env var, or `[models]` in a config.toml layer —
+/// count as the cross-provider consent [`Self::is_explicit`] reports. A model
+/// slug delivered by remote settings is *service* configuration, not a user
+/// choice, so it lands in [`Self::Remote`]: it still decides which model the
+/// helper uses (the resolved `String` fields are unchanged), but it can never
+/// authorize a Codex session to route its content to an xAI helper.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AuxModelPin {
     /// Explicit via the env escape hatch (`GROK_*_MODEL`) — used verbatim.
     Env(String),
-    /// Explicit via CLI flag, `[models]` in config.toml, or remote settings.
+    /// Explicit via CLI flag or `[models]` in config.toml — a local user choice.
     Pinned(String),
-    /// No explicit source anywhere: the compiled default applies.
+    /// Supplied by remote settings. Governs the model *value* like any other
+    /// source, but is server-controlled and therefore NOT user consent: it
+    /// behaves like [`Self::Unpinned`] for every cross-provider gate.
+    Remote(String),
+    /// No source anywhere: the compiled default applies.
     #[default]
     Unpinned,
 }
 impl AuxModelPin {
-    /// Whether the user explicitly chose this model (any non-default source).
+    /// Whether the *user* explicitly chose this model on this machine
+    /// (CLI / env / local TOML). Remote settings and the compiled default
+    /// both answer `false` — see the type docs.
     pub fn is_explicit(&self) -> bool {
-        !matches!(self, Self::Unpinned)
+        matches!(self, Self::Env(_) | Self::Pinned(_))
     }
 
-    /// The explicitly pinned slug, if any.
+    /// Whether a session on `session_provider` may route its content to this
+    /// (xAI-hosted) auxiliary helper: an xAI session always may; any other
+    /// provider only when the user explicitly pinned the helper model
+    /// (spec §12.2). A remote-settings pin does not qualify.
+    pub fn allows_aux_helper(
+        &self,
+        session_provider: xai_grok_sampling_types::ModelProvider,
+    ) -> bool {
+        session_provider == xai_grok_sampling_types::ModelProvider::Xai || self.is_explicit()
+    }
+
+    /// The user-explicit pinned slug, if any (remote pins excluded).
     pub fn explicit_model(&self) -> Option<&str> {
         match self {
             Self::Env(m) | Self::Pinned(m) => Some(m.as_str()),
+            Self::Remote(_) | Self::Unpinned => None,
+        }
+    }
+
+    /// The resolved slug from any source, including remote settings. Use this
+    /// when you need the model *value*; use [`Self::explicit_model`] when you
+    /// need the user's consent.
+    pub fn any_model(&self) -> Option<&str> {
+        match self {
+            Self::Env(m) | Self::Pinned(m) | Self::Remote(m) => Some(m.as_str()),
             Self::Unpinned => None,
         }
     }
@@ -602,9 +637,18 @@ impl ModelOverrideConfig {
         let parsed_models: crate::agent::config::ModelsConfig = models_table
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
+        // Local user sources (CLI flag / config.toml `[models]`) are consent.
         let pin_of = |value: Option<&str>| {
             non_empty_model_override(value)
                 .map(AuxModelPin::Pinned)
+                .unwrap_or_default()
+        };
+        // Remote settings decide the model *value* but are service
+        // configuration, never the user's cross-provider consent — see
+        // [`AuxModelPin`].
+        let remote_pin_of = |value: Option<&str>| {
+            non_empty_model_override(value)
+                .map(AuxModelPin::Remote)
                 .unwrap_or_default()
         };
         let mut result = Self {
@@ -631,17 +675,18 @@ impl ModelOverrideConfig {
         if let Some(remote) = remote {
             if !has_local_ws && let Some(ref v) = remote.web_search_model {
                 result.web_search = v.clone();
-                result.web_search_pin = pin_of(Some(v.as_str()));
+                result.web_search_pin = remote_pin_of(Some(v.as_str()));
             }
             if !has_local_ss {
                 result.session_summary =
                     non_empty_model_override(remote.session_summary_model.as_deref());
-                result.session_summary_pin = pin_of(remote.session_summary_model.as_deref());
+                result.session_summary_pin = remote_pin_of(remote.session_summary_model.as_deref());
             }
             if !has_local_id {
                 result.image_description =
                     non_empty_model_override(remote.image_description_model.as_deref());
-                result.image_description_pin = pin_of(remote.image_description_model.as_deref());
+                result.image_description_pin =
+                    remote_pin_of(remote.image_description_model.as_deref());
             }
             if result.prompt_suggestion == PromptSuggestModelPin::Unpinned
                 && let Some(v) = non_empty_model_override(remote.prompt_suggestion_model.as_deref())

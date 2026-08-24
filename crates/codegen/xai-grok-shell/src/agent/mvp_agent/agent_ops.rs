@@ -96,11 +96,7 @@ impl MvpAgent {
         primary: &SamplingConfig,
     ) -> Result<(OaiCompatClient, String), acp::Error> {
         let slug = self.resolve_session_summary_model();
-        // Provenance approximation until `Config` carries the
-        // `AuxModelPin` fields (see `crate::config::AuxModelPin`): a slug
-        // that differs from the compiled default can only come from an
-        // explicit source (CLI/env/toml/remote).
-        let slug_is_explicit = slug != crate::models::default_session_summary_model();
+        let slug_is_explicit = self.cfg.borrow().session_summary_pin.is_explicit();
         let resolved_aux = if summary_aux_resolution_allowed(primary, slug_is_explicit) {
             // Only an xAI credential may become the aux resolver's xAI proxy
             // bearer (tier 2 adopts `session_key` verbatim); a Codex OAuth
@@ -2289,7 +2285,18 @@ impl MvpAgent {
             zdr_restricted,
         }
     }
-    pub(super) fn prepare_web_search_sampling_config(&self) -> Option<SamplingConfig> {
+    /// Resolve the web-search sampler config, **without** the provider gate.
+    ///
+    /// Provider isolation (spec §12.2) applies — the web-search tool
+    /// synthesizes an xAI-profiled request from the session/env bearer, so a
+    /// non-xAI session must not reach it unless the user explicitly pinned the
+    /// search model — but it cannot be decided here. The provider that
+    /// matters is the *session's own effective* provider, which a subagent
+    /// model override can change in either direction and which a model switch
+    /// can change again at any time. So the caller hands this snapshot plus
+    /// [`crate::config::AuxModelPin`] to `spawn_session_actor`, and the
+    /// session owns the live gate (`apply_web_search_provider_gate`).
+    pub(super) fn resolve_web_search_sampling_config(&self) -> Option<SamplingConfig> {
         let model_id = self.cfg.borrow().web_search_model.clone();
         let models = self.models_manager.models();
         let session = self.current_or_buffered_auth();
@@ -4643,7 +4650,11 @@ impl MvpAgent {
             .find(|entry| entry.info.model == sampling_config.model)
             .and_then(|entry| entry.info.max_retries);
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
-        let web_search_sampling_config = self.prepare_web_search_sampling_config();
+        // Provider-ungated on purpose: the session owns the §12.2 gate so it
+        // can re-apply it on every model switch, in both directions. The pin
+        // travels with the config for that.
+        let web_search_sampling_config = self.resolve_web_search_sampling_config();
+        let web_search_pin = self.cfg.borrow().web_search_pin.clone();
         let image_gen_config = self.prepare_image_gen_config();
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();
@@ -4904,6 +4915,7 @@ impl MvpAgent {
                     model_max_retries,
                     subagent_rate_limit_max_attempts,
                     web_search_sampling_config,
+                    web_search_pin,
                     web_fetch_config,
                     image_gen_config,
                     video_gen_config,
@@ -4953,6 +4965,7 @@ impl MvpAgent {
                         ),
                     ),
                     self.resolve_image_description_model(),
+                    self.cfg.borrow().image_description_pin.clone(),
                     agent_hook_registry_override,
                     workspace_ops.clone(),
                     {
@@ -5438,6 +5451,81 @@ mod codex_trace_gate_tests {
             agent.auth_manager.clone(),
         );
         let _ = handle.upload_queue.set(queue);
+    }
+
+    /// Review finding: `get_trace_context` gates on Codex provenance at
+    /// creation, but `set_session_model` does not take the prompt dispatch
+    /// lock, so a switch to Codex can land AFTER a context has been admitted.
+    /// The barrier: context created while unmarked -> concurrent switch marks
+    /// the session -> every upload boundary must refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_context_is_revoked_by_a_model_switch_after_creation() {
+        let agent = build_agent();
+        let sid = acp::SessionId::new("trace-barrier-sess");
+        let chat = spawn_chat_state("grok-4.5");
+        let handle = make_handle("trace-barrier-sess", "grok-4.5", chat.clone());
+        preset_upload_queue(&agent, &handle);
+        agent.insert_resident(&sid, handle);
+        let info = crate::session::info::Info {
+            id: sid.clone(),
+            cwd: "/tmp".to_string(),
+        };
+
+        // The turn admits a trace context while the session is still xAI.
+        let ctx = agent
+            .get_trace_context(&info, 0)
+            .await
+            .expect("an unmarked xAI session gets a trace context");
+        assert!(
+            !ctx.codex_provenance_revoked(),
+            "control: a live context is not revoked"
+        );
+
+        // The concurrent `set_session_model` lands. `mark_ever_used_codex`
+        // publishes synchronously, so the barrier needs no actor round-trip:
+        // the very next boundary check sees it.
+        chat.mark_ever_used_codex();
+        assert!(
+            ctx.codex_provenance_revoked(),
+            "a switch to Codex must revoke an already-created trace context"
+        );
+        assert!(
+            ctx.refuse_upload_on_codex_provenance("turn_messages.json"),
+            "every upload boundary must refuse the revoked context"
+        );
+
+        // The egress functions themselves refuse, not just the predicate.
+        assert!(
+            crate::upload::trace::upload_artifact_to_gcs(
+                &ctx,
+                "trace-barrier/artifact.json",
+                b"{}",
+                "application/json",
+                "artifact",
+            )
+            .await
+            .is_none(),
+            "direct GCS upload must refuse a revoked context"
+        );
+        assert!(
+            crate::upload::trace::upload_trace_artifact_deferred(
+                &ctx,
+                b"{}",
+                "trace-barrier/deferred.json",
+                "application/json",
+                "deferred",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await
+            .is_err(),
+            "queue enqueue must refuse a revoked context"
+        );
+
+        // And a context requested after the mark is never created at all.
+        assert!(
+            agent.get_trace_context(&info, 1).await.is_none(),
+            "no new context after the mark"
+        );
     }
 
     /// A session marked `ever_used_codex` must not get a trace context, even

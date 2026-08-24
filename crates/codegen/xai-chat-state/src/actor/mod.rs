@@ -40,6 +40,11 @@ pub struct ChatStateActor {
     event_tx: mpsc::UnboundedSender<ChatStateEvent>,
     /// Cancellation token for graceful shutdown.
     cancellation_token: tokio_util::sync::CancellationToken,
+    /// Shared synchronous mirror of `state.ever_used_codex`, published to
+    /// every [`ChatStateHandle`] so provider-isolation gates can read the
+    /// monotonic mark without a round-trip. Every write to
+    /// `state.ever_used_codex` must go through [`Self::set_ever_used_codex`].
+    ever_used_codex_latch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatStateActor {
@@ -78,6 +83,7 @@ impl ChatStateActor {
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let ever_used_codex_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let actor = ChatStateActor {
             state: ChatState::new(initial_conversation, sampling_config),
@@ -86,11 +92,20 @@ impl ChatStateActor {
             cmd_rx,
             event_tx,
             cancellation_token,
+            ever_used_codex_latch: ever_used_codex_latch.clone(),
         };
 
         tokio::spawn(actor.run());
 
-        ChatStateHandle::new(cmd_tx)
+        ChatStateHandle::new(cmd_tx, ever_used_codex_latch)
+    }
+
+    /// Set the monotonic Codex-provenance mark, keeping the synchronous latch
+    /// every handle reads in step with the actor's own state. Never clears.
+    pub(super) fn set_ever_used_codex(&mut self) {
+        self.state.ever_used_codex = true;
+        self.ever_used_codex_latch
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Main actor loop — processes commands until shutdown or cancellation.
@@ -404,7 +419,7 @@ impl ChatStateActor {
                          content is disabled for the session's remaining lifetime"
                     );
                 }
-                self.state.ever_used_codex = true;
+                self.set_ever_used_codex();
             }
             ChatStateCommand::GetEverUsedCodex { reply } => {
                 let _ = reply.send(self.state.ever_used_codex);

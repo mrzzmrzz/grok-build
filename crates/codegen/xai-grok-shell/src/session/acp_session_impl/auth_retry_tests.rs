@@ -195,3 +195,19 @@ fn suspend_reset_requires_open_incident_and_real_drift() {
         "the failed reset checks must not charge the budget"
     );
 }
+
+/// Codex 401 recovery is one forced refresh plus one replay per logical
+/// request: the request's first 401 claims it, every later 401 of the same
+/// request is terminal, and the next request gets a fresh allowance.
+#[test]
+fn codex_401_recovery_is_claimable_once_per_request() {
+    let spent = std::cell::Cell::new(false);
+    assert!(super::claim_codex_401_recovery(&spent));
+    assert!(!super::claim_codex_401_recovery(&spent));
+    assert!(!super::claim_codex_401_recovery(&spent));
+    spent.set(false);
+    assert!(
+        super::claim_codex_401_recovery(&spent),
+        "a new logical request restores the allowance"
+    );
+}

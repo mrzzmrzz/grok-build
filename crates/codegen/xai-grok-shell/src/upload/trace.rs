@@ -541,6 +541,11 @@ pub(crate) async fn upload_artifact_to_gcs(
     content_type: &str,
     artifact: &str,
 ) -> Option<String> {
+    // Final egress boundary: re-check provenance here, not just where the
+    // context was admitted (see `PromptTraceContext::codex_provenance_revoked`).
+    if ctx.refuse_upload_on_codex_provenance(artifact) {
+        return None;
+    }
     let _upload_start = std::time::Instant::now();
     let config = ctx.gcs_config.with_auth(Some(ctx.auth_manager.clone()));
     match upload_bytes(&config, gcs_path, content, content_type).await {
@@ -1386,6 +1391,13 @@ pub(crate) async fn upload_trace_artifact_deferred(
     artifact_name: &str,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
+    // Enqueueing is egress: the queue worker uploads asynchronously, so a
+    // revoked context must not hand it bytes either.
+    if ctx.refuse_upload_on_codex_provenance(artifact_name) {
+        return Err(anyhow::anyhow!(
+            "trace upload refused: session marked Codex after the trace context was created"
+        ));
+    }
     if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         let outcome = queue
@@ -1463,6 +1475,10 @@ pub(crate) async fn upload_trace_artifact(
     content_type: &str,
     artifact_name: &str,
 ) {
+    // Enqueueing is egress — see `upload_trace_artifact_deferred`.
+    if ctx.refuse_upload_on_codex_provenance(artifact_name) {
+        return;
+    }
     let (ok, err_msg) = if let Some(queue) = &ctx.upload_queue {
         let session_id = ctx.session_info.id.0.to_string();
         match queue

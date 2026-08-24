@@ -253,7 +253,13 @@ pub(crate) async fn spawn_session_actor(
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
     subagent_rate_limit_max_attempts: u32,
+    // Resolved WITHOUT the provider gate: the gate is applied inside, against
+    // this session's own effective provider (a subagent's model override moves
+    // the child's provider in either direction), and re-applied on every model
+    // switch. `web_search_pin` carries the provenance it needs — only a
+    // user-explicit pin lets a non-xAI session reach the xAI helper (§12.2).
     web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_pin: crate::config::AuxModelPin,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -284,6 +290,7 @@ pub(crate) async fn spawn_session_actor(
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     image_description_model: String,
+    image_description_pin: crate::config::AuxModelPin,
     hook_registry_override: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     workspace_ops: xai_grok_workspace::WorkspaceOps,
     cli_permission_rules: Vec<xai_grok_workspace::permission::types::PermissionRule>,
@@ -502,6 +509,25 @@ pub(crate) async fn spawn_session_actor(
         tracing::warn!("web_search disabled: configured model could not be resolved");
         xai_grok_tools::implementations::WebSearchConfig::Disabled
     };
+    // Provider isolation (spec §12.2) for the web-search helper. The config
+    // above is provider-ungated on purpose: the caller resolves it from the
+    // parent/global provider, while THIS session's effective provider is only
+    // known here (a subagent model override moves it in either direction) and
+    // can change again at any model switch. So the gate is a piece of live
+    // session state, seeded here and recomputed by
+    // `SessionActor::apply_web_search_provider_gate`. When it is closed the
+    // tool is hidden from every request and its client is removed from the
+    // toolset, which is reversible — a switch back to a permitted provider
+    // restores exactly the same client.
+    let initial_web_search_provider_allowed =
+        web_search_pin.allows_aux_helper(sampling_config.provider_profile.provider);
+    if web_search_config.is_enabled() && !initial_web_search_provider_allowed {
+        tracing::info!(
+            provider = ?sampling_config.provider_profile.provider,
+            "web_search withheld at spawn: an unpinned xAI search helper must not \
+             serve a non-xAI session"
+        );
+    }
     let embed_base_url = sampling_config.base_url.clone();
     let embed_api_key = sampling_config.api_key.clone();
     let session_pruning_config: crate::config::PruningConfig = memory_config.as_ref().map_or_else(
@@ -1832,6 +1858,7 @@ pub(crate) async fn spawn_session_actor(
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
         codex_turn_state: std::cell::RefCell::new(None),
+        codex_401_recovery_spent: std::cell::Cell::new(false),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
         turn_summary_enabled: effective_config.is_turn_summary_enabled(),
@@ -1846,6 +1873,10 @@ pub(crate) async fn spawn_session_actor(
         sampler_handle,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,
+        image_description_pin,
+        web_search_pin,
+        web_search_provider_allowed: std::cell::Cell::new(initial_web_search_provider_allowed),
+        parked_web_search_client: parking_lot::Mutex::new(None),
         image_describe_cache: Arc::new(crate::session::image_describe::ImageDescribeCache::new()),
         subagent_token_records: parking_lot::Mutex::new(HashMap::new()),
         workspace_ops: workspace_ops.clone(),
@@ -1924,6 +1955,12 @@ pub(crate) async fn spawn_session_actor(
             .await;
     }
     session.inject_deny_read_globs().await;
+    // Park the search client when this session's own provider does not allow
+    // it (the spawn-time half of the gate; model switches call the same
+    // helper). Done after the toolset is wired so the removal actually lands.
+    if !session.web_search_provider_allowed.get() {
+        session.park_or_restore_web_search_client().await;
+    }
     if session.permissions.is_auto_mode() {
         session.wire_permission_auto_llm_classifier().await;
     }
@@ -2316,7 +2353,13 @@ pub(crate) async fn spawn_session_on_thread(
     inference_idle_timeout_secs: u64,
     max_retries: Option<u32>,
     subagent_rate_limit_max_attempts: u32,
+    // Resolved WITHOUT the provider gate: the gate is applied inside, against
+    // this session's own effective provider (a subagent's model override moves
+    // the child's provider in either direction), and re-applied on every model
+    // switch. `web_search_pin` carries the provenance it needs — only a
+    // user-explicit pin lets a non-xAI session reach the xAI helper (§12.2).
     web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    web_search_pin: crate::config::AuxModelPin,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
@@ -2348,6 +2391,7 @@ pub(crate) async fn spawn_session_on_thread(
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     image_description_model: String,
+    image_description_pin: crate::config::AuxModelPin,
     hook_registry_override: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
     workspace_ops: xai_grok_workspace::WorkspaceOps,
     cli_permission_rules: Vec<xai_grok_workspace::permission::types::PermissionRule>,
@@ -2495,6 +2539,7 @@ pub(crate) async fn spawn_session_on_thread(
                         max_retries,
                         subagent_rate_limit_max_attempts,
                         web_search_sampling_config,
+                        web_search_pin,
                         web_fetch_config,
                         image_gen_config,
                         video_gen_config,
@@ -2525,6 +2570,7 @@ pub(crate) async fn spawn_session_on_thread(
                         inherited_permission_handle,
                         api_key_provider,
                         image_description_model,
+                        image_description_pin,
                         hook_registry_override,
                         workspace_ops,
                         cli_permission_rules,

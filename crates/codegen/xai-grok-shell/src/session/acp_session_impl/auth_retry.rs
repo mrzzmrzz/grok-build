@@ -26,6 +26,17 @@ pub(crate) async fn pace_uncharged_resubmit(
     }
 }
 
+/// Claim the one Codex 401 recovery a logical request is allowed: a forced
+/// OAuth refresh plus the single replay it buys. `true` for the first 401 of
+/// the request, `false` for every later one — the caller must then surface the
+/// 401 terminally instead of refreshing again. `spent` is cleared where the
+/// request's [`AuthRetrySchedule`] is created, so a new prompt gets a new
+/// allowance; the shared schedule alone would permit several refresh+replay
+/// rounds for the same request.
+pub(crate) fn claim_codex_401_recovery(spent: &std::cell::Cell<bool>) -> bool {
+    !spent.replace(true)
+}
+
 /// Compact `2h3m` / `4m7s` / `12s` rendering for turn-failure messages.
 pub(crate) fn human_duration(d: std::time::Duration) -> String {
     let total_secs = d.as_secs();

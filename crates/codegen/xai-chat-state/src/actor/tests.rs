@@ -5195,3 +5195,37 @@ async fn ever_used_codex_is_monotonic_across_snapshot_restore() {
         "restore is OR-merge: rewind can never un-mark a Codex session"
     );
 }
+
+/// The synchronous latch behind `ever_used_codex_now` is what egress gates
+/// read, so it must be observable the instant `mark_ever_used_codex` returns —
+/// before the actor has dequeued anything — and must also pick up a mark that
+/// entered through a snapshot restore.
+#[tokio::test]
+async fn ever_used_codex_now_is_visible_synchronously_and_from_restore() {
+    let h = TestHarness::new();
+    assert!(!h.handle.ever_used_codex_now(), "fresh session is unmarked");
+
+    h.handle.mark_ever_used_codex();
+    assert!(
+        h.handle.ever_used_codex_now(),
+        "the latch must be set before the actor processes the command"
+    );
+    // A clone shares the latch (every gate holds a clone of the handle).
+    assert!(h.handle.clone().ever_used_codex_now());
+    assert!(h.handle.ever_used_codex().await, "the actor agrees");
+
+    // A mark arriving only through a snapshot restore also reaches the latch.
+    let marked = h.handle.snapshot().await.unwrap();
+    assert!(marked.ever_used_codex);
+    let fresh = TestHarness::new();
+    assert!(!fresh.handle.ever_used_codex_now());
+    fresh.handle.restore_snapshot(marked);
+    assert!(
+        fresh.handle.ever_used_codex().await,
+        "restore carries the mark"
+    );
+    assert!(
+        fresh.handle.ever_used_codex_now(),
+        "the restore must publish through the synchronous latch too"
+    );
+}

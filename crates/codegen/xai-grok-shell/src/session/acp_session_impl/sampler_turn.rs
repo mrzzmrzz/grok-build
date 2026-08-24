@@ -298,7 +298,16 @@ impl SessionActor {
         let bridge = self.agent.borrow().tool_bridge().clone();
         let defs = bridge.tool_definitions_builtins_only().await;
         let plan_active = self.plan_mode.lock().is_active();
-        filter_cursor_tools_by_plan_mode(defs, plan_active)
+        let mut defs = filter_cursor_tools_by_plan_mode(defs, plan_active);
+        // Provider isolation (spec §12.2): the single place every consumer of
+        // the session's tool list goes through, so a model switch onto a
+        // provider the web-search pin does not cover hides the tool from the
+        // very next request — see
+        // `SessionActor::apply_web_search_provider_gate`.
+        if !self.web_search_provider_allowed.get() {
+            defs.retain(|td| td.function.name != "web_search");
+        }
+        defs
     }
     pub(super) fn model_auth_facts(&self, model_id: &str) -> crate::agent::config::ModelAuthFacts {
         self.model_auth_state(model_id).0
@@ -446,10 +455,13 @@ impl SessionActor {
     /// rotated token reaches the wire through the per-request
     /// `CodexBearerResolver` (disk read), not chat-state credentials.
     ///
-    /// Bounded: each 401 buys at most one forced refresh plus the single
-    /// replay the caller charges against the shared per-incident auth-retry
-    /// budget, and a permanently rejected refresh token is cached by
-    /// `codex_auth` so later 401s fail fast instead of re-refreshing.
+    /// Bounded to ONE recovery per logical request: the first eligible 401
+    /// claims the allowance ([`claim_codex_401_recovery`]) and buys one forced
+    /// refresh plus the single replay the caller charges against the shared
+    /// per-incident auth-retry budget; every later 401 of the same request
+    /// fails closed without refreshing again. A permanently rejected refresh
+    /// token is additionally cached by `codex_auth` so later requests fail
+    /// fast too.
     ///
     /// Fails closed (`false`, surfacing the 401) when the session carries no
     /// OAuth identity anchor (an explicit-key Codex model cannot be repaired
@@ -457,6 +469,35 @@ impl SessionActor {
     /// credentials belong to a different account than the one this session
     /// was configured with.
     async fn try_codex_401_recovery(&self) -> bool {
+        self.try_codex_401_recovery_with(crate::codex_auth::force_refresh)
+            .await
+    }
+    /// Restore the single Codex 401 recovery allowance, i.e. open a new
+    /// logical request. Called where a prompt turn starts and after every
+    /// sampler response that lands: the next request of the same prompt (a
+    /// tool continuation) is independent, so a token that rotates while a
+    /// long tool runs must still be repairable exactly once.
+    pub(crate) fn reset_codex_401_recovery(&self) {
+        self.codex_401_recovery_spent.set(false);
+    }
+    /// Refresh-injected twin of [`Self::try_codex_401_recovery`] for tests.
+    pub(super) async fn try_codex_401_recovery_with<F, Fut>(&self, force_refresh: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<crate::codex_auth::CodexCredentials>>>,
+    {
+        if !claim_codex_401_recovery(&self.codex_401_recovery_spent) {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                "auth recovery: Codex 401 again after this request already refreshed once — failing closed"
+            );
+            xai_grok_telemetry::unified_log::warn(
+                "auth recovery: Codex 401 recovery already spent for this request",
+                Some(self.session_info.id.0.as_ref()),
+                None,
+            );
+            return false;
+        }
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
             return false;
         };
@@ -467,7 +508,7 @@ impl SessionActor {
             );
             return false;
         }
-        let credentials = match crate::codex_auth::force_refresh().await {
+        let credentials = match force_refresh().await {
             Ok(Some(credentials)) => credentials,
             Ok(None) => {
                 tracing::warn!(
@@ -731,15 +772,37 @@ impl SessionActor {
         if self.permissions.has_llm_side_query() {
             return;
         }
-        let auto_cfg = crate::util::config::resolve_auto_mode_config_from_disk();
+        let (auto_cfg, classifier_pin) =
+            crate::util::config::resolve_auto_mode_config_and_pin_from_disk();
         let session_model = self
             .chat_state_handle
             .get_sampling_config()
             .await
             .map(|c| c.model)
             .unwrap_or_default();
+        // Provider isolation (spec §12.2), same rule as image-describe and
+        // web-search: the classifier ships the user's command (and, under the
+        // `full` prompt type, transcript context) to whatever model it routes
+        // to, and `resolve_auto_classifier_sampler` builds an xAI-profiled
+        // request from the session/env bearer. A non-xAI session may only use
+        // it when the user pinned the classifier model locally — a remote
+        // setting is service configuration, not consent
+        // (`AuxModelPin::Remote`). Denied ⇒ `None`, which is the existing
+        // in-session fallback: the classifier runs on the session's own client
+        // and model, provider-consistent by construction.
         let aux_classifier_sampler = match auto_cfg.classifier_model.as_deref() {
-            Some(slug) => self.resolve_auto_classifier_sampler(slug).await,
+            Some(slug) if self.auto_classifier_aux_allowed(&classifier_pin).await => {
+                self.resolve_auto_classifier_sampler(slug).await
+            }
+            Some(slug) => {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    classifier_model = %slug,
+                    "auto-mode classifier: unpinned xAI helper withheld from a \
+                     non-xAI session; classifying on the session model"
+                );
+                None
+            }
             None => None,
         };
         let models = self.models_manager.models();
@@ -760,10 +823,33 @@ impl SessionActor {
             >,
         )>();
         let session = Arc::clone(self);
+        // The wiring gate above is a snapshot; a model switch can move the
+        // session onto Codex afterwards. Re-check per classification so the
+        // aux helper is withheld from the moment the provider changes, and
+        // warn only on the first denial (this runs on every prompt).
+        let aux_denied_warned = std::cell::Cell::new(false);
         tokio::task::spawn_local(async move {
             while let Some((messages, respond_to)) = rx.recv().await {
+                let live_aux = match &aux_classifier_sampler {
+                    Some(entry) if session.auto_classifier_aux_allowed(&classifier_pin).await => {
+                        Some(entry)
+                    }
+                    Some((_, model, _)) => {
+                        if !aux_denied_warned.replace(true) {
+                            tracing::warn!(
+                                session_id = %session.session_info.id.0,
+                                classifier_model = %model,
+                                "auto-mode classifier: session provider changed to a \
+                                 non-xAI provider; withholding the unpinned xAI helper \
+                                 and classifying on the session model"
+                            );
+                        }
+                        None
+                    }
+                    None => None,
+                };
                 let result = async {
-                    let (sampling_client, model, context_window) = match &aux_classifier_sampler {
+                    let (sampling_client, model, context_window) = match live_aux {
                         Some((client, model, context_window)) => {
                             (client.clone(), model.clone(), *context_window)
                         }
@@ -889,6 +975,52 @@ impl SessionActor {
             creds.client_version.clone(),
         )
     }
+    /// Image-describe arm of [`Self::resolve_aux_sampler_config`], gated on
+    /// provider isolation (spec §12.2): a non-xAI session must not ship its
+    /// images to the xAI describe helper unless the user explicitly pinned
+    /// that model. `None` ⇒ the caller keeps the session's own config and
+    /// model (`finalize_image_describe_sampler_config`), which is
+    /// provider-consistent by construction.
+    pub(super) async fn resolve_image_describe_sampler_config(
+        &self,
+        session_provider: xai_grok_sampling_types::ModelProvider,
+    ) -> Option<xai_grok_sampler::SamplerConfig> {
+        if !self
+            .image_description_pin
+            .allows_aux_helper(session_provider)
+        {
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                provider = ?session_provider,
+                "image describe: unpinned xAI helper withheld from a non-xAI \
+                 session; describing on the session model"
+            );
+            return None;
+        }
+        self.resolve_aux_sampler_config(&self.image_description_model)
+            .await
+    }
+    /// Whether this session may route Auto-mode classification to the
+    /// dedicated (xAI-hosted) classifier model named by `pin`.
+    ///
+    /// Same provider-isolation rule as [`Self::resolve_image_describe_sampler_config`]
+    /// (spec §12.2), evaluated against the session's **live** provider so a
+    /// model switch closes the gate immediately. Consent is local-only: a
+    /// remote-settings classifier slug resolves as
+    /// [`crate::config::AuxModelPin::Remote`] and never authorizes the
+    /// cross-provider call.
+    pub(super) async fn auto_classifier_aux_allowed(
+        &self,
+        pin: &crate::config::AuxModelPin,
+    ) -> bool {
+        let provider = self
+            .reconstruct_full_config()
+            .await
+            .provider_profile
+            .provider;
+        pin.allows_aux_helper(provider)
+    }
+
     /// Resolve a dedicated sampler for the Auto-mode classifier model `slug`,
     /// stamping session-local auth/attribution like image-describe (which relies
     /// on the resolver, not a config override, for `base_url`/`api_backend` so

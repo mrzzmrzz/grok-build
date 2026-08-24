@@ -2100,12 +2100,31 @@ impl SessionActor {
                 "elapsed_since_turn_start_ms": conv_turn_start.elapsed().as_millis() as u64,
             })),
         );
-        if let Some(ref gcs_config) = trace_gcs_config {
+        // Tool definitions are the FIRST trace artifact a turn ships, and it
+        // leaves before the request is even built — i.e. before the
+        // `build_request` provenance re-check below. A `set_session_model`
+        // switch to Codex landing between `get_trace_context` and here would
+        // otherwise push this session's tool manifest through the xAI-only
+        // pipeline, so the monotonic latch is re-read at the boundary (and
+        // again inside the spawned task, which can be scheduled later still).
+        if let Some(ref gcs_config) = trace_gcs_config
+            && !self.chat_state_handle.ever_used_codex_now()
+        {
             let gcs_cfg = gcs_config.clone();
             let tool_defs = tool_definitions.clone();
             let manifest_clone = artifact_tracker.cloned();
             let auth_manager = self.auth_manager.clone();
+            let chat_state_handle = self.chat_state_handle.clone();
+            let session_id = self.session_info.id.0.to_string();
             tokio::spawn(async move {
+                if chat_state_handle.ever_used_codex_now() {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "tool-definition trace upload refused: the session was marked \
+                         Codex after the trace context was created"
+                    );
+                    return;
+                }
                 crate::upload::trace::upload_tool_definitions(
                     gcs_cfg,
                     auth_manager,
@@ -2123,6 +2142,7 @@ impl SessionActor {
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut todo_gate_fires: u32 = 0;
         let mut auth_retry_schedule = AuthRetrySchedule::new();
+        self.reset_codex_401_recovery();
         let mut rate_limit_waits = self.rate_limit_wait_budget();
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
@@ -2402,6 +2422,7 @@ impl SessionActor {
                 }
                 Ok(SamplerTurnOutcome::CompactAndResubmit) => {
                     auth_retry_schedule.reset_on_success();
+                    self.reset_codex_401_recovery();
                     continue;
                 }
                 Ok(SamplerTurnOutcome::RefreshAuthAndResubmit { credential, store }) => {
@@ -2533,6 +2554,7 @@ impl SessionActor {
                 }
             };
             auth_retry_schedule.reset_on_success();
+            self.reset_codex_401_recovery();
             let model_elapsed_ms = model_timer.elapsed().as_millis() as u64;
             let usage = response.usage.as_ref();
             let prompt_tokens = usage.map(|u| u.prompt_tokens);

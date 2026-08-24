@@ -76,6 +76,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         session_env: Arc::new(HashMap::new()),
         memory_config: None,
         web_search_sampling_config: None,
+        web_search_pin: Default::default(),
         web_fetch_config: Default::default(),
         image_gen_config: Default::default(),
         video_gen_config: Default::default(),
@@ -118,6 +119,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         worktree_type: crate::util::config::WorktreeType::Linked,
         api_key_provider: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+        image_description_pin: Default::default(),
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         auth_manager: Arc::new(crate::auth::AuthManager::new(
             std::path::Path::new("/tmp/nonexistent-grok-test"),

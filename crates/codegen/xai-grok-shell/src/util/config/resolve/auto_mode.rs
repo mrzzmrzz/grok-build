@@ -203,8 +203,38 @@ fn merge_auto_mode_config(
     }
 }
 
+/// Provenance of the merged `classifier_model`, mirroring the auxiliary-model
+/// rule in [`crate::config::AuxModelPin`]: a local `[auto_mode]` table is the
+/// user's own choice, a remote-settings slug is service configuration and
+/// therefore not cross-provider consent.
+fn classifier_model_pin(
+    config: &crate::agent::config::AutoModeConfig,
+    remote: &crate::agent::config::AutoModeConfig,
+) -> crate::config::AuxModelPin {
+    match (
+        config.classifier_model.as_deref(),
+        remote.classifier_model.as_deref(),
+    ) {
+        (Some(local), _) => crate::config::AuxModelPin::Pinned(local.to_owned()),
+        (None, Some(remote)) => crate::config::AuxModelPin::Remote(remote.to_owned()),
+        (None, None) => crate::config::AuxModelPin::Unpinned,
+    }
+}
+
 /// Full Auto-mode config for the classifier-wiring read (overlay-free).
 pub(crate) fn resolve_auto_mode_config_from_disk() -> crate::agent::config::AutoModeConfig {
+    resolve_auto_mode_config_and_pin_from_disk().0
+}
+
+/// [`resolve_auto_mode_config_from_disk`] plus the provenance of the resolved
+/// `classifier_model`. The classifier ships the user's command and (with the
+/// `full` prompt type) transcript context to whatever model it routes to, so
+/// the wiring needs the pin to decide whether a non-xAI session may use an
+/// xAI-hosted classifier at all (spec §12.2).
+pub(crate) fn resolve_auto_mode_config_and_pin_from_disk() -> (
+    crate::agent::config::AutoModeConfig,
+    crate::config::AuxModelPin,
+) {
     let config = match crate::config::ConfigLayers::load() {
         Ok(layers) => auto_mode_config_overlay_free(&layers),
         Err(_) => crate::agent::config::AutoModeConfig::default(),
@@ -214,7 +244,8 @@ pub(crate) fn resolve_auto_mode_config_from_disk() -> crate::agent::config::Auto
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default();
-    merge_auto_mode_config(config, remote)
+    let pin = classifier_model_pin(&config, &remote);
+    (merge_auto_mode_config(config, remote), pin)
 }
 
 pub(crate) fn auto_mode_classify_timeout(
@@ -525,6 +556,42 @@ mod auto_permission_mode_gate_tests {
         assert_eq!(empty.classifier_model, None);
         assert_eq!(empty.classify_timeout_ms, None);
         assert_eq!(empty.reasoning_effort, None);
+    }
+
+    /// The classifier model's provenance follows the same local-only consent
+    /// rule as every other auxiliary model: local `[auto_mode]` is a user pin,
+    /// remote settings are not.
+    #[test]
+    fn classifier_model_pin_records_local_vs_remote_provenance() {
+        use crate::agent::config::AutoModeConfig;
+        use crate::config::AuxModelPin;
+        let local = AutoModeConfig {
+            classifier_model: Some("local-classifier".into()),
+            ..AutoModeConfig::default()
+        };
+        let remote = AutoModeConfig {
+            classifier_model: Some("remote-classifier".into()),
+            ..AutoModeConfig::default()
+        };
+        assert_eq!(
+            classifier_model_pin(&local, &remote),
+            AuxModelPin::Pinned("local-classifier".into()),
+            "local config wins the value and is user consent"
+        );
+        let remote_only = classifier_model_pin(&AutoModeConfig::default(), &remote);
+        assert_eq!(
+            remote_only,
+            AuxModelPin::Remote("remote-classifier".into()),
+            "a remote-only slug still names the model..."
+        );
+        assert!(
+            !remote_only.is_explicit(),
+            "...but is not the user's cross-provider consent"
+        );
+        assert_eq!(
+            classifier_model_pin(&AutoModeConfig::default(), &AutoModeConfig::default()),
+            AuxModelPin::Unpinned
+        );
     }
 
     #[test]

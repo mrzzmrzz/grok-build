@@ -1583,6 +1583,18 @@ pub struct Config {
     /// Image describe model (`grok-build` default via `ModelOverrideConfig::resolve`).
     #[serde(skip)]
     pub image_description_model: Option<String>,
+    /// Provenance of [`Self::web_search_model`]. The resolved slug alone cannot
+    /// tell an explicit user pin from the compiled default, and that
+    /// distinction gates cross-provider auxiliary routing (spec §12.2): a
+    /// non-xAI session may reach an xAI helper only when the user pinned it.
+    #[serde(skip)]
+    pub web_search_pin: crate::config::AuxModelPin,
+    /// Provenance of [`Self::session_summary_model`] — see [`Self::web_search_pin`].
+    #[serde(skip)]
+    pub session_summary_pin: crate::config::AuxModelPin,
+    /// Provenance of [`Self::image_description_model`] — see [`Self::web_search_pin`].
+    #[serde(skip)]
+    pub image_description_pin: crate::config::AuxModelPin,
     /// Next-prompt suggestion model pin (`env > [models] prompt_suggestion >
     /// remote`), consumed catalog-guarded by `handle_suggest_prompt`; see
     /// `ModelOverrideConfig::resolve`.
@@ -1837,6 +1849,9 @@ impl Default for Config {
             web_search_model: crate::models::default_web_search_model().to_owned(),
             session_summary_model: None,
             image_description_model: None,
+            web_search_pin: crate::config::AuxModelPin::Unpinned,
+            session_summary_pin: crate::config::AuxModelPin::Unpinned,
+            image_description_pin: crate::config::AuxModelPin::Unpinned,
             prompt_suggest_model_pin: crate::config::PromptSuggestModelPin::Unpinned,
         };
         cfg.apply_env_overrides();
@@ -2187,6 +2202,9 @@ impl Config {
         config.web_search_model = model_overrides.web_search;
         config.session_summary_model = model_overrides.session_summary;
         config.image_description_model = model_overrides.image_description;
+        config.web_search_pin = model_overrides.web_search_pin;
+        config.session_summary_pin = model_overrides.session_summary_pin;
+        config.image_description_pin = model_overrides.image_description_pin;
         config.prompt_suggest_model_pin = model_overrides.prompt_suggestion;
         config.apply_env_overrides();
         Ok(config)
@@ -2329,6 +2347,9 @@ impl Config {
         self.web_search_model = models.web_search;
         self.session_summary_model = models.session_summary;
         self.image_description_model = models.image_description;
+        self.web_search_pin = models.web_search_pin;
+        self.session_summary_pin = models.session_summary_pin;
+        self.image_description_pin = models.image_description_pin;
         self.prompt_suggest_model_pin = models.prompt_suggestion;
         self.memory_enabled_override = ctx.memory_enabled_override;
         let mem = self.resolve_memory(ctx.memory_enabled_override, ctx.remote_settings);

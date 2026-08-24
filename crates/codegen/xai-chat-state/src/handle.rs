@@ -19,19 +19,41 @@ use crate::types::{
 #[derive(Clone)]
 pub struct ChatStateHandle {
     cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
+    /// Synchronous mirror of the actor's monotonic `ever_used_codex` latch,
+    /// shared with the actor so both writers (the `MarkEverUsedCodex` command
+    /// and a snapshot restore) publish through it.
+    ///
+    /// The actor's copy is authoritative for state, but reading it costs a
+    /// round-trip through the command queue and an `await`. Provider-isolation
+    /// gates sit on egress boundaries where that is either impossible (sync
+    /// call sites) or a TOCTOU window (a switch landing between the check and
+    /// the upload), so they read this instead — see
+    /// [`Self::ever_used_codex_now`]. Safe because the flag is monotonic:
+    /// [`Self::mark_ever_used_codex`] sets the atomic BEFORE it enqueues the
+    /// command, so the latch is never behind the actor, only ever ahead.
+    ever_used_codex: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ChatStateHandle {
-    /// Create a new handle with the given command sender.
-    pub(crate) fn new(cmd_tx: mpsc::UnboundedSender<ChatStateCommand>) -> Self {
-        Self { cmd_tx }
+    /// Create a new handle sharing `ever_used_codex` with its actor.
+    pub(crate) fn new(
+        cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
+        ever_used_codex: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            cmd_tx,
+            ever_used_codex,
+        }
     }
 
     /// Create a no-op handle that discards all commands.
     /// Useful for tests and situations where chat state tracking is not needed.
     pub fn noop() -> Self {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            ever_used_codex: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     // ═══ Fire-and-forget mutations ═══
@@ -528,8 +550,27 @@ impl ChatStateHandle {
 
     /// Monotonically mark that the session has sampled through the Codex
     /// provider. Fire-and-forget; there is deliberately no way to clear it.
+    ///
+    /// The synchronous latch is set FIRST, so every egress gate reading
+    /// [`Self::ever_used_codex_now`] observes the mark the instant this
+    /// returns — before the actor has even dequeued the command. That
+    /// ordering is what closes the model-switch/upload race.
     pub fn mark_ever_used_codex(&self) {
+        self.ever_used_codex
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.cmd_tx.send(ChatStateCommand::MarkEverUsedCodex);
+    }
+
+    /// Synchronous, non-blocking read of the monotonic Codex-provenance latch.
+    ///
+    /// `true` means the session's content must not leave through an xAI-only
+    /// pipeline (prompt traces, xAI-hosted auxiliary helpers). Use this at
+    /// egress boundaries: it needs no `await`, so it can be re-checked
+    /// immediately before the bytes leave, and it never lags
+    /// [`Self::mark_ever_used_codex`].
+    pub fn ever_used_codex_now(&self) -> bool {
+        self.ever_used_codex
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the session has ever sampled through the Codex provider.
@@ -542,11 +583,26 @@ impl ChatStateHandle {
     /// when the actor is gone. For callers that already hold independent
     /// provenance (e.g. the spawn-time provider profile) and must not taint
     /// an unrelated session merely because this actor shut down first.
+    ///
+    /// The synchronous latch short-circuits: once marked, the answer can no
+    /// longer change, so no round-trip is needed (and a shut-down actor can
+    /// no longer downgrade a mark that already landed).
     pub async fn try_ever_used_codex(&self) -> Option<bool> {
-        self.query("GetEverUsedCodex", |reply| {
-            ChatStateCommand::GetEverUsedCodex { reply }
-        })
-        .await
+        if self.ever_used_codex_now() {
+            return Some(true);
+        }
+        let answer = self
+            .query("GetEverUsedCodex", |reply| {
+                ChatStateCommand::GetEverUsedCodex { reply }
+            })
+            .await;
+        // Republish so a mark that reached the actor by another route (e.g. a
+        // snapshot restore) is visible to the synchronous gates too.
+        if answer == Some(true) {
+            self.ever_used_codex
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        answer
     }
 
     pub async fn get_last_model_metadata(&self) -> crate::commands::ModelMetadata {

@@ -65,6 +65,51 @@ pub(crate) struct PromptTraceContext {
     pub(crate) auth_manager: std::sync::Arc<crate::auth::AuthManager>,
 }
 impl PromptTraceContext {
+    /// Whether this context has been revoked by Codex provenance landing on
+    /// the session AFTER the context was admitted.
+    ///
+    /// `MvpAgent::get_trace_context` refuses to build a context for a session
+    /// that is already marked, but a `set_session_model` switch to Codex can
+    /// land at any point afterwards — it does not take the prompt dispatch
+    /// lock. Binding the context to a snapshot of the mark would therefore
+    /// leave the final egress boundary non-atomic with provenance, so every
+    /// upload boundary re-reads the session's monotonic latch through this
+    /// instead. The read is synchronous and cannot block, so it is cheap
+    /// enough to sit immediately before the bytes leave.
+    ///
+    /// Scope note: the boundary is *enqueue*, not *flush*. Artifacts already
+    /// accepted by the upload queue when the mark lands were produced while
+    /// the session was still xAI — they are pre-Codex content by construction
+    /// — so they are left to drain. What the gate stops is every byte offered
+    /// from the mark onwards, including the turn-end set that would otherwise
+    /// carry the switching turn's own conversation.
+    pub(crate) fn codex_provenance_revoked(&self) -> bool {
+        self.session_handle.chat_state_handle.ever_used_codex_now()
+    }
+
+    /// [`Self::codex_provenance_revoked`] plus the telemetry/log the skip
+    /// needs. `true` means the caller must not upload `artifact`.
+    pub(crate) fn refuse_upload_on_codex_provenance(&self, artifact: &str) -> bool {
+        if !self.codex_provenance_revoked() {
+            return false;
+        }
+        tracing::warn!(
+            session_id = %self.session_info.id.0,
+            turn_number = self.turn_number,
+            artifact,
+            "trace upload refused: the session was marked Codex after this trace \
+             context was created; xAI-only egress is closed"
+        );
+        xai_grok_telemetry::session_ctx::log_session_event(
+            crate::agent::session_metrics::TraceUploadSkipped {
+                session_id: self.session_info.id.0.to_string(),
+                turn_number: self.turn_number,
+                reason: "codex_provenance_revoked".to_owned(),
+            },
+        );
+        true
+    }
+
     pub(crate) fn artifact_upload_context(&self) -> super::manifest::ArtifactUploadContext {
         super::manifest::ArtifactUploadContext {
             gcs_config: self.gcs_config.clone(),
@@ -182,6 +227,13 @@ pub(crate) async fn complete_prompt_trace(
     use super::manifest::{
         build_manifest, resolve_upload_method, skip_artifact, write_upload_manifest,
     };
+    // Turn-end egress. Individual artifact uploads re-check too, but stopping
+    // here also avoids the queue flush and the manifest write for a session
+    // that was marked Codex mid-turn. `Ok(false)` = nothing was durably
+    // confirmed, so `restorable_turn_number` is not advanced.
+    if ctx.refuse_upload_on_codex_provenance("complete_prompt_trace") {
+        return Ok(false);
+    }
     let upload_method = resolve_upload_method(&ctx.gcs_config);
     let method_str = upload_method.as_str();
     xai_grok_telemetry::session_ctx::log_session_event(

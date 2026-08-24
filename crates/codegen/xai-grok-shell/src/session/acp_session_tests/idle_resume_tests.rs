@@ -323,6 +323,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 recap_in_flight: std::cell::Cell::new(false),
                 recap_epoch: std::cell::Cell::new(0),
                 codex_turn_state: std::cell::RefCell::new(None),
+                codex_401_recovery_spent: std::cell::Cell::new(false),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 title_refresh_task: std::cell::RefCell::new(None),
@@ -337,6 +338,10 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
+                image_description_pin: Default::default(),
+                web_search_pin: Default::default(),
+                web_search_provider_allowed: std::cell::Cell::new(true),
+                parked_web_search_client: parking_lot::Mutex::new(None),
                 image_describe_cache: Arc::new(
                     crate::session::image_describe::ImageDescribeCache::new(),
                 ),

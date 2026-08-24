@@ -3471,3 +3471,27 @@ fn startup_hints_ever_used_codex_defaults_false_and_deserializes() {
         serde_json::from_str(r#"{"everUsedCodex":true}"#).unwrap();
     assert!(hints.ever_used_codex);
 }
+
+/// Prompt traces ride the xAI-only upload pipeline, so the child follows the
+/// same monotonic provenance gate as the main session
+/// (`MvpAgent::get_trace_context`): a Codex initial provider or an inherited
+/// parent mark (`spawn_provenance`) and a mid-run switch onto Codex
+/// (`ever_used_codex`) each block turn-0 upload; a plain xAI child still
+/// uploads.
+#[test]
+fn subagent_turn0_trace_upload_is_gated_by_codex_provenance() {
+    use crate::agent::subagent::handle_request::subagent_trace_upload_allowed;
+    assert!(
+        subagent_trace_upload_allowed(false, false),
+        "control: an xAI child still uploads its turn-0 trace"
+    );
+    assert!(
+        !subagent_trace_upload_allowed(true, false),
+        "a child spawned on Codex (or inheriting a Codex parent) uploads nothing"
+    );
+    assert!(
+        !subagent_trace_upload_allowed(false, true),
+        "a mid-run switch onto Codex blocks the upload too"
+    );
+    assert!(!subagent_trace_upload_allowed(true, true));
+}

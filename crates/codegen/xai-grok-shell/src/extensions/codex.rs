@@ -158,15 +158,19 @@ async fn handle_logout(agent: &MvpAgent) -> ExtResult {
     // instead of waiting out the callback window.
     crate::codex_auth::cancel_pending_login();
     let _op = CODEX_AUTH_OP_LOCK.lock().await;
-    match crate::codex_auth::run_cli_logout().await {
+    let result = crate::codex_auth::run_cli_logout().await;
+    // Drop the logged-out account's in-memory catalog, fence any in-flight
+    // refresh, and move the current model onto an available fallback before
+    // the catalog is re-announced. This runs on the failure path too: a
+    // logout that removed the credentials but could not persist its
+    // cross-process fence still left this process logged out, and the
+    // reconciliation is a re-read of on-disk state either way.
+    agent.models_manager.on_codex_auth_changed();
+    notify_models_updated(agent);
+    match result {
         Ok(was_logged_in) => {
             tracing::info_span!("auth.lifecycle", action = "codex_logout", success = true)
                 .in_scope(|| {});
-            // Drop the logged-out account's in-memory catalog, fence any
-            // in-flight refresh, and move the current model onto an
-            // available fallback before the catalog is re-announced.
-            agent.models_manager.on_codex_auth_changed();
-            notify_models_updated(agent);
             to_raw_response(&CodexAuthActionResponse {
                 ok: true,
                 email: None,

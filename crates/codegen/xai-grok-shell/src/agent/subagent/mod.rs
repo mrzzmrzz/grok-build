@@ -183,7 +183,13 @@ pub(crate) struct SubagentSpawnContext {
     /// cross-session memory store.
     pub memory_config: Option<crate::config::MemoryConfig>,
     /// Resolved sampling config for web_search.
+    /// Provider-ungated web-search config: the child applies the
+    /// [`crate::config::AuxModelPin`] gate below against its own effective
+    /// provider, since it may override the parent's model in either direction.
     pub web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
+    /// Provenance of the web-search model; gates the xAI search helper for a
+    /// non-xAI child (see `crate::config::AuxModelPin::allows_aux_helper`).
+    pub web_search_pin: crate::config::AuxModelPin,
     /// Resolved config for web fetch.
     pub web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
     /// Image generation config (parent-inherited).
@@ -271,6 +277,9 @@ pub(crate) struct SubagentSpawnContext {
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     pub image_description_model: String,
+    /// Provenance of `image_description_model`; gates the xAI describe helper
+    /// for a non-xAI child (see `crate::config::AuxModelPin::allows_aux_helper`).
+    pub image_description_pin: crate::config::AuxModelPin,
     /// Dual-mode workspace operations handle.
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     pub auth_manager: std::sync::Arc<crate::auth::AuthManager>,

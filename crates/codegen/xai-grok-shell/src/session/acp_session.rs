@@ -105,7 +105,8 @@ use tool_layer_images::*;
 #[path = "acp_session_impl/auth_retry.rs"]
 mod auth_retry;
 pub(crate) use auth_retry::{
-    AuthRetryDecision, AuthRetrySchedule, human_duration, pace_uncharged_resubmit,
+    AuthRetryDecision, AuthRetrySchedule, claim_codex_401_recovery, human_duration,
+    pace_uncharged_resubmit,
 };
 #[path = "acp_session_impl/rate_limit_waits.rs"]
 mod rate_limit_waits;
@@ -1065,6 +1066,13 @@ pub(crate) struct SessionActor {
     /// prompts (subagent sessions) each keep an independent binding.
     /// Lifecycle rules live in [`crate::session::turn_affinity`].
     pub(crate) codex_turn_state: std::cell::RefCell<Option<String>>,
+    /// Whether this logical prompt has already spent its single Codex 401
+    /// recovery (one forced OAuth refresh plus the one replay it buys). Every
+    /// later 401 of the same prompt is terminal, so a permanently rejected
+    /// credential can never loop refresh traffic. Claimed through
+    /// [`claim_codex_401_recovery`] and cleared where the prompt's
+    /// [`AuthRetrySchedule`] is created.
+    pub(crate) codex_401_recovery_spent: std::cell::Cell<bool>,
     /// The in-flight turn-summary side-call, if any. A newer completion (or a
     /// real prompt / rewind / cancel / shutdown) aborts it — its result would
     /// describe an older turn — and a completion respawns; see
@@ -1171,6 +1179,33 @@ pub(crate) struct SessionActor {
     /// Resolved vision model ID for auxiliary image processing.
     /// Populated from `Config.image_description_model` at spawn.
     pub(crate) image_description_model: String,
+    /// Provenance of [`Self::image_description_model`], populated from
+    /// `Config.image_description_pin` at spawn. A non-xAI session may only
+    /// route its images to this xAI helper when the pin is explicit
+    /// (`AuxModelPin::is_explicit`); see `resolve_image_describe_sampler_config`.
+    pub(crate) image_description_pin: crate::config::AuxModelPin,
+    /// Provenance of the session's `web_search` helper model, populated from
+    /// `Config.web_search_pin` at spawn (a subagent inherits its parent's).
+    ///
+    /// The helper's endpoint/key were baked into
+    /// `rebuild_spec.web_search_config` from whichever provider was active at
+    /// spawn, so the pin — not that snapshot — is what decides availability
+    /// after a model switch; see
+    /// [`SessionActor::apply_web_search_provider_gate`].
+    pub(crate) web_search_pin: crate::config::AuxModelPin,
+    /// Whether the effective provider currently permits the xAI-hosted
+    /// `web_search` helper. Seeded from the spawn provider and recomputed on
+    /// every model switch. `false` hides the tool from every request AND
+    /// removes its client from the toolset, so a call already in flight
+    /// cannot dispatch either.
+    pub(crate) web_search_provider_allowed: std::cell::Cell<bool>,
+    /// The `WebSearchClient` parked while the gate above is closed, so
+    /// switching back to a permitted provider restores the exact client
+    /// (attribution hook and cached HTTP client included) instead of
+    /// rebuilding a divergent one.
+    pub(crate) parked_web_search_client: parking_lot::Mutex<
+        Option<xai_grok_tools::implementations::web_search::client::WebSearchClient>,
+    >,
     /// Cache auxiliary image outputs by content and prompt fingerprint.
     pub(crate) image_describe_cache: Arc<crate::session::image_describe::ImageDescribeCache>,
     /// Per-subagent token state keyed by `subagent_id`; sums into
@@ -1541,6 +1576,9 @@ mod support;
 #[cfg(test)]
 #[path = "acp_session_tests/usage_categories_tests.rs"]
 mod usage_categories_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/web_search_provider_gate_tests.rs"]
+mod web_search_provider_gate_tests;
 #[cfg(test)]
 mod managed_gateway_descriptor_tests {
     use super::*;

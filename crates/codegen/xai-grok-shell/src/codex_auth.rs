@@ -412,10 +412,14 @@ fn logout_generation() -> u64 {
 /// device wait begins: the in-process generation and the on-disk epoch
 /// (which survives across processes, so a logout completed by a separate
 /// CLI/TUI process still fences this login's late callback).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `disk_epoch` is a [`DiskLogoutEpoch`], not a plain `u64`: an unreadable
+/// tombstone is NOT the same as "no logout has ever happened", and collapsing
+/// the two is what made the fence fail open.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LoginFence {
     generation: u64,
-    disk_epoch: u64,
+    disk_epoch: DiskLogoutEpoch,
 }
 
 fn capture_login_fence(path: &Path) -> LoginFence {
@@ -436,32 +440,84 @@ fn logout_epoch_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.logout-epoch"))
 }
 
-/// The persisted logout epoch for the auth store at `path`; `0` when no
-/// logout has ever been recorded (or the tombstone is unreadable).
-fn read_disk_logout_epoch(path: &Path) -> u64 {
-    std::fs::read_to_string(logout_epoch_path(path))
-        .ok()
-        .and_then(|contents| contents.trim().parse().ok())
-        .unwrap_or(0)
+/// The three distinguishable states of the persisted logout tombstone.
+///
+/// The cross-process half of the logout fence is only as strong as this read.
+/// "No tombstone at all" is the legitimate first-use state and means epoch 0;
+/// "a tombstone exists but we cannot read a number out of it" (a directory in
+/// its place, a truncated/garbage write, an I/O or permission error) means the
+/// user's latest logout intent is **unknown**, and every consumer must fail
+/// closed rather than assume 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiskLogoutEpoch {
+    /// No logout has ever been recorded for this auth store: epoch 0.
+    Absent,
+    /// A tombstone was read and parsed.
+    Recorded(u64),
+    /// A tombstone exists but its value could not be determined. Carries a
+    /// short, user-facing reason for the actionable error.
+    Unreadable(String),
+}
+
+impl DiskLogoutEpoch {
+    /// The comparable epoch value, or `Err(reason)` when the tombstone is
+    /// unreadable and no honest comparison is possible.
+    fn value(&self) -> Result<u64, &str> {
+        match self {
+            Self::Absent => Ok(0),
+            Self::Recorded(epoch) => Ok(*epoch),
+            Self::Unreadable(reason) => Err(reason.as_str()),
+        }
+    }
+}
+
+/// Read the persisted logout epoch for the auth store at `path`, keeping
+/// "never written" distinct from "cannot be read" — see [`DiskLogoutEpoch`].
+fn read_disk_logout_epoch(path: &Path) -> DiskLogoutEpoch {
+    let epoch_path = logout_epoch_path(path);
+    match std::fs::read_to_string(&epoch_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DiskLogoutEpoch::Absent,
+        // Anything else — a directory in its place, EACCES, a bad device —
+        // leaves the latest logout intent unknown.
+        Err(error) => DiskLogoutEpoch::Unreadable(format!("could not be read ({error})")),
+        Ok(contents) => match contents.trim().parse::<u64>() {
+            Ok(epoch) => DiskLogoutEpoch::Recorded(epoch),
+            // Includes the empty/truncated file left by a torn write.
+            Err(error) => DiskLogoutEpoch::Unreadable(format!("is corrupt ({error})")),
+        },
+    }
 }
 
 /// Advance the persisted logout epoch. The caller MUST hold the auth file
 /// lock, so the bump is atomic with the credential removal it records.
-/// Best-effort: a failed write degrades cross-process fencing but never
-/// blocks the logout itself (the in-process generation still advanced).
-fn bump_disk_logout_epoch(path: &Path) {
-    let next = read_disk_logout_epoch(path).saturating_add(1);
+///
+/// Fails when the cross-process fence cannot be established — either the
+/// existing tombstone is unreadable (so the next value is unknowable) or the
+/// write itself failed. The caller reports that to the user instead of
+/// claiming a logout that another process can still race.
+fn bump_disk_logout_epoch(path: &Path) -> Result<()> {
     let epoch_path = logout_epoch_path(path);
+    let current = read_disk_logout_epoch(path);
+    let next = match current.value() {
+        Ok(epoch) => epoch.saturating_add(1),
+        Err(reason) => {
+            bail!(
+                "the Codex logout tombstone at {} {reason}; the cross-process logout \
+                 fence could not be advanced. Remove that path and run logout again.",
+                epoch_path.display()
+            );
+        }
+    };
     if let Some(parent) = epoch_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(error) = std::fs::write(&epoch_path, next.to_string()) {
-        tracing::warn!(
-            %error,
-            path = %epoch_path.display(),
-            "could not persist the Codex logout epoch; cross-process login fencing is degraded"
-        );
-    }
+    std::fs::write(&epoch_path, next.to_string()).with_context(|| {
+        format!(
+            "could not persist the Codex logout epoch to {}; the cross-process logout \
+             fence was not established",
+            epoch_path.display()
+        )
+    })
 }
 
 /// Registered cancellable login attempts: the flow actively waiting on its
@@ -879,6 +935,10 @@ async fn exchange_code(
 /// on-disk epoch re-read here under the lock. A moved fence means the user's
 /// latest completed intent is "logged out": the finished browser callback is
 /// discarded instead of resurrecting credentials.
+///
+/// Fails **closed** on an unreadable tombstone at either end (capture or
+/// re-read): if the latest cross-process logout intent cannot be determined,
+/// persisting would be exactly the resurrection this fence exists to prevent.
 fn persist_token_response_fenced(
     path: &Path,
     response: TokenResponse,
@@ -890,7 +950,24 @@ fn persist_token_response_fenced(
              discarding the completed login"
         );
     }
-    if read_disk_logout_epoch(path) != logout_fence.disk_epoch {
+    let epoch_path = logout_epoch_path(path);
+    let captured = logout_fence.disk_epoch.value().map_err(|reason| {
+        anyhow::anyhow!(
+            "the Codex logout tombstone at {} {reason}, so a logout completed by \
+             another process cannot be ruled out; discarding the completed login. \
+             Remove that path and log in again.",
+            epoch_path.display()
+        )
+    })?;
+    let current = read_disk_logout_epoch(path).value().map_err(|reason| {
+        anyhow::anyhow!(
+            "the Codex logout tombstone at {} {reason}, so a logout completed by \
+             another process cannot be ruled out; discarding the completed login. \
+             Remove that path and log in again.",
+            epoch_path.display()
+        )
+    })?;
+    if current != captured {
         bail!(
             "Codex login was superseded by a logout completed by another process; \
              discarding the completed login"
@@ -1305,7 +1382,17 @@ async fn logout_at(path: &Path, endpoints: &CodexEndpoints) -> Result<bool> {
     // epoch beside the auth file fences logins running in OTHER processes,
     // whose statics cannot see this bump.
     LOGOUT_GENERATION.fetch_add(1, Ordering::AcqRel);
-    bump_disk_logout_epoch(path);
+    // The local credentials are already gone and this process is fenced, but
+    // a failed tombstone bump means a concurrent login in ANOTHER process is
+    // not. That is a durability failure of the user's latest intent, so it is
+    // reported rather than swallowed — the caller surfaces the message and the
+    // remedy. (Reads fail closed too, so an unreadable tombstone still blocks
+    // stale persists; this error is what tells the user to repair it.)
+    bump_disk_logout_epoch(path).context(
+        "Codex credentials were removed locally, but the cross-process logout fence \
+         could not be established: a login already in flight in another process may \
+         still be able to write new credentials",
+    )?;
     Ok(removed)
 }
 
@@ -2114,7 +2201,7 @@ mod tests {
             "logout must advance the fence"
         );
         assert!(
-            read_disk_logout_epoch(&path) > fence.disk_epoch,
+            read_disk_logout_epoch(&path).value().unwrap() > fence.disk_epoch.value().unwrap(),
             "logout must advance the persisted epoch"
         );
         // The stale callback now completes and tries to persist under the
@@ -2125,7 +2212,7 @@ mod tests {
             refresh_token: "ref".to_owned(),
         };
         let _lock = acquire_auth_lock(&path).unwrap();
-        let error = persist_token_response_fenced(&path, response, fence).unwrap_err();
+        let error = persist_token_response_fenced(&path, response, fence.clone()).unwrap_err();
         assert!(
             error.to_string().contains("superseded by a logout"),
             "{error}"
@@ -2150,7 +2237,7 @@ mod tests {
         // concurrently; retry until the capture-persist pair was atomic.
         let credentials = loop {
             let fence = capture_login_fence(&path);
-            match persist_token_response_fenced(&path, make_response(), fence) {
+            match persist_token_response_fenced(&path, make_response(), fence.clone()) {
                 Ok(credentials) => break credentials,
                 Err(_) if logout_generation() != fence.generation => continue,
                 Err(error) => panic!("unexpected persist failure: {error}"),
@@ -2252,11 +2339,13 @@ mod tests {
         let error = loop {
             let stale_cross_process_fence = LoginFence {
                 generation: logout_generation(),
-                disk_epoch: process1_fence.disk_epoch,
+                disk_epoch: process1_fence.disk_epoch.clone(),
             };
-            let error = persist_token_response_fenced(&path, make_response(), stale_cross_process_fence)
-                .unwrap_err();
-            if logout_generation() == stale_cross_process_fence.generation {
+            let stamped_generation = stale_cross_process_fence.generation;
+            let error =
+                persist_token_response_fenced(&path, make_response(), stale_cross_process_fence)
+                    .unwrap_err();
+            if logout_generation() == stamped_generation {
                 break error;
             }
         };
@@ -2268,5 +2357,149 @@ mod tests {
             !path.exists(),
             "the other process's logout must remain the final credential state"
         );
+    }
+
+    /// The three tombstone states are distinguishable: absent is the
+    /// legitimate epoch 0, a parsed number is itself, and anything else is
+    /// `Unreadable` — never silently 0.
+    #[test]
+    fn disk_logout_epoch_distinguishes_absent_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let epoch_path = logout_epoch_path(&path);
+        assert_eq!(read_disk_logout_epoch(&path), DiskLogoutEpoch::Absent);
+        assert_eq!(read_disk_logout_epoch(&path).value(), Ok(0));
+
+        std::fs::write(&epoch_path, "7").unwrap();
+        assert_eq!(read_disk_logout_epoch(&path), DiskLogoutEpoch::Recorded(7));
+
+        // Corrupt contents (garbage and the empty file a torn write leaves).
+        for contents in ["not-a-number", ""] {
+            std::fs::write(&epoch_path, contents).unwrap();
+            let read = read_disk_logout_epoch(&path);
+            assert!(
+                matches!(read, DiskLogoutEpoch::Unreadable(_)),
+                "{contents:?} must not read as epoch 0: {read:?}"
+            );
+            assert!(read.value().is_err());
+        }
+
+        // A directory in the tombstone's place: the review's deterministic
+        // repro. It must be unreadable, NOT zero.
+        std::fs::remove_file(&epoch_path).unwrap();
+        std::fs::create_dir(&epoch_path).unwrap();
+        let read = read_disk_logout_epoch(&path);
+        assert!(
+            matches!(read, DiskLogoutEpoch::Unreadable(_)),
+            "a directory tombstone must not read as epoch 0: {read:?}"
+        );
+    }
+
+    /// Deterministic fail-open repro, now closed: with a DIRECTORY in the
+    /// tombstone's place the epoch cannot be written, so `logout_at` reports
+    /// the failure (credentials are still removed) and a stale login's persist
+    /// is refused instead of resurrecting credentials.
+    #[tokio::test]
+    async fn directory_tombstone_fails_logout_closed_and_blocks_stale_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        std::fs::create_dir(logout_epoch_path(&path)).unwrap();
+        // A login flow captured its fence before the browser wait.
+        let fence = capture_login_fence(&path);
+        assert!(
+            matches!(fence.disk_epoch, DiskLogoutEpoch::Unreadable(_)),
+            "the directory tombstone must not capture as epoch 0"
+        );
+        // Seed credentials so the logout has something to remove.
+        std::fs::write(&path, "{}").unwrap();
+
+        let error = logout_at(&path, &endpoints("http://127.0.0.1:9"))
+            .await
+            .expect_err("an unpersistable logout epoch must be reported");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("cross-process logout fence"),
+            "the error must name the fence that was not established: {rendered}"
+        );
+        assert!(
+            !path.exists(),
+            "logout still removes the local credentials before reporting"
+        );
+
+        // The stale callback lands: the unreadable tombstone means a logout by
+        // another process cannot be ruled out, so the persist fails closed.
+        // Re-stamp the CURRENT process generation (the cross-process model —
+        // another process's static is invisible here) so the refusal is
+        // attributable to the tombstone alone.
+        let make_response = || TokenResponse {
+            id_token: jwt(serde_json::json!({ "email": "a@example.com" })),
+            access_token: "acc".to_owned(),
+            refresh_token: "ref".to_owned(),
+        };
+        let _lock = acquire_auth_lock(&path).unwrap();
+        let cross_process_fence = LoginFence {
+            generation: logout_generation(),
+            disk_epoch: fence.disk_epoch,
+        };
+        let error = persist_token_response_fenced(&path, make_response(), cross_process_fence)
+            .expect_err("an unreadable tombstone must refuse the persist");
+        assert!(
+            format!("{error:#}").contains("logout tombstone"),
+            "{error:#}"
+        );
+        assert!(
+            !path.exists(),
+            "the logout must remain the final credential state"
+        );
+    }
+
+    /// The same fail-closed rule for a corrupt (unparseable) tombstone, and
+    /// for corruption that appears only AFTER the fence was captured cleanly.
+    #[test]
+    fn corrupt_tombstone_refuses_stale_login_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        let make_response = || TokenResponse {
+            id_token: jwt(serde_json::json!({ "email": "a@example.com" })),
+            access_token: "acc".to_owned(),
+            refresh_token: "ref".to_owned(),
+        };
+        // Corrupt at capture time.
+        std::fs::write(logout_epoch_path(&path), "garbage").unwrap();
+        let fence = capture_login_fence(&path);
+        let error = persist_token_response_fenced(&path, make_response(), fence)
+            .expect_err("a corrupt tombstone must refuse the persist");
+        assert!(format!("{error:#}").contains("is corrupt"), "{error:#}");
+        assert!(!path.exists());
+
+        // Clean at capture time, corrupted before the callback lands (a torn
+        // write from a concurrent logout): still refused.
+        std::fs::write(logout_epoch_path(&path), "3").unwrap();
+        let fence = capture_login_fence(&path);
+        assert_eq!(fence.disk_epoch, DiskLogoutEpoch::Recorded(3));
+        std::fs::write(logout_epoch_path(&path), "").unwrap();
+        let error = persist_token_response_fenced(&path, make_response(), fence)
+            .expect_err("a tombstone corrupted mid-flight must refuse the persist");
+        assert!(
+            format!("{error:#}").contains("logout tombstone"),
+            "{error:#}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// A healthy tombstone still bumps monotonically and reports success.
+    #[test]
+    fn bump_disk_logout_epoch_advances_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CODEX_AUTH_FILE_NAME);
+        bump_disk_logout_epoch(&path).expect("first bump writes the tombstone");
+        assert_eq!(read_disk_logout_epoch(&path), DiskLogoutEpoch::Recorded(1));
+        bump_disk_logout_epoch(&path).expect("second bump advances");
+        assert_eq!(read_disk_logout_epoch(&path), DiskLogoutEpoch::Recorded(2));
+        // An unreadable tombstone has no knowable successor: fail, do not
+        // reset the fence to 1 and silently move it backwards.
+        std::fs::write(logout_epoch_path(&path), "corrupt").unwrap();
+        let error = bump_disk_logout_epoch(&path).expect_err("corrupt tombstone must fail");
+        assert!(format!("{error:#}").contains("is corrupt"), "{error:#}");
     }
 }
