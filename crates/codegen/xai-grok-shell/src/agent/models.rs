@@ -65,11 +65,9 @@ pub(crate) enum CacheAuthMethod {
 pub(crate) fn task_model_error_for_catalog(
     requested: &str,
     available: &IndexMap<String, ModelEntry>,
-    is_session_auth: bool,
+    auth: config::AuthVisibility,
 ) -> Option<String> {
-    let is_available = |entry: &ModelEntry| {
-        entry.info.user_selectable && entry.info.visible_for_auth(is_session_auth)
-    };
+    let is_available = |entry: &ModelEntry| entry.info.user_selectable && entry.visible_for(auth);
     if config::find_model_by_id(available, requested).is_some_and(&is_available) {
         return None;
     }
@@ -110,6 +108,9 @@ enum CatalogProgress {
 #[derive(Default)]
 struct CatalogState {
     prefetched: Option<IndexMap<String, ModelEntry>>,
+    /// Live Codex catalog entries (already mapped), folded into `models` by
+    /// every resolve; scoped to the Codex account, not the xAI identity.
+    codex_models: Option<IndexMap<String, ModelEntry>>,
     models: IndexMap<String, ModelEntry>,
     etag: Option<String>,
     /// Gates whether the apply path reselects the default (first real catalog)
@@ -131,10 +132,14 @@ struct Inner {
     gateway: RwLock<Option<xai_acp_lib::AcpAgentGatewaySender>>,
     cache: ModelsCacheManager,
     endpoint: Arc<dyn ModelsEndpoint>,
+    /// Probe for a Codex OAuth login; production reads the credential file.
+    codex_login: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Guard to prevent overlapping retry loops.
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
     refresh_in_flight: AtomicBool,
+    /// Single-flight for the background Codex catalog revalidation.
+    codex_refresh_in_flight: AtomicBool,
     fetches_in_flight: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
@@ -156,6 +161,28 @@ struct RefreshInFlightGuard(Arc<Inner>);
 impl Drop for RefreshInFlightGuard {
     fn drop(&mut self) {
         self.0.refresh_in_flight.store(false, Ordering::Release);
+    }
+}
+struct CodexRefreshInFlightGuard(Arc<Inner>);
+impl Drop for CodexRefreshInFlightGuard {
+    fn drop(&mut self) {
+        self.0
+            .codex_refresh_in_flight
+            .store(false, Ordering::Release);
+    }
+}
+
+/// Codex login probe used by production visibility snapshots. The test build
+/// returns `false` so unit tests never consult the developer's real
+/// credential file; tests inject the flag via `ModelsManagerBuilder`.
+fn default_codex_login_probe() -> bool {
+    #[cfg(not(test))]
+    {
+        crate::codex_auth::is_logged_in()
+    }
+    #[cfg(test)]
+    {
+        false
     }
 }
 
@@ -229,6 +256,7 @@ pub(crate) struct ModelsManagerBuilder {
     cfg: config::Config,
     endpoint: Arc<dyn ModelsEndpoint>,
     cache: ModelsCacheManager,
+    codex_login: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl ModelsManagerBuilder {
@@ -247,6 +275,7 @@ impl ModelsManagerBuilder {
             cfg,
             endpoint: Arc::new(HttpModelsEndpoint),
             cache: ModelsCacheManager::new(),
+            codex_login: Arc::new(default_codex_login_probe),
         }
     }
 
@@ -259,6 +288,12 @@ impl ModelsManagerBuilder {
     #[cfg(test)]
     pub(crate) fn cache(mut self, cache: ModelsCacheManager) -> Self {
         self.cache = cache;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn codex_login(mut self, probe: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.codex_login = probe;
         self
     }
 
@@ -281,8 +316,10 @@ impl ModelsManagerBuilder {
                 gateway: RwLock::new(None),
                 cache: self.cache,
                 endpoint: self.endpoint,
+                codex_login: self.codex_login,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
+                codex_refresh_in_flight: AtomicBool::new(false),
                 fetches_in_flight: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
@@ -320,9 +357,12 @@ impl ModelsManager {
         auth_manager: Arc<AuthManager>,
     ) -> Result<Self, String> {
         let has_session = auth_manager.current_or_expired().is_some();
-        let is_session_auth = auth_manager
-            .current_or_expired()
-            .is_some_and(|a| a.is_session_auth());
+        let auth_visibility = config::AuthVisibility::new(
+            auth_manager
+                .current_or_expired()
+                .is_some_and(|a| a.is_session_auth()),
+            default_codex_login_probe(),
+        );
         let fetch_auth = ModelFetchAuth::resolve(&cfg.endpoints, has_session);
         let mut cached_etag = None;
         let prefetched_models = prefetched_models.or_else(|| {
@@ -345,7 +385,7 @@ impl ModelsManager {
         }
 
         let (current_model_key, current_model, model_source) =
-            resolve_default_model(cfg, &catalog, is_session_auth);
+            resolve_default_model(cfg, &catalog, auth_visibility);
 
         tracing::info!(
             model_id = %current_model.model,
@@ -384,8 +424,12 @@ impl ModelsManager {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
         }
-        let prefetched = self.inner.catalog.read().prefetched.clone();
-        let new_catalog = resolve_model_catalog(&new_config, prefetched);
+        let (prefetched, codex_models) = {
+            let cat = self.inner.catalog.read();
+            (cat.prefetched.clone(), cat.codex_models.clone())
+        };
+        let new_catalog =
+            resolve_model_catalog_with_codex(&new_config, prefetched, codex_models.as_ref());
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
         if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
@@ -476,6 +520,12 @@ impl ModelsManager {
             .is_some_and(|a| a.is_session_auth())
     }
 
+    /// One snapshot of both auth facts the visibility filters consume, taken
+    /// at the manager boundary so the filters themselves stay pure.
+    fn auth_visibility(&self) -> config::AuthVisibility {
+        config::AuthVisibility::new(self.is_session_auth(), (self.inner.codex_login)())
+    }
+
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
         let snapshot = {
@@ -489,14 +539,14 @@ impl ModelsManager {
             .filter(|(_, e)| e.info.user_selectable)
             .collect();
 
-        available_models(&selectable, self.is_session_auth())
+        available_models(&selectable, self.auth_visibility())
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
-        let is_session_auth = self.is_session_auth();
+        let auth = self.auth_visibility();
         let cat = self.inner.catalog.read();
         let models = &cat.models;
-        task_model_error_for_catalog(requested, models, is_session_auth)
+        task_model_error_for_catalog(requested, models, auth)
     }
 
     pub fn current_model_id(&self) -> acp::ModelId {
@@ -679,7 +729,9 @@ impl ModelsManager {
     // ── Mutations ───────────────────────────────────────────────────
 
     fn rebuild(&self, cfg: &config::Config, prefetched: Option<IndexMap<String, ModelEntry>>) {
-        self.inner.catalog.write().models = resolve_model_catalog(cfg, prefetched);
+        let mut cat = self.inner.catalog.write();
+        let codex_models = cat.codex_models.clone();
+        cat.models = resolve_model_catalog_with_codex(cfg, prefetched, codex_models.as_ref());
     }
 
     /// Reset to this identity's bundled catalog and reselect a valid default.
@@ -923,6 +975,7 @@ impl ModelsManager {
 
     /// One-shot background catalog refresh after readiness; no-op when a fresh disk cache already loaded a real catalog.
     pub fn spawn_background_refresh(&self) {
+        self.spawn_codex_catalog_refresh();
         self.spawn_background_refresh_inner(crate::util::config::resolve_remote_fetch_enabled());
     }
 
@@ -934,6 +987,101 @@ impl ModelsManager {
             return;
         }
         self.spawn_catalog_retry(remote_fetch_enabled);
+    }
+
+    // ── Live Codex catalog (stale-while-revalidate) ─────────────────
+
+    /// Cached-first Codex catalog load: publish the fresh account-matched
+    /// disk cache immediately (zero network), then revalidate through the
+    /// live endpoint in the background. No-op without a Codex login.
+    fn spawn_codex_catalog_refresh(&self) {
+        if !(self.inner.codex_login)() {
+            return;
+        }
+        let client = crate::codex_models::CodexModelsClient::new();
+        self.publish_codex_cached_catalog(&client);
+        if !crate::util::config::resolve_remote_fetch_enabled() {
+            tracing::debug!("Codex catalog revalidation skipped: remote_fetch disabled");
+            return;
+        }
+        if self
+            .inner
+            .codex_refresh_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            tracing::debug!("Codex catalog refresh already in flight, skipping");
+            return;
+        }
+        let mgr = self.clone();
+        tokio::task::spawn(async move {
+            let _guard = CodexRefreshInFlightGuard(mgr.inner.clone());
+            mgr.revalidate_codex_catalog(&client).await;
+        });
+    }
+
+    /// Startup half of stale-while-revalidate: only a fresh, account-matched
+    /// cache is served; anything else waits for the background revalidation.
+    fn publish_codex_cached_catalog(&self, client: &crate::codex_models::CodexModelsClient) {
+        if let Some(catalog) = client.load_fresh_cache() {
+            self.publish_codex_catalog(client, catalog);
+        }
+    }
+
+    /// Background half: serve-or-fetch through the provider-isolated client
+    /// (ETag revalidation and the 401 refresh-once retry live there).
+    async fn revalidate_codex_catalog(&self, client: &crate::codex_models::CodexModelsClient) {
+        match client.load_fresh_or_fetch().await {
+            Ok(Some(catalog)) => self.publish_codex_catalog(client, catalog),
+            Ok(None) => tracing::debug!("Codex catalog refresh skipped: no Codex login"),
+            Err(error) => tracing::warn!(%error, "Codex catalog refresh failed"),
+        }
+    }
+
+    /// Re-check the account fingerprint at publish time, map the catalog into
+    /// manager entries, and republish when anything changed.
+    fn publish_codex_catalog(
+        &self,
+        client: &crate::codex_models::CodexModelsClient,
+        catalog: crate::codex_models::CodexModelsCatalog,
+    ) {
+        if !client.catalog_matches_current_account(&catalog) {
+            tracing::info!("discarding Codex catalog fetched for a different account");
+            client.invalidate_cache();
+            return;
+        }
+        self.set_codex_models(codex_catalog_entries(&catalog));
+    }
+
+    /// Store mapped live Codex entries and rebuild the published catalog.
+    /// Unchanged content is a no-op so cached-first plus revalidation does
+    /// not double-notify clients.
+    fn set_codex_models(&self, entries: IndexMap<String, ModelEntry>) {
+        let cfg = self.inner.cfg.read().clone();
+        let changed = {
+            let mut cat = self.inner.catalog.write();
+            let same_content = cat.codex_models.as_ref().is_some_and(|current| {
+                serde_json::to_string(current).ok() == serde_json::to_string(&entries).ok()
+            });
+            if same_content {
+                false
+            } else {
+                let count = entries.len();
+                cat.codex_models = Some(entries);
+                let codex_models = cat.codex_models.clone();
+                cat.models = resolve_model_catalog_with_codex(
+                    &cfg,
+                    cat.prefetched.clone(),
+                    codex_models.as_ref(),
+                );
+                tracing::info!(count, "live Codex catalog merged into model manager");
+                true
+            }
+        };
+        if changed {
+            self.reselect_current_model_if_missing(&cfg);
+            self.notify_models_updated();
+        }
     }
 
     /// Refresh the model catalog on every auth token refresh.
@@ -1001,8 +1149,14 @@ impl ModelsManager {
         {
             let mut cat = self.inner.catalog.write();
             let generation = cat.generation + 1;
+            // The Codex catalog is scoped to the Codex account (fingerprint
+            // checked before every publish), not the xAI identity being
+            // cleared here; a Codex logout hides its entries via the
+            // login-gated visibility filter instead.
+            let codex_models = cat.codex_models.take();
             *cat = CatalogState::default();
             cat.generation = generation;
+            cat.codex_models = codex_models;
             self.inner
                 .catalog_progress
                 .send_replace(CatalogProgress::Pending);
@@ -1222,7 +1376,12 @@ impl ModelsManager {
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
             cat.prefetched = Some(models);
-            cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
+            let codex_models = cat.codex_models.clone();
+            cat.models = resolve_model_catalog_with_codex(
+                cfg,
+                cat.prefetched.clone(),
+                codex_models.as_ref(),
+            );
             cat.etag = new_etag;
             cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
             // In the lock: the flag and its mirror can't desync vs `clear()`.
@@ -1301,14 +1460,14 @@ impl ModelsManager {
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
         let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
+        let auth = self.auth_visibility();
         let needs_reselection = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             match models.get(current.0.as_ref()) {
                 None => true,
                 Some(entry) => {
-                    !entry.info.user_selectable
-                        || (!user_selected && !entry.info.visible_for_auth(self.is_session_auth()))
+                    !entry.info.user_selectable || (!user_selected && !entry.visible_for(auth))
                 }
             }
         };
@@ -1318,7 +1477,7 @@ impl ModelsManager {
         let (key, _, source) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            resolve_default_model(config, models, auth)
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         tracing::info!(
@@ -1330,10 +1489,11 @@ impl ModelsManager {
 
     /// Re-resolve the default model against the current catalog.
     fn reselect_default_model(&self, config: &config::Config) {
+        let auth = self.auth_visibility();
         let (key, _, source) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
-            resolve_default_model(config, models, self.is_session_auth())
+            resolve_default_model(config, models, auth)
         };
         let new_id = acp::ModelId::new(Arc::from(key));
         let current = self.inner.current_model_id.read().clone();
@@ -1348,11 +1508,13 @@ impl ModelsManager {
 }
 
 mod cache;
+mod codex;
 mod endpoint;
 mod fetch;
 mod resolution;
 
 pub(crate) use cache::*;
+pub(crate) use codex::*;
 pub(crate) use endpoint::*;
 pub(crate) use fetch::*;
 pub use fetch::{

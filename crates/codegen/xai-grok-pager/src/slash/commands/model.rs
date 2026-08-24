@@ -235,7 +235,7 @@ fn build_model_items(models: &ModelState) -> Vec<ArgItem> {
             match_text: format!(
                 "{} {} {}",
                 info.name,
-                id.0,
+                id,
                 model_provider_label(info).unwrap_or_default()
             ),
             insert_text,

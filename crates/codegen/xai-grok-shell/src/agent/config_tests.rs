@@ -2532,7 +2532,7 @@ fn hidden_model_excluded_from_acp_but_kept_in_catalog() {
     .unwrap();
     let cfg = Config::new_from_toml_cfg(&raw_config).unwrap();
     let catalog = resolve_model_catalog(&cfg, None);
-    let available = available_models(&catalog, true);
+    let available = available_models(&catalog, AuthVisibility::new(true, false));
     assert!(
         catalog.contains_key("visible-model"),
         "visible model missing from catalog"
@@ -2582,7 +2582,7 @@ fn hidden_models_kept_in_catalog_but_not_in_acp() {
     )
     .unwrap();
     let catalog = resolve_model_catalog(&Config::new_from_toml_cfg(&raw).unwrap(), None);
-    let available = available_models(&catalog, true);
+    let available = available_models(&catalog, AuthVisibility::new(true, false));
     assert!(catalog.contains_key("to-hide"));
     assert!(catalog["to-hide"].info.hidden);
     assert!(!available.values().any(|m| m.name == "to-hide"));
@@ -2682,16 +2682,117 @@ fn supported_in_api_false_hides_from_api_key_users() {
     let catalog = resolve_model_catalog(&cfg, None);
     assert!(catalog.contains_key("oauth-only-model"));
     assert!(catalog.contains_key("public-model"));
-    let api_available = available_models(&catalog, false);
+    let api_available = available_models(&catalog, AuthVisibility::new(false, false));
     assert!(!api_available.values().any(|m| m.name == "oauth-only-model"));
     assert!(api_available.values().any(|m| m.name == "public-model"));
-    let oauth_available = available_models(&catalog, true);
+    let oauth_available = available_models(&catalog, AuthVisibility::new(true, false));
     assert!(
         oauth_available
             .values()
             .any(|m| m.name == "oauth-only-model")
     );
     assert!(oauth_available.values().any(|m| m.name == "public-model"));
+}
+#[test]
+fn codex_entry_visibility_is_gated_on_codex_login_not_xai_auth() {
+    use crate::agent::models::resolve_model_catalog;
+    let catalog = resolve_model_catalog(&Config::default(), None);
+    let codex = catalog
+        .get("gpt-5.6-sol")
+        .expect("bundled Codex fallback entry");
+    assert_eq!(codex.info().provider(), ModelProvider::Codex);
+
+    // No Codex login: invisible regardless of the xAI auth mode.
+    assert!(!codex.visible_for(AuthVisibility::new(false, false)));
+    assert!(
+        !codex.visible_for(AuthVisibility::new(true, false)),
+        "xAI OAuth must not unlock a Codex model"
+    );
+    // Codex OAuth login: visible without any xAI credential.
+    assert!(codex.visible_for(AuthVisibility::new(false, true)));
+
+    // An explicit static credential also makes it visible without OAuth.
+    let mut with_key = codex.clone();
+    with_key.api_key = Some("sk-explicit".to_owned());
+    assert!(with_key.visible_for(AuthVisibility::new(false, false)));
+
+    // `hidden` still wins over a Codex login.
+    let mut hidden = codex.clone();
+    hidden.info.hidden = true;
+    assert!(!hidden.visible_for(AuthVisibility::new(true, true)));
+
+    // xAI entries keep the exact `visible_for_auth` semantics.
+    let xai = catalog.get("grok-4.6").expect("bundled xAI entry");
+    for is_session_auth in [false, true] {
+        for codex_logged_in in [false, true] {
+            assert_eq!(
+                xai.visible_for(AuthVisibility::new(is_session_auth, codex_logged_in)),
+                xai.info().visible_for_auth(is_session_auth),
+                "a Codex login must not change xAI visibility"
+            );
+        }
+    }
+}
+#[test]
+fn available_models_lists_codex_entry_only_when_logged_in() {
+    use crate::agent::models::{available_models, resolve_model_catalog};
+    let catalog = resolve_model_catalog(&Config::default(), None);
+
+    let logged_out = available_models(&catalog, AuthVisibility::new(true, false));
+    assert!(
+        !logged_out.keys().any(|id| id.0.as_ref() == "gpt-5.6-sol"),
+        "Codex fallback must stay hidden without a Codex login"
+    );
+
+    let logged_in = available_models(&catalog, AuthVisibility::new(false, true));
+    let codex = logged_in
+        .iter()
+        .find(|(id, _)| id.0.as_ref() == "gpt-5.6-sol")
+        .map(|(_, info)| info)
+        .expect("Codex fallback must be listed after `grok login --codex`");
+    assert_eq!(
+        codex
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("provider"))
+            .and_then(serde_json::Value::as_str),
+        Some("codex"),
+        "picker provider label needs the provider meta tag"
+    );
+    // xAI rows keep their existing meta shape (no provider tag).
+    let xai = logged_in
+        .iter()
+        .find(|(id, _)| id.0.as_ref() == "grok-4.6")
+        .map(|(_, info)| info)
+        .expect("bundled xAI entry");
+    assert!(
+        xai.meta
+            .as_ref()
+            .is_none_or(|meta| !meta.contains_key("provider"))
+    );
+}
+#[test]
+fn task_model_error_gates_codex_slugs_on_codex_login() {
+    use crate::agent::models::task_model_error_for_catalog;
+    let catalog = crate::agent::models::resolve_model_catalog(&Config::default(), None);
+
+    let logged_out =
+        task_model_error_for_catalog("gpt-5.6-sol", &catalog, AuthVisibility::new(true, false))
+            .expect("Codex slug must be rejected without a Codex login");
+    let offered = logged_out
+        .split_once("Valid model slugs:")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    assert!(
+        !offered.contains("gpt-5.6-sol"),
+        "a gated Codex slug must not be offered: {logged_out}"
+    );
+
+    assert!(
+        task_model_error_for_catalog("gpt-5.6-sol", &catalog, AuthVisibility::new(false, true))
+            .is_none(),
+        "Codex slug must resolve once logged in"
+    );
 }
 #[test]
 fn inference_idle_timeout_secs_round_trip() {
@@ -7563,10 +7664,7 @@ fn model_family_maps_to_provider_explicitly() {
         ModelProvider::Codex
     );
     // Unknown families warn and stay on xAI (legacy-compatible).
-    assert_eq!(
-        model_provider_from_family(Some("acme")),
-        ModelProvider::Xai
-    );
+    assert_eq!(model_provider_from_family(Some("acme")), ModelProvider::Xai);
 }
 /// A Codex model without an explicit key must never pick up xAI credential
 /// sources: not the session token, not XAI_API_KEY.

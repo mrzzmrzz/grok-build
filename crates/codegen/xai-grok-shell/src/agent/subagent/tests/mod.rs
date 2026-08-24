@@ -1695,7 +1695,7 @@ fn fresh_tool_model_accepts_visible_key_and_internal_id() {
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .is_none(),
             "key lookup should succeed"
@@ -1706,7 +1706,7 @@ fn fresh_tool_model_accepts_visible_key_and_internal_id() {
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .is_none(),
             "info().model lookup should succeed"
@@ -1725,7 +1725,7 @@ fn fresh_tool_model_rejects_unavailable_exact_key_over_visible_slug_collision() 
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .as_deref(),
             Some(
@@ -1748,7 +1748,7 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .as_deref(),
             Some(
@@ -1786,7 +1786,7 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .unwrap();
         assert_eq!(
@@ -1804,7 +1804,7 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
                 ModelOverrideProvenance::Tool,
                 false,
                 &models,
-                true,
+                crate::agent::config::AuthVisibility::new(true, false),
             )
             .is_none(),
             "OAuth-only model should resolve for session auth"
@@ -1819,7 +1819,7 @@ fn resumed_tool_model_override_is_ignored() {
                 ModelOverrideProvenance::Tool,
                 true,
                 &empty,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .is_none(),
             "resume must preserve source-model pinning"
@@ -1834,7 +1834,7 @@ fn harness_model_override_keeps_internal_fallback_behavior() {
                 ModelOverrideProvenance::Harness,
                 false,
                 &empty,
-                false,
+                crate::agent::config::AuthVisibility::new(false, false),
             )
             .is_none(),
             "internal role/config pins must retain downstream soft fallback"

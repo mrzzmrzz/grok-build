@@ -3509,6 +3509,16 @@ pub(crate) fn resolve_model_list(
     cfg: &Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
+    resolve_model_list_with_codex(cfg, prefetched, None)
+}
+/// [`resolve_model_list`] with live Codex catalog entries folded in between
+/// the xAI base (defaults/prefetched) and the `[model.*]` overlay, so user
+/// overrides still apply field-by-field on top of live Codex metadata.
+pub(crate) fn resolve_model_list_with_codex(
+    cfg: &Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_prefetched: Option<&IndexMap<String, ModelEntry>>,
+) -> IndexMap<String, ModelEntry> {
     let mut resolved: IndexMap<String, ModelEntry> = IndexMap::new();
     if cfg.endpoints.has_custom_endpoint() {
         tracing::info!(
@@ -3552,6 +3562,9 @@ pub(crate) fn resolve_model_list(
             }
         }
         resolved = prefetched;
+    }
+    if let Some(codex) = codex_prefetched {
+        crate::agent::models::merge_codex_catalog_entries(&mut resolved, codex);
     }
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
@@ -4406,6 +4419,23 @@ impl ModelInfo {
         !self.hidden && (is_session_auth || self.supported_in_api)
     }
 }
+/// Auth state consulted by catalog visibility filters, captured once at the
+/// manager boundary so the filter functions stay pure and unit-testable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuthVisibility {
+    /// The xAI credential grants OAuth-only models (`GrokAuth::is_session_auth`).
+    pub(crate) is_session_auth: bool,
+    /// A Codex OAuth login exists on disk (`codex_auth::is_logged_in`).
+    pub(crate) codex_logged_in: bool,
+}
+impl AuthVisibility {
+    pub(crate) fn new(is_session_auth: bool, codex_logged_in: bool) -> Self {
+        Self {
+            is_session_auth,
+            codex_logged_in,
+        }
+    }
+}
 /// Flat struct so credential and endpoint fields coexist after deep-merge.
 /// Routing reads fields, not provenance.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4467,6 +4497,20 @@ impl ModelEntry {
     /// changes. Never executes a provider command.
     pub(crate) fn has_own_credentials(&self) -> bool {
         self.own_credential().is_some() || self.auth_provider.is_some()
+    }
+    /// Provider-aware picker visibility.
+    ///
+    /// xAI entries keep the [`ModelInfo::visible_for_auth`] semantics
+    /// unchanged. A Codex entry is visible only when a Codex OAuth login
+    /// exists or the entry carries its own explicit `api_key`/`env_key`
+    /// credential — xAI auth never unlocks Codex models and vice versa.
+    pub(crate) fn visible_for(&self, auth: AuthVisibility) -> bool {
+        match self.info.provider() {
+            ModelProvider::Codex => {
+                !self.info.hidden && (auth.codex_logged_in || self.own_credential().is_some())
+            }
+            ModelProvider::Xai => self.info.visible_for_auth(auth.is_session_auth),
+        }
     }
 }
 impl std::ops::Deref for ModelEntry {
@@ -5540,6 +5584,14 @@ pub(crate) fn to_acp_model_info(
                     map.insert(
                         REASONING_EFFORTS_META_KEY.to_string(),
                         reasoning_efforts_meta_value(&info.reasoning_efforts),
+                    );
+                }
+                // Provider tag for the picker's provider label; only non-xAI
+                // providers are tagged so xAI rows keep their existing look.
+                if info.provider() == ModelProvider::Codex {
+                    map.insert(
+                        "provider".to_string(),
+                        serde_json::Value::String("codex".to_string()),
                     );
                 }
                 if map.is_empty() { None } else { Some(map) }

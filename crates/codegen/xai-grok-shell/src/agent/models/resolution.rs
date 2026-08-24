@@ -55,11 +55,11 @@ pub(crate) fn is_campaign_only_flip(
 pub(crate) fn resolve_default_model(
     cfg: &config::Config,
     catalog: &IndexMap<String, ModelEntry>,
-    is_session_auth: bool,
+    auth: config::AuthVisibility,
 ) -> (String, ModelEntry, config::ConfigSource) {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth) && e.info.user_selectable)
+        .filter(|(_, e)| e.visible_for(auth) && e.info.user_selectable)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
@@ -150,11 +150,11 @@ pub(crate) fn resolve_default_model(
 /// Filter hidden and auth-gated entries out of `catalog` and convert to ACP wire format.
 pub(crate) fn available_models(
     catalog: &IndexMap<String, ModelEntry>,
-    is_session_auth: bool,
+    auth: config::AuthVisibility,
 ) -> IndexMap<acp::ModelId, acp::ModelInfo> {
     let visible: IndexMap<String, ModelEntry> = catalog
         .iter()
-        .filter(|(_, e)| e.info.visible_for_auth(is_session_auth))
+        .filter(|(_, e)| e.visible_for(auth))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     config::to_acp_model_info(&visible)
@@ -199,7 +199,18 @@ pub(crate) fn resolve_model_catalog(
     cfg: &config::Config,
     prefetched: Option<IndexMap<String, ModelEntry>>,
 ) -> IndexMap<String, ModelEntry> {
-    let mut catalog: IndexMap<String, ModelEntry> = config::resolve_model_list(cfg, prefetched);
+    resolve_model_catalog_with_codex(cfg, prefetched, None)
+}
+
+/// [`resolve_model_catalog`] over a base that also folds in live Codex
+/// catalog entries (see `resolve_model_list_with_codex` for the merge order).
+pub(crate) fn resolve_model_catalog_with_codex(
+    cfg: &config::Config,
+    prefetched: Option<IndexMap<String, ModelEntry>>,
+    codex_prefetched: Option<&IndexMap<String, ModelEntry>>,
+) -> IndexMap<String, ModelEntry> {
+    let mut catalog: IndexMap<String, ModelEntry> =
+        config::resolve_model_list_with_codex(cfg, prefetched, codex_prefetched);
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();

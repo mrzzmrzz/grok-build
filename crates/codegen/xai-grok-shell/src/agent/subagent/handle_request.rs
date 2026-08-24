@@ -14,13 +14,13 @@ pub(super) fn task_model_override_error(
     provenance: ModelOverrideProvenance,
     is_resume: bool,
     available: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    is_session_auth: bool,
+    auth: crate::agent::config::AuthVisibility,
 ) -> Option<String> {
     if provenance != ModelOverrideProvenance::Tool || is_resume {
         return None;
     }
     let requested = requested?;
-    crate::agent::models::task_model_error_for_catalog(requested, available, is_session_auth)
+    crate::agent::models::task_model_error_for_catalog(requested, available, auth)
 }
 /// Runtime adapter for one shell child. Shared lifecycle state is owned by the
 /// `xai-grok-tools` coordinator actor and reached only through `reporter`.
@@ -196,9 +196,12 @@ pub(crate) async fn run_shell_child(
         request.runtime_overrides.model_override_provenance,
         resume_source.is_some(),
         &ctx.available_models,
-        ctx.auth_manager
-            .current_or_expired()
-            .is_some_and(|a| a.is_session_auth()),
+        crate::agent::config::AuthVisibility::new(
+            ctx.auth_manager
+                .current_or_expired()
+                .is_some_and(|a| a.is_session_auth()),
+            crate::codex_auth::is_logged_in(),
+        ),
     ) {
         return child_run_output(failure_result(&request, &error), completion_data, None);
     }

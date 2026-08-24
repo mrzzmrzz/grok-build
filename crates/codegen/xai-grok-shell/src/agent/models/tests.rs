@@ -642,7 +642,8 @@ fn default_model_honors_allowlist_when_no_default_set() {
             "#,
     );
     let catalog = resolve_model_catalog(&cfg, None);
-    let (_key, entry, _src) = resolve_default_model(&cfg, &catalog, true);
+    let (_key, entry, _src) =
+        resolve_default_model(&cfg, &catalog, config::AuthVisibility::new(true, false));
     assert!(
         entry.info.user_selectable,
         "picked non-selectable {}",
@@ -1757,7 +1758,8 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg.models.default = Some("missing-model".to_string());
     cfg.models.default_is_campaign_driven = true;
     cfg.models.pre_campaign_default = Some("real-model".to_string());
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) =
+        resolve_default_model(&cfg, &catalog, config::AuthVisibility::new(true, false));
     assert_eq!(
         key, "real-model",
         "must fall back to the pre-campaign default"
@@ -1767,13 +1769,15 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg2.models.default = Some("missing-model".to_string());
     cfg2.models.default_is_campaign_driven = true;
     cfg2.models.pre_campaign_default = Some("also-missing".to_string());
-    let (key2, _, _) = resolve_default_model(&cfg2, &catalog, true);
+    let (key2, _, _) =
+        resolve_default_model(&cfg2, &catalog, config::AuthVisibility::new(true, false));
     assert_eq!(&key2, catalog.keys().next().unwrap());
 
     let mut cfg3 = config::Config::default();
     cfg3.models.default = Some("missing-model".to_string());
     cfg3.models.pre_campaign_default = Some("real-model".to_string());
-    let (key3, _, _) = resolve_default_model(&cfg3, &catalog, true);
+    let (key3, _, _) =
+        resolve_default_model(&cfg3, &catalog, config::AuthVisibility::new(true, false));
     assert_eq!(
         &key3,
         catalog.keys().next().unwrap(),
@@ -1787,7 +1791,8 @@ fn unavailable_campaign_default_falls_back_to_config_default() {
     cfg4.models.default = Some("campaign-model".to_string());
     cfg4.models.default_is_campaign_driven = true;
     cfg4.models.pre_campaign_default = Some("real-model".to_string());
-    let (key4, _, _) = resolve_default_model(&cfg4, &catalog, true);
+    let (key4, _, _) =
+        resolve_default_model(&cfg4, &catalog, config::AuthVisibility::new(true, false));
     assert_eq!(
         &key4,
         catalog.keys().next().unwrap(),
@@ -1980,14 +1985,16 @@ fn default_model_skips_oauth_only_for_api_key_users() {
     };
     catalog.insert("public-model".to_string(), public);
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, false);
+    let (key, _, _) =
+        resolve_default_model(&cfg, &catalog, config::AuthVisibility::new(false, false));
     assert_ne!(
         key, "oauth-only",
         "API-key default must not be an OAuth-only model"
     );
     assert_eq!(key, "public-model");
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) =
+        resolve_default_model(&cfg, &catalog, config::AuthVisibility::new(true, false));
     assert!(
         key == "oauth-only" || key == "public-model",
         "OAuth user should be able to use either model as default"
@@ -2121,7 +2128,8 @@ fn resolve_default_model_prefers_id_over_model_slug() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("grok-build".to_string());
 
-    let (key, _, _) = resolve_default_model(&cfg, &catalog, true);
+    let (key, _, _) =
+        resolve_default_model(&cfg, &catalog, config::AuthVisibility::new(true, false));
     assert_eq!(key, "grok-build", "must match id, not first slug hit");
 }
 
@@ -2309,4 +2317,214 @@ async fn identity_switch_clears_user_pick_latch() {
         "grok-4.5",
         "a new identity's first catalog must reselect the default after clear()",
     );
+}
+
+// ── live Codex catalog: stale-while-revalidate into the manager ────
+
+mod codex_catalog {
+    use super::*;
+    use crate::codex_auth::CodexCredentials;
+    use crate::codex_models::{CODEX_MODELS_CACHE_FILE, CodexModelsAuthSource, CodexModelsClient};
+    use axum::Router;
+    use axum::routing::get;
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
+
+    fn codex_credentials(account: &str) -> CodexCredentials {
+        CodexCredentials {
+            access_token: format!("token-{account}"),
+            account_id: Some(account.to_owned()),
+            chatgpt_user_id: Some(format!("user-{account}")),
+            email: Some(format!("{account}@example.com")),
+            plan_type: Some("pro".to_owned()),
+            is_workspace_account: false,
+            account_is_fedramp: false,
+        }
+    }
+
+    /// Auth source whose `current` credentials can be switched mid-test.
+    #[derive(Debug)]
+    struct SwitchableCodexAuth {
+        current: Mutex<Option<CodexCredentials>>,
+        fresh: Option<CodexCredentials>,
+    }
+
+    #[async_trait::async_trait]
+    impl CodexModelsAuthSource for SwitchableCodexAuth {
+        fn current_credentials(&self) -> anyhow::Result<Option<CodexCredentials>> {
+            Ok(self.current.lock().unwrap().clone())
+        }
+        async fn fresh_credentials(&self) -> anyhow::Result<Option<CodexCredentials>> {
+            Ok(self.fresh.clone())
+        }
+        async fn force_refresh(&self) -> anyhow::Result<Option<CodexCredentials>> {
+            Ok(self.fresh.clone())
+        }
+    }
+
+    async fn spawn_codex_models_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/codex/models",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "models": [{
+                        "slug": "gpt-6-live",
+                        "display_name": "GPT-6 Live",
+                        "visibility": "list",
+                        "priority": 1,
+                        "context_window": 372000,
+                        "effective_context_window_percent": 95,
+                        "supported_reasoning_levels": [
+                            {"effort": "low", "description": "Fast"},
+                            {"effort": "medium", "description": "Balanced"}
+                        ]
+                    }]
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/codex"), server)
+    }
+
+    fn codex_client(
+        cache_dir: &std::path::Path,
+        base_url: &str,
+        auth: Arc<dyn CodexModelsAuthSource>,
+    ) -> CodexModelsClient {
+        CodexModelsClient::for_test(
+            cache_dir.join(CODEX_MODELS_CACHE_FILE),
+            base_url.to_owned(),
+            "test-grok".to_owned(),
+            "1.2.3".to_owned(),
+            std::time::Duration::from_secs(300),
+            auth,
+        )
+    }
+
+    /// Manager over the bundled default catalog with an injected Codex login.
+    fn manager_with_codex_login(logged_in: bool) -> (ModelsManager, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+        let cfg = config::Config::default();
+        let mgr = ModelsManagerBuilder::new(
+            None,
+            resolve_model_catalog(&cfg, None),
+            acp::ModelId::new("grok-4.6"),
+            auth_manager,
+            cfg,
+        )
+        .cache(test_cache_manager(tmp.path()))
+        .codex_login(Arc::new(move || logged_in))
+        .build();
+        (mgr, tmp)
+    }
+
+    fn lists_model(mgr: &ModelsManager, key: &str) -> bool {
+        mgr.available().keys().any(|id| id.0.as_ref() == key)
+    }
+
+    #[test]
+    fn available_gates_bundled_codex_fallback_on_login_probe() {
+        let (logged_out, _tmp) = manager_with_codex_login(false);
+        assert!(!lists_model(&logged_out, "gpt-5.6-sol"));
+        assert!(lists_model(&logged_out, "grok-4.6"));
+
+        let (logged_in, _tmp) = manager_with_codex_login(true);
+        assert!(lists_model(&logged_in, "gpt-5.6-sol"));
+        assert!(lists_model(&logged_in, "grok-4.6"));
+    }
+
+    #[tokio::test]
+    async fn cached_first_then_background_revalidate_merges_live_catalog() {
+        let (base_url, server) = spawn_codex_models_server().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = Arc::new(SwitchableCodexAuth {
+            current: Mutex::new(Some(codex_credentials("account-1"))),
+            fresh: Some(codex_credentials("account-1")),
+        });
+        let client = codex_client(tmp.path(), &base_url, auth);
+
+        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
+        // Cold cache: the startup half has nothing to publish yet.
+        mgr.publish_codex_cached_catalog(&client);
+        assert!(!lists_model(&mgr, "gpt-6-live"));
+
+        // Background half fetches, maps, and merges the live catalog.
+        mgr.revalidate_codex_catalog(&client).await;
+        assert!(lists_model(&mgr, "gpt-6-live"));
+        assert!(
+            lists_model(&mgr, "grok-4.6"),
+            "xAI entries must survive the Codex merge"
+        );
+        let available = mgr.available();
+        let live = available
+            .iter()
+            .find(|(id, _)| id.0.as_ref() == "gpt-6-live")
+            .map(|(_, info)| info)
+            .unwrap();
+        assert_eq!(live.name, "GPT-6 Live");
+        assert_eq!(
+            live.meta
+                .as_ref()
+                .and_then(|meta| meta.get("provider"))
+                .and_then(serde_json::Value::as_str),
+            Some("codex"),
+        );
+
+        // A later startup serves the cache with zero network.
+        server.abort();
+        let auth = Arc::new(SwitchableCodexAuth {
+            current: Mutex::new(Some(codex_credentials("account-1"))),
+            fresh: Some(codex_credentials("account-1")),
+        });
+        let client = codex_client(tmp.path(), &base_url, auth);
+        let (cold, _cold_tmp) = manager_with_codex_login(true);
+        cold.publish_codex_cached_catalog(&client);
+        assert!(
+            lists_model(&cold, "gpt-6-live"),
+            "cached-first startup must list the live Codex catalog offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_switch_discards_fetched_catalog_and_cache() {
+        let (base_url, server) = spawn_codex_models_server().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = Arc::new(SwitchableCodexAuth {
+            current: Mutex::new(Some(codex_credentials("account-2"))),
+            fresh: Some(codex_credentials("account-1")),
+        });
+        let client = codex_client(tmp.path(), &base_url, auth);
+
+        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
+        // The fetch runs as account-1 but account-2 is current by publish
+        // time: the catalog must be dropped and the cache invalidated.
+        mgr.revalidate_codex_catalog(&client).await;
+        server.abort();
+        assert!(!lists_model(&mgr, "gpt-6-live"));
+        assert!(!client.cache_path().exists());
+    }
+
+    #[tokio::test]
+    async fn unchanged_codex_catalog_does_not_bump_model_switch_state() {
+        let (base_url, server) = spawn_codex_models_server().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = Arc::new(SwitchableCodexAuth {
+            current: Mutex::new(Some(codex_credentials("account-1"))),
+            fresh: Some(codex_credentials("account-1")),
+        });
+        let client = codex_client(tmp.path(), &base_url, auth);
+
+        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
+        mgr.revalidate_codex_catalog(&client).await;
+        let first = serde_json::to_string(&mgr.models()).unwrap();
+        // Revalidating an identical catalog (cache is fresh now) is a no-op.
+        mgr.revalidate_codex_catalog(&client).await;
+        server.abort();
+        assert_eq!(serde_json::to_string(&mgr.models()).unwrap(), first);
+    }
 }

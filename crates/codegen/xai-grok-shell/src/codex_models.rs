@@ -190,7 +190,7 @@ impl CodexModelsCache {
 }
 
 #[async_trait]
-trait CodexModelsAuthSource: fmt::Debug + Send + Sync {
+pub(crate) trait CodexModelsAuthSource: fmt::Debug + Send + Sync {
     fn current_credentials(&self) -> anyhow::Result<Option<CodexCredentials>>;
     async fn fresh_credentials(&self) -> anyhow::Result<Option<CodexCredentials>>;
     async fn force_refresh(&self) -> anyhow::Result<Option<CodexCredentials>>;
@@ -523,7 +523,7 @@ impl CodexModelsClient {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         cache_path: PathBuf,
         base_url: String,
         grok_version: String,
