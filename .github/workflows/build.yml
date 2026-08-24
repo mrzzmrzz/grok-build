@@ -42,8 +42,13 @@ jobs:
       - name: Smoke-run
         run: ./target/release/xai-grok-pager --version
 
+      # The cargo artifact keeps its internal name; ship it under the
+      # user-facing `grok` name, matching the official installer.
+      - name: Rename to grok
+        run: cp target/release/xai-grok-pager target/release/grok
+
       - uses: actions/upload-artifact@v4
         with:
           name: grok-${{ matrix.name }}
-          path: target/release/xai-grok-pager
+          path: target/release/grok
           if-no-files-found: error
