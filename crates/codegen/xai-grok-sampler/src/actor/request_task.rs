@@ -133,11 +133,23 @@ pub(crate) async fn run_request_task(
     let doom_max_retries = doom_policy.map_or(0, |p| p.max_retries);
     let mut doom_retry_count: u32 = 0;
     let output_observed = Arc::new(AtomicBool::new(false));
+    // Freshest response-bound Codex turn-state observed by any attempt
+    // (response headers arrive before the body, so even an attempt whose
+    // body then fails can bind a new value). The retry loop folds it into
+    // the next attempt directly: the shell's asynchronous session-slot
+    // update cannot feed a loop that already holds its request.
+    let latest_turn_state: TurnStateCell = Arc::new(Mutex::new(None));
 
     loop {
         if cancel_token.is_cancelled() {
             handle_cancellation(&event_tx, &request_id, &mut completion_tx);
             return request_id;
+        }
+
+        if let Ok(mut observed) = latest_turn_state.lock()
+            && let Some(state) = observed.take()
+        {
+            request.turn_state = Some(state);
         }
 
         // Once the resample budget is spent, the attempt runs with the abort
@@ -152,6 +164,7 @@ pub(crate) async fn run_request_task(
             &cancel_token,
             doom_check,
             Arc::clone(&output_observed),
+            Arc::clone(&latest_turn_state),
         )
         .instrument(sampling_span.clone())
         .await;
@@ -536,6 +549,7 @@ async fn run_one_attempt(
     cancel_token: &CancellationToken,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
+    latest_turn_state: TurnStateCell,
 ) -> AttemptOutcome {
     let client_custom_tool_names: Vec<String> = request
         .hosted_tools
@@ -560,6 +574,7 @@ async fn run_one_attempt(
                 None,
                 FailedResponseCapture::default(),
                 output_observed,
+                latest_turn_state,
             )
             .await
         }
@@ -601,6 +616,7 @@ async fn run_one_attempt(
                 doom_check,
                 failed_response,
                 output_observed,
+                latest_turn_state,
             )
             .await
         }
@@ -620,6 +636,7 @@ async fn run_one_attempt(
                 None,
                 FailedResponseCapture::default(),
                 output_observed,
+                latest_turn_state,
             )
             .await
         }
@@ -629,6 +646,11 @@ async fn run_one_attempt(
 /// Captured-error cell shared between the tee adapter and the
 /// per-request task.
 type ErrorCell = Arc<Mutex<Option<SamplingError>>>;
+
+/// Freshest response-bound Codex turn-state, shared between the retry loop
+/// and the attempt driver so an internal retry echoes the value bound by the
+/// failed attempt's handshake (not the request's original, often-stale one).
+type TurnStateCell = Arc<Mutex<Option<String>>>;
 
 /// Wrap a raw chunk stream so its first error is captured into a
 /// shared cell. The wrapped stream still yields the original
@@ -671,6 +693,7 @@ async fn drive_l2(
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     failed_response: FailedResponseCapture,
     output_observed: Arc<AtomicBool>,
+    latest_turn_state: TurnStateCell,
 ) -> AttemptOutcome {
     let mut l2 = pin!(l2);
     loop {
@@ -739,6 +762,17 @@ async fn drive_l2(
                             | SamplingEvent::BackendToolCallCompleted { .. }
                     ) {
                         output_observed.store(true, Ordering::Relaxed);
+                    }
+                    // Bind the handshake's turn-state for the retry loop
+                    // before forwarding: only Codex responses carry it, and
+                    // it must ride the next internal attempt even if this
+                    // attempt's body fails after the handshake.
+                    if let SamplingEvent::ModelMetadata { metadata, .. } = &other
+                        && let Some(state) =
+                            metadata.turn_state.as_deref().filter(|s| !s.is_empty())
+                        && let Ok(mut observed) = latest_turn_state.lock()
+                    {
+                        *observed = Some(state.to_owned());
                     }
                     let _ = event_tx.send(retag(other, &request_id));
                 }

@@ -5106,6 +5106,22 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
         (facts, provider)
     })
 }
+/// [`ModelAuthFacts`] for a resolved catalog entry. Shared by the
+/// static-config resolve above and `ModelsManager::model_auth_state` (the
+/// merged, account-scoped catalog that also holds live Codex entries) so the
+/// two sources cannot drift: a model's provider identity is the same whether
+/// it came from static config or the live catalog.
+pub(crate) fn model_auth_facts_for_entry(entry: &ModelEntry) -> ModelAuthFacts {
+    ModelAuthFacts {
+        byok: if entry.has_own_credentials() {
+            ModelByok::Byok
+        } else {
+            ModelByok::NotByok
+        },
+        auth_scheme: entry.info().auth_scheme,
+        model_provider: entry.info().provider(),
+    }
+}
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,

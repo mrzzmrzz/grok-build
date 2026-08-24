@@ -525,6 +525,20 @@ pub struct ToolCall {
     pub arguments: Arc<str>,
 }
 
+/// Reserved ID namespace for native Responses custom-tool calls.
+///
+/// A [`ToolCall`] persists only three fields, so the call *kind* (ordinary
+/// function call vs. native custom call) is not stored explicitly — it is
+/// inferred from these prefixes on `ToolCall::id`. That makes the
+/// `custom_tool_call:` / `custom_tool_call.v2:` namespaces **reserved**: an
+/// ordinary function-call ID that happens to match the v2 syntax (prefix,
+/// decimal byte length, `:`, at least that many bytes) is indistinguishable
+/// from an encoded custom call and is interpreted as one (see the
+/// `reserved_namespace_collision_is_interpreted_as_custom` regression test).
+/// Provider-minted function-call IDs (`call_*`, `fc_*`, UUIDs) never start
+/// with these prefixes, so the collision is theoretical on real wires; if a
+/// provider ever mints IDs in this namespace, the call kind must be promoted
+/// to an explicit persisted field instead of a string inference.
 const CUSTOM_TOOL_CALL_ID_PREFIX: &str = "custom_tool_call:";
 const CUSTOM_TOOL_CALL_ID_V2_PREFIX: &str = "custom_tool_call.v2:";
 
@@ -2611,6 +2625,56 @@ mod custom_tool_call_id_tests {
             "custom_tool_call.v2:9:short", // length past the end
         ] {
             assert_eq!(decode_custom_tool_call_id(id), None, "{id}");
+        }
+    }
+
+    /// Pins the documented reserved-namespace collision (see the doc on
+    /// [`CUSTOM_TOOL_CALL_ID_PREFIX`]): an ordinary function-call ID that
+    /// happens to be well-formed v2 syntax IS interpreted as a custom call,
+    /// because the persisted shape carries no explicit call kind. This test
+    /// exists so any change to that inference is a conscious decision, and so
+    /// near-miss IDs in the namespace demonstrably stay ordinary calls.
+    #[test]
+    fn reserved_namespace_collision_is_interpreted_as_custom() {
+        // Well-formed v2 syntax minted (hypothetically) as a plain function
+        // call id: `call_id = "ab"`, `item_id = "item_7"`.
+        let colliding = ToolCall {
+            id: "custom_tool_call.v2:2:abitem_7".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            colliding.is_custom(),
+            "documented collision: reserved v2 syntax decodes as a custom call"
+        );
+        assert_eq!(colliding.call_id(), "ab");
+        assert_eq!(colliding.custom_item_id(), Some("item_7"));
+
+        // Near-misses inside the reserved prefix stay ordinary calls: the
+        // decode is total only for well-formed length-prefixed payloads.
+        for id in [
+            "custom_tool_call.v2",         // bare prefix stem, no colon
+            "custom_tool_call.v2:99:ab",   // declared length exceeds payload
+            "custom_tool_call.v2:-1:ab",   // negative length
+            "custom_tool_call.v2:2.0:ab",  // non-integer length
+        ] {
+            let call = ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            };
+            assert!(!call.is_custom(), "{id} must stay an ordinary call");
+            assert_eq!(call.call_id(), id, "{id} keeps its verbatim id");
+        }
+
+        // Realistic provider-minted ids are far outside the namespace.
+        for id in ["call_abc123", "fc_00000000-0000-0000-0000-000000000000"] {
+            let call = ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            };
+            assert!(!call.is_custom());
         }
     }
 }

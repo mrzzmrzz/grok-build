@@ -203,6 +203,81 @@ async fn xai_profile_never_sends_turn_state_header() {
     );
 }
 
+/// Actor-level regression for turn-state propagation through the sampler's
+/// *internal* retry loop: the first attempt's 200 handshake binds a new
+/// turn-state, its body then dies before a usable response, and the next
+/// internal attempt — cloned inside `run_request_task`, with no shell in the
+/// loop — must echo the newly bound value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_retry_echoes_turn_state_bound_by_failed_attempt() {
+    use tokio::sync::mpsc;
+    use xai_grok_sampler::{RequestId, RetryPolicy, SamplerActor};
+
+    let captured: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let n = {
+                    let mut sink = sink.lock().unwrap();
+                    let body = serde_json::from_slice::<serde_json::Value>(&body)
+                        .unwrap_or(serde_json::Value::Null);
+                    sink.push((headers, body));
+                    sink.len() - 1
+                };
+                let mut response = axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream");
+                let body = if n == 0 {
+                    // Handshake binds a new turn-state; the body then ends
+                    // with no terminal event — a retryable attempt failure.
+                    response = response.header("x-codex-turn-state", "ts-rebound-1");
+                    String::new()
+                } else {
+                    xai_grok_test_support::sse::responses_api_script_exact("ok", "gpt-test")
+                        .into_iter()
+                        .map(|event| format!("data: {}\n\n", event.data))
+                        .collect()
+                };
+                response.body(body).unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let mut cfg = support::test_config(&format!("http://{addr}/v1"), "seed-key");
+    cfg.api_backend = ApiBackend::Responses;
+    cfg.provider_profile = ProviderProfile::CODEX;
+    cfg.max_retries = Some(2);
+    cfg.idle_timeout_secs = Some(30);
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    // First request of the logical prompt: no turn-state bound yet.
+    let result = handle
+        .submit_and_collect(RequestId::from("req-ts-retry"), request_with(None, None))
+        .await;
+    assert!(result.is_ok(), "retry must recover: {result:?}");
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2, "one failed attempt plus one retry");
+    assert!(
+        captured[0].0.get("x-codex-turn-state").is_none(),
+        "first attempt has no turn-state to echo"
+    );
+    assert_eq!(
+        captured[1].0.get("x-codex-turn-state").unwrap(),
+        "ts-rebound-1",
+        "the internal retry must echo the turn-state bound by the failed attempt's handshake"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_body_carries_prompt_cache_key_and_no_previous_response_id() {
     let (base_url, captured) = spawn_scripted_server(vec![OK_NO_STATE, OK_NO_STATE]).await;

@@ -112,7 +112,14 @@ fn is_unknown_response_event_kind(err: &SamplingError) -> bool {
     let SamplingError::Serialization(serde_err) = err else {
         return false;
     };
-    let message = serde_err.to_string();
+    is_unknown_response_event_kind_message(&serde_err.to_string())
+}
+
+/// Message-level core of [`is_unknown_response_event_kind`], shared with the
+/// SSE decoder (`client::deserialize_response_event`) so both layers classify
+/// an unknown top-level event kind identically — the decoder to pick its log
+/// level, this layer to skip the frame.
+pub(crate) fn is_unknown_response_event_kind_message(message: &str) -> bool {
     message.starts_with("unknown variant") && message.contains("`response.created`")
 }
 
@@ -346,6 +353,24 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
         let mut next_tool_index: u32 = 0;
 
         let mut stream = raw_stream;
+        // A stream death (idle timeout / retryable transport error) after at
+        // least one complete output item takes the same durable-output
+        // recovery as a clean EOF — set instead of yielding Failed so the
+        // completed items are not discarded and re-billed by a retry.
+        let recover_durable = |durable_output: &BTreeMap<u32, rs::OutputItem>,
+                                   err: &SamplingError,
+                                   retryable_only: bool| {
+            if durable_output.is_empty() || (retryable_only && !err.is_retryable()) {
+                return false;
+            }
+            tracing::warn!(
+                request_id = %request_id,
+                error = %err,
+                recovered_items = durable_output.len(),
+                "stream died after completed output items; recovering durable output"
+            );
+            true
+        };
         loop {
             let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(event_result)) => event_result,
@@ -354,6 +379,9 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                     let err = SamplingError::IdleTimeout {
                         elapsed_secs: idle_timeout.as_secs(),
                     };
+                    if recover_durable(&durable_output, &err, false) {
+                        break;
+                    }
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -378,6 +406,9 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                         let err = SamplingError::IdleTimeout {
                             elapsed_secs: idle_timeout.as_secs(),
                         };
+                        if recover_durable(&durable_output, &err, false) {
+                            break;
+                        }
                         yield SamplingEvent::Failed {
                             request_id: request_id.clone(),
                             error: SamplingErrorInfo::from(&err),
@@ -387,8 +418,16 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                     continue;
                 }
                 // Everything else — transport failures and known events with
-                // malformed payloads alike — fails the attempt loudly.
+                // malformed payloads alike — fails the attempt loudly. A
+                // retryable transport failure after complete output items
+                // instead takes the durable recovery: a retry would discard
+                // that finished work. Non-retryable failures (a known event
+                // with a malformed payload is a wire-contract violation)
+                // stay hard errors.
                 Err(err) => {
+                    if recover_durable(&durable_output, &err, true) {
+                        break;
+                    }
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -809,6 +848,9 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                 let err = SamplingError::IdleTimeout {
                     elapsed_secs: idle_timeout.as_secs(),
                 };
+                if recover_durable(&durable_output, &err, false) {
+                    break;
+                }
                 yield SamplingEvent::Failed {
                     request_id: request_id.clone(),
                     error: SamplingErrorInfo::from(&err),
@@ -837,7 +879,22 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                 let mut recovered = created_response
                     .take()
                     .unwrap_or_else(recovery_response_shell);
-                recovered.status = Status::Incomplete;
+                // Every recovered item is complete by construction (only
+                // `ResponseOutputItemDone` frames land here). When the last
+                // one is the assistant message, the turn's final item
+                // finished before the stream died: surface it as a terminal
+                // completion instead of reclassifying it as a max-token
+                // truncation. Anything else (e.g. reasoning with no
+                // message) may be missing its tail and stays Incomplete.
+                let message_completed_last = durable_output
+                    .values()
+                    .next_back()
+                    .is_some_and(|item| matches!(item, rs::OutputItem::Message(_)));
+                recovered.status = if message_completed_last {
+                    Status::Completed
+                } else {
+                    Status::Incomplete
+                };
                 recovered.output = durable_output.into_values().collect();
                 recovered
             }
@@ -1824,13 +1881,15 @@ mod tests {
         }
     }
 
-    /// With no tool call in the recovered items the turn surfaces as
-    /// truncated (`Length`), matching the synthesized Incomplete status.
+    /// A recovery whose last item is the completed assistant message is a
+    /// terminal completion (`Stop`): the message finished before the stream
+    /// died, so it must reach the caller instead of being reclassified as a
+    /// max-token truncation by the retry loop.
     #[tokio::test]
-    async fn durable_message_only_recovery_reports_length() {
+    async fn durable_message_only_recovery_completes_terminally() {
         let raw = stream::iter(vec![Ok(output_item_done_event(
             0,
-            output_message_item("msg-1", "cut off"),
+            output_message_item("msg-1", "whole message"),
         ))])
         .boxed();
         let events = collect(stream_responses(
@@ -1844,10 +1903,147 @@ mod tests {
 
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
-                assert_eq!(response.assistant_text(), "cut off");
+                assert_eq!(response.assistant_text(), "whole message");
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A recovery that never saw the message complete (reasoning item only)
+    /// may be missing its tail: it stays Incomplete and surfaces as `Length`.
+    #[tokio::test]
+    async fn durable_recovery_without_completed_message_reports_length() {
+        let raw = stream::iter(vec![Ok(output_item_done_event(
+            0,
+            reasoning_item("rs-1", &["thinking"], None),
+        ))])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Length));
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A retryable transport error after a completed output item takes the
+    /// same durable recovery as a clean EOF instead of failing the attempt.
+    #[tokio::test]
+    async fn durable_items_recover_after_retryable_stream_error() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                output_message_item("msg-1", "done before the wire died"),
+            )),
+            Err(SamplingError::EventStreamError(
+                "connection reset by peer".to_owned(),
+            )),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "done before the wire died");
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A non-retryable mid-stream failure (a known event with a malformed
+    /// payload) stays a hard error even when durable items exist.
+    #[tokio::test]
+    async fn non_retryable_stream_error_still_fails_despite_durable_items() {
+        let serde_err =
+            serde_json::from_str::<rs::ResponseStreamEvent>("{\"type\":\"response.created\"}")
+                .unwrap_err();
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                output_message_item("msg-1", "durable"),
+            )),
+            Err(SamplingError::Serialization(serde_err)),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert!(
+            matches!(events.last(), Some(SamplingEvent::Failed { .. })),
+            "malformed known event must stay a hard error, got {events:?}"
+        );
+    }
+
+    /// An idle timeout after a completed output item recovers durably
+    /// instead of failing the attempt.
+    #[tokio::test(start_paused = true)]
+    async fn durable_items_recover_after_idle_timeout() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![Ok(
+            output_item_done_event(0, output_message_item("msg-1", "before the stall")),
+        )];
+        let raw = stream::iter(events).chain(stream::pending()).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_millis(50),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "before the stall");
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// An idle timeout with no completed output item still fails as before.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_without_durable_items_still_fails() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> =
+            vec![Ok(text_delta_event("hi"))];
+        let raw = stream::iter(events).chain(stream::pending()).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_millis(50),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::IdleTimeout);
+            }
+            other => panic!("expected Failed(IdleTimeout), got {other:?}"),
         }
     }
 

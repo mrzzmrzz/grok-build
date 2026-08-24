@@ -2405,8 +2405,11 @@ mod codex_catalog {
         )
     }
 
-    /// Manager over the bundled default catalog with an injected Codex login.
-    fn manager_with_codex_login(logged_in: bool) -> (ModelsManager, tempfile::TempDir) {
+    /// Manager over the bundled default catalog with an injected Codex
+    /// account probe (a switchable fingerprint; `None` = logged out).
+    fn manager_with_codex_probe(
+        probe: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> (ModelsManager, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
         let cfg = config::Config::default();
@@ -2418,9 +2421,64 @@ mod codex_catalog {
             cfg,
         )
         .cache(test_cache_manager(tmp.path()))
-        .codex_login(Arc::new(move || logged_in))
+        .codex_account(probe)
         .build();
         (mgr, tmp)
+    }
+
+    /// [`manager_with_codex_probe`] pinned to one account's fingerprint
+    /// (`None` = logged out), matching the client-side auth injection.
+    fn manager_with_codex_account(
+        account: Option<&CodexCredentials>,
+    ) -> (ModelsManager, tempfile::TempDir) {
+        let fingerprint = account.and_then(crate::codex_models::account_fingerprint);
+        manager_with_codex_probe(Arc::new(move || fingerprint.clone()))
+    }
+
+    /// Shared mutable fingerprint slot for tests that switch accounts.
+    fn switchable_probe(
+        initial: Option<&CodexCredentials>,
+    ) -> (
+        Arc<Mutex<Option<String>>>,
+        Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) {
+        let slot = Arc::new(Mutex::new(
+            initial.and_then(crate::codex_models::account_fingerprint),
+        ));
+        let probe_slot = Arc::clone(&slot);
+        (
+            slot,
+            Arc::new(move || probe_slot.lock().unwrap().clone()),
+        )
+    }
+
+    fn fingerprint_of(account: &CodexCredentials) -> String {
+        crate::codex_models::account_fingerprint(account).unwrap()
+    }
+
+    fn codex_generation(mgr: &ModelsManager) -> u64 {
+        mgr.inner.catalog.read().codex_generation
+    }
+
+    /// Live entries as the publish path would deliver them for `slug`.
+    fn live_entries(slug: &str) -> IndexMap<String, ModelEntry> {
+        let mut info = config::ModelInfo::fallback(slug);
+        info.model_family = Some("codex".to_owned());
+        // Codex only speaks Responses; the legality filter would drop a
+        // ChatCompletions-backed Codex entry from the resolved catalog.
+        info.api_backend = crate::sampling::ApiBackend::Responses;
+        let mut entries = IndexMap::new();
+        entries.insert(
+            slug.to_owned(),
+            ModelEntry {
+                info,
+                api_key: None,
+                env_key: None,
+                auth_provider: None,
+                api_base_url: None,
+            },
+        );
+        entries
     }
 
     fn lists_model(mgr: &ModelsManager, key: &str) -> bool {
@@ -2429,11 +2487,11 @@ mod codex_catalog {
 
     #[test]
     fn available_gates_bundled_codex_fallback_on_login_probe() {
-        let (logged_out, _tmp) = manager_with_codex_login(false);
+        let (logged_out, _tmp) = manager_with_codex_account(None);
         assert!(!lists_model(&logged_out, "gpt-5.6-sol"));
         assert!(lists_model(&logged_out, "grok-4.6"));
 
-        let (logged_in, _tmp) = manager_with_codex_login(true);
+        let (logged_in, _tmp) = manager_with_codex_account(Some(&codex_credentials("account-1")));
         assert!(lists_model(&logged_in, "gpt-5.6-sol"));
         assert!(lists_model(&logged_in, "grok-4.6"));
     }
@@ -2448,13 +2506,13 @@ mod codex_catalog {
         });
         let client = codex_client(tmp.path(), &base_url, auth);
 
-        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
+        let (mgr, _mgr_tmp) = manager_with_codex_account(Some(&codex_credentials("account-1")));
         // Cold cache: the startup half has nothing to publish yet.
-        mgr.publish_codex_cached_catalog(&client);
+        mgr.publish_codex_cached_catalog(&client, codex_generation(&mgr));
         assert!(!lists_model(&mgr, "gpt-6-live"));
 
         // Background half fetches, maps, and merges the live catalog.
-        mgr.revalidate_codex_catalog(&client).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
         assert!(lists_model(&mgr, "gpt-6-live"));
         assert!(
             lists_model(&mgr, "grok-4.6"),
@@ -2482,8 +2540,8 @@ mod codex_catalog {
             fresh: Some(codex_credentials("account-1")),
         });
         let client = codex_client(tmp.path(), &base_url, auth);
-        let (cold, _cold_tmp) = manager_with_codex_login(true);
-        cold.publish_codex_cached_catalog(&client);
+        let (cold, _cold_tmp) = manager_with_codex_account(Some(&codex_credentials("account-1")));
+        cold.publish_codex_cached_catalog(&client, codex_generation(&cold));
         assert!(
             lists_model(&cold, "gpt-6-live"),
             "cached-first startup must list the live Codex catalog offline"
@@ -2500,10 +2558,10 @@ mod codex_catalog {
         });
         let client = codex_client(tmp.path(), &base_url, auth);
 
-        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
+        let (mgr, _mgr_tmp) = manager_with_codex_account(Some(&codex_credentials("account-2")));
         // The fetch runs as account-1 but account-2 is current by publish
         // time: the catalog must be dropped and the cache invalidated.
-        mgr.revalidate_codex_catalog(&client).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
         server.abort();
         assert!(!lists_model(&mgr, "gpt-6-live"));
         assert!(!client.cache_path().exists());
@@ -2519,12 +2577,165 @@ mod codex_catalog {
         });
         let client = codex_client(tmp.path(), &base_url, auth);
 
-        let (mgr, _mgr_tmp) = manager_with_codex_login(true);
-        mgr.revalidate_codex_catalog(&client).await;
+        let (mgr, _mgr_tmp) = manager_with_codex_account(Some(&codex_credentials("account-1")));
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
         let first = serde_json::to_string(&mgr.models()).unwrap();
         // Revalidating an identical catalog (cache is fresh now) is a no-op.
-        mgr.revalidate_codex_catalog(&client).await;
+        mgr.revalidate_codex_catalog(&client, codex_generation(&mgr)).await;
         server.abort();
         assert_eq!(serde_json::to_string(&mgr.models()).unwrap(), first);
+    }
+
+    // ── account scoping of the in-memory catalog (A logout → B login) ──
+
+    /// Success path: after A logs out and B logs in, only a publish carrying
+    /// B's fingerprint at the current generation becomes visible.
+    #[test]
+    fn account_transition_then_successful_refresh_publishes_b_only() {
+        let account_a = codex_credentials("account-a");
+        let account_b = codex_credentials("account-b");
+        let (slot, probe) = switchable_probe(Some(&account_a));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+
+        assert!(mgr.set_codex_models_fenced(
+            live_entries("gpt-a-live"),
+            fingerprint_of(&account_a),
+            codex_generation(&mgr),
+        ));
+        assert!(lists_model(&mgr, "gpt-a-live"));
+
+        // A logs out; B logs in.
+        *slot.lock().unwrap() = None;
+        mgr.on_codex_auth_changed();
+        assert!(
+            !lists_model(&mgr, "gpt-a-live"),
+            "A's retained catalog must not survive A's logout"
+        );
+        *slot.lock().unwrap() = Some(fingerprint_of(&account_b));
+        mgr.on_codex_auth_changed();
+        assert!(!lists_model(&mgr, "gpt-a-live"));
+
+        // B's refresh succeeds and publishes under B's fingerprint.
+        assert!(mgr.set_codex_models_fenced(
+            live_entries("gpt-b-live"),
+            fingerprint_of(&account_b),
+            codex_generation(&mgr),
+        ));
+        assert!(lists_model(&mgr, "gpt-b-live"));
+        assert!(!lists_model(&mgr, "gpt-a-live"));
+    }
+
+    /// Failure / disabled-fetch path: with no successful refresh for B, A's
+    /// entries stay evicted — the visibility gate does not depend on the new
+    /// account's refresh outcome at all.
+    #[test]
+    fn account_transition_without_refresh_keeps_old_catalog_hidden() {
+        let account_a = codex_credentials("account-a");
+        let account_b = codex_credentials("account-b");
+        let (slot, probe) = switchable_probe(Some(&account_a));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+
+        assert!(mgr.set_codex_models_fenced(
+            live_entries("gpt-a-live"),
+            fingerprint_of(&account_a),
+            codex_generation(&mgr),
+        ));
+        assert!(lists_model(&mgr, "gpt-a-live"));
+
+        *slot.lock().unwrap() = Some(fingerprint_of(&account_b));
+        mgr.on_codex_auth_changed();
+        // No refresh ran for B (failed or remote_fetch disabled): A's
+        // entries are gone and nothing of B's appears.
+        assert!(!lists_model(&mgr, "gpt-a-live"));
+        assert!(!mgr.models().contains_key("gpt-a-live"));
+    }
+
+    /// Old-refresh-in-flight path: a publish captured under A's generation
+    /// (or carrying A's fingerprint) is discarded after the transition to B.
+    #[test]
+    fn stale_in_flight_publish_is_fenced_after_account_transition() {
+        let account_a = codex_credentials("account-a");
+        let account_b = codex_credentials("account-b");
+        let (slot, probe) = switchable_probe(Some(&account_a));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+        let stale_generation = codex_generation(&mgr);
+
+        *slot.lock().unwrap() = Some(fingerprint_of(&account_b));
+        mgr.on_codex_auth_changed();
+
+        // A's in-flight refresh completes late: wrong fingerprint.
+        assert!(!mgr.set_codex_models_fenced(
+            live_entries("gpt-a-live"),
+            fingerprint_of(&account_a),
+            stale_generation,
+        ));
+        assert!(!lists_model(&mgr, "gpt-a-live"));
+
+        // Even a fetch that somehow carries B's fingerprint but was captured
+        // under the old generation is discarded.
+        assert!(!mgr.set_codex_models_fenced(
+            live_entries("gpt-b-live"),
+            fingerprint_of(&account_b),
+            stale_generation,
+        ));
+        assert!(!lists_model(&mgr, "gpt-b-live"));
+
+        // The current generation publishes normally.
+        assert!(mgr.set_codex_models_fenced(
+            live_entries("gpt-b-live"),
+            fingerprint_of(&account_b),
+            codex_generation(&mgr),
+        ));
+        assert!(lists_model(&mgr, "gpt-b-live"));
+    }
+
+    // ── currentModelId/availableModels invariant across logout ─────────
+
+    /// Selecting a live Codex model and logging out must leave the manager
+    /// on a deterministic available fallback — never a current id outside
+    /// `available()`.
+    #[test]
+    fn logout_reselects_current_model_into_available_set() {
+        let account = codex_credentials("account-a");
+        let (slot, probe) = switchable_probe(Some(&account));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+        assert!(mgr.set_codex_models_fenced(
+            live_entries("gpt-a-live"),
+            fingerprint_of(&account),
+            codex_generation(&mgr),
+        ));
+
+        // Explicit user pick of the live Codex model.
+        mgr.set_current_model_id(acp::ModelId::new("gpt-a-live"));
+        assert!(lists_model(&mgr, "gpt-a-live"));
+        assert_eq!(mgr.current_model_id().0.as_ref(), "gpt-a-live");
+
+        // Logout: the pick is no longer usable under the current auth.
+        *slot.lock().unwrap() = None;
+        mgr.on_codex_auth_changed();
+
+        let current = mgr.current_model_id();
+        let available = mgr.available();
+        assert_ne!(current.0.as_ref(), "gpt-a-live");
+        assert!(
+            available.keys().any(|id| id.0 == current.0),
+            "current model {current:?} must be in availableModels after logout"
+        );
+        assert!(!lists_model(&mgr, "gpt-a-live"));
+    }
+
+    /// A logout that never affected the active model leaves the user's pick
+    /// alone: the invariant only forces a switch when the model became
+    /// unusable.
+    #[test]
+    fn logout_keeps_a_still_usable_current_model() {
+        let account = codex_credentials("account-a");
+        let (slot, probe) = switchable_probe(Some(&account));
+        let (mgr, _tmp) = manager_with_codex_probe(probe);
+        mgr.set_current_model_id(acp::ModelId::new("grok-4.6"));
+
+        *slot.lock().unwrap() = None;
+        mgr.on_codex_auth_changed();
+        assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4.6");
     }
 }

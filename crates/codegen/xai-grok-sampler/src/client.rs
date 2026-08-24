@@ -155,16 +155,47 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
                     return Ok(event);
                 }
             }
-            tracing::error!(
-                error = %first_err,
-                raw_data = %data,
-                "Failed to deserialize ResponseStreamEvent from stream"
-            );
+            log_response_event_decode_failure(&first_err, data);
             return Err(SamplingError::Serialization(first_err));
         }
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+/// Classify a Responses-event decode failure before logging it. An unknown
+/// *top-level event kind* is expected provider growth — the stream layer
+/// skips it (`is_unknown_response_event_kind`), so it logs at debug with
+/// bounded metadata only. A known event with a malformed payload is a real
+/// wire-contract violation and stays an error, but with a bounded payload
+/// excerpt instead of the unbounded raw frame.
+fn log_response_event_decode_failure(err: &serde_json::Error, data: &str) {
+    const RAW_EXCERPT_MAX_CHARS: usize = 2048;
+    let message = err.to_string();
+    if crate::stream::responses::is_unknown_response_event_kind_message(&message) {
+        let event_kind = serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            event_kind = %event_kind,
+            payload_len = data.len(),
+            "skipping unknown Responses stream event kind"
+        );
+        return;
+    }
+    let raw_excerpt: String = data.chars().take(RAW_EXCERPT_MAX_CHARS).collect();
+    tracing::error!(
+        error = %message,
+        payload_len = data.len(),
+        raw_data = %raw_excerpt,
+        "Failed to deserialize ResponseStreamEvent from stream"
+    );
 }
 
 /// On terminal Responses API events (`response.completed` /

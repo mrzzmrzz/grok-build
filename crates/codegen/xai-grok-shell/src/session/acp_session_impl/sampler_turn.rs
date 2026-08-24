@@ -233,6 +233,13 @@ impl SessionActor {
     }
     /// Reads and populates [`Self::model_auth_memo`]; a fresh `Unknown`
     /// falls back to the last definite entry (see the field's contract).
+    ///
+    /// Resolution order: the `ModelsManager`'s merged, account-scoped
+    /// catalog first — the same source that supplied the picker entry, so a
+    /// live catalog-only Codex model keeps its provider identity — then the
+    /// static effective config for a model the manager does not know (e.g.
+    /// a just-edited `[model.*]` entry the catalog watcher has not folded in
+    /// yet).
     fn model_auth_state(
         &self,
         model_id: &str,
@@ -248,8 +255,10 @@ impl SessionActor {
         {
             return (memo.facts, memo.provider.clone());
         }
-        let (fresh, provider) =
-            crate::agent::config::resolve_model_auth_facts_and_provider(model_id);
+        let (fresh, provider) = match self.models_manager.model_auth_state(model_id) {
+            Some(state) if !model_id.is_empty() => state,
+            _ => crate::agent::config::resolve_model_auth_facts_and_provider(model_id),
+        };
         if fresh.byok == ModelByok::Unknown {
             if let Some(memo) = self.model_auth_memo.borrow().as_ref()
                 && memo.model_id == model_id
@@ -346,6 +355,83 @@ impl SessionActor {
             None,
         );
         self.set_chat_api_key(new_key).await;
+        true
+    }
+    /// 401 arm for a Codex OAuth session: force one refresh through the
+    /// Codex credential store and resubmit once. Provider-separated by
+    /// construction — it never touches the xAI `AuthManager`, and the
+    /// rotated token reaches the wire through the per-request
+    /// `CodexBearerResolver` (disk read), not chat-state credentials.
+    ///
+    /// Bounded: each 401 buys at most one forced refresh plus the single
+    /// replay the caller charges against the shared per-incident auth-retry
+    /// budget, and a permanently rejected refresh token is cached by
+    /// `codex_auth` so later 401s fail fast instead of re-refreshing.
+    ///
+    /// Fails closed (`false`, surfacing the 401) when the session carries no
+    /// OAuth identity anchor (an explicit-key Codex model cannot be repaired
+    /// by an OAuth rotation), when the refresh fails, or when the refreshed
+    /// credentials belong to a different account than the one this session
+    /// was configured with.
+    async fn try_codex_401_recovery(&self) -> bool {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return false;
+        };
+        if !crate::codex_auth::has_oauth_identity_anchor(&cfg.extra_headers) {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                "auth recovery: Codex 401 on an explicit-key session — not refreshable"
+            );
+            return false;
+        }
+        let credentials = match crate::codex_auth::force_refresh().await {
+            Ok(Some(credentials)) => credentials,
+            Ok(None) => {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    "auth recovery: Codex 401, no credentials on disk (logged out)"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    %error,
+                    "auth recovery: Codex 401, forced OAuth refresh failed"
+                );
+                xai_grok_telemetry::unified_log::warn(
+                    "auth recovery: Codex 401, forced OAuth refresh failed",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({ "error": format!("{error:#}") })),
+                );
+                return false;
+            }
+        };
+        let identity_matches = crate::codex_auth::credentials_match_identity_anchor(
+            &cfg.extra_headers,
+            &credentials,
+        );
+        if identity_matches != Some(true) {
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
+                "auth recovery: Codex 401, refreshed credentials belong to a different account — failing closed"
+            );
+            xai_grok_telemetry::unified_log::warn(
+                "auth recovery: Codex 401, account identity changed — failing closed",
+                Some(self.session_info.id.0.as_ref()),
+                None,
+            );
+            return false;
+        }
+        tracing::info!(
+            session_id = %self.session_info.id.0,
+            "auth recovery: Codex 401, OAuth refresh succeeded, retrying once"
+        );
+        xai_grok_telemetry::unified_log::info(
+            "auth recovery: Codex 401, OAuth refresh succeeded, retrying",
+            Some(self.session_info.id.0.as_ref()),
+            None,
+        );
         true
     }
     /// Gate inputs for `model_id` routed to `base_url`. See
@@ -948,13 +1034,33 @@ impl SessionActor {
             .await
             .map(|c| (c.model, c.base_url))
             .unwrap_or_default();
-        let auth_provider =
-            if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
-                self.model_auth_provider(&failed_model_id)
-            } else {
-                None
-            };
-        let auth_recovery_eligible = matches!(error.kind, SamplingErrorKind::Auth) && {
+        let failed_401 =
+            matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401);
+        // Provider-separated 401 recovery: a Codex session refreshes through
+        // Codex OAuth only. It is excluded from the xAI session-token
+        // eligibility below, so xAI credentials are never minted for (or
+        // waited on by) a Codex request.
+        let failed_model_is_codex = self.model_auth_facts(&failed_model_id).model_provider
+            == xai_grok_sampling_types::ModelProvider::Codex;
+        if failed_model_is_codex && failed_401 {
+            if self.try_codex_401_recovery().await {
+                self.prepare_sampler_for_turn().await;
+                return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                    credential: error.credential,
+                    store: RecoveredStore::AuthProvider,
+                });
+            }
+            // Unrecoverable Codex 401: fall through to the terminal error
+            // surfacing below — never into the xAI recovery paths.
+        }
+        let auth_provider = if failed_401 && !failed_model_is_codex {
+            self.model_auth_provider(&failed_model_id)
+        } else {
+            None
+        };
+        let auth_recovery_eligible = !failed_model_is_codex
+            && matches!(error.kind, SamplingErrorKind::Auth)
+            && {
             let gate = self.auth_gate(&failed_model_id, &failed_base_url);
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);

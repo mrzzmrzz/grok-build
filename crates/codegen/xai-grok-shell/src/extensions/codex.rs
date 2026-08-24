@@ -63,6 +63,15 @@ impl CodexUsageResponse {
     }
 }
 
+/// Serializes Codex login/logout end-to-end (each handler holds the guard
+/// for its full duration, browser wait included) so interleaved operations
+/// cannot reverse the user's final intent. A logout first cancels a pending
+/// login's callback wait (`codex_auth::cancel_pending_login`) *before*
+/// queueing here, so it never waits out the 10-minute browser window; the
+/// logout-generation fence inside `codex_auth` is the in-lock backstop that
+/// keeps a completed stale callback from resurrecting credentials.
+static CODEX_AUTH_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tracing::instrument(skip_all, fields(method = %args.method))]
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
@@ -80,10 +89,20 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
 /// admits Codex entries) and a background Codex catalog refresh is spawned so
 /// live GPT models appear in the picker without a restart.
 async fn handle_login(agent: &MvpAgent) -> ExtResult {
+    let _op = CODEX_AUTH_OP_LOCK.lock().await;
     match crate::codex_auth::run_tui_login().await {
         Ok(summary) => {
             tracing::info_span!("auth.lifecycle", action = "codex_login", success = true)
                 .in_scope(|| {});
+            // Account transition first: scope the in-memory catalog to the
+            // account that just logged in (and restore the current-model
+            // invariant) before anything is re-announced.
+            agent.models_manager.on_codex_auth_changed();
+            // Keep the OAuth bearer fresh for long-running sessions; the
+            // loop is a process-wide singleton, so a re-login is a no-op.
+            crate::codex_auth::start_proactive_refresh(
+                tokio_util::sync::CancellationToken::new(),
+            );
             notify_models_updated(agent);
             agent.models_manager.spawn_background_refresh();
             to_raw_response(&CodexAuthActionResponse {
@@ -108,10 +127,19 @@ async fn handle_login(agent: &MvpAgent) -> ExtResult {
 /// cache (never touches xAI auth), then re-announces the model catalog so
 /// Codex entries disappear from pickers via the login-gated visibility filter.
 async fn handle_logout(agent: &MvpAgent) -> ExtResult {
+    // Wake a login stuck on its browser callback before queueing on the
+    // operation lock, so this logout runs as soon as that login aborts
+    // instead of waiting out the callback window.
+    crate::codex_auth::cancel_pending_login();
+    let _op = CODEX_AUTH_OP_LOCK.lock().await;
     match crate::codex_auth::run_cli_logout().await {
         Ok(was_logged_in) => {
             tracing::info_span!("auth.lifecycle", action = "codex_logout", success = true)
                 .in_scope(|| {});
+            // Drop the logged-out account's in-memory catalog, fence any
+            // in-flight refresh, and move the current model onto an
+            // available fallback before the catalog is re-announced.
+            agent.models_manager.on_codex_auth_changed();
             notify_models_updated(agent);
             to_raw_response(&CodexAuthActionResponse {
                 ok: true,
@@ -216,6 +244,31 @@ mod tests {
     fn usage_response_logged_out_omits_optionals() {
         let wire = serde_json::to_value(CodexUsageResponse::logged_out()).unwrap();
         assert_eq!(wire, serde_json::json!({ "loggedIn": false }));
+    }
+
+    /// Concurrent login/logout serialize on the operation lock: a logout
+    /// issued while a login operation is in flight waits for it to finish
+    /// (its browser wait having been cancelled up front) instead of
+    /// interleaving with it.
+    #[tokio::test]
+    async fn concurrent_login_and_logout_serialize_on_the_op_lock() {
+        // The "login" holds the operation lock, as handle_login does for its
+        // full duration.
+        let login_guard = CODEX_AUTH_OP_LOCK.lock().await;
+        // The "logout" queues behind it, as handle_logout does.
+        let logout = tokio::spawn(async {
+            let _guard = CODEX_AUTH_OP_LOCK.lock().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !logout.is_finished(),
+            "logout must serialize behind the in-flight login operation"
+        );
+        drop(login_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), logout)
+            .await
+            .expect("logout proceeds once the login operation completes")
+            .unwrap();
     }
 
     #[test]

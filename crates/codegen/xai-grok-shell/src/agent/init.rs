@@ -170,6 +170,17 @@ fn init_process(cfg: &AgentConfig, auth_manager: &AuthManager) {
             // Clear a logged-out team's files before the background sync runs.
             crate::managed_config::clear_orphan();
             crate::managed_config::spawn_sync(tokio_util::sync::CancellationToken::new());
+            // Codex OAuth proactive refresh: process-lifetime loop (same
+            // token ownership pattern as the managed-config sync above) so
+            // a long-running session never sends an expired bearer. Started
+            // only when a Codex login exists; a mid-session login starts it
+            // from the login handler, and after logout the loop's refresh
+            // pass sees no credentials and idles.
+            if crate::codex_auth::is_logged_in() {
+                crate::codex_auth::start_proactive_refresh(
+                    tokio_util::sync::CancellationToken::new(),
+                );
+            }
         }
 
         let grok_home = crate::util::grok_home::grok_home();

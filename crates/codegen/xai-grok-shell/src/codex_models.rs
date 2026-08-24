@@ -19,15 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
-pub const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
-pub const CODEX_CLIENT_VERSION_ENV: &str = "GROK_CODEX_CLIENT_VERSION";
-pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
+pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
+pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "GROK_CODEX_CLIENT_VERSION";
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
 
 /// Resolve the whole semantic version sent to the Codex models endpoint.
-pub fn codex_client_version() -> String {
+pub(crate) fn codex_client_version() -> String {
     match std::env::var(CODEX_CLIENT_VERSION_ENV) {
         Ok(value) => normalize_whole_semver(&value)
             .unwrap_or_else(|| DEFAULT_CODEX_CLIENT_VERSION.to_owned()),
@@ -44,7 +44,7 @@ fn normalize_whole_semver(value: &str) -> Option<String> {
 /// Visibility supplied by the Codex catalog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CodexModelVisibility {
+pub(crate) enum CodexModelVisibility {
     List,
     Hide,
     #[default]
@@ -52,14 +52,14 @@ pub enum CodexModelVisibility {
 }
 
 impl CodexModelVisibility {
-    pub fn is_list_visible(self) -> bool {
+    pub(crate) fn is_list_visible(self) -> bool {
         self == Self::List
     }
 }
 
 /// A reasoning option returned by the Codex catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexReasoningLevel {
+pub(crate) struct CodexReasoningLevel {
     pub effort: String,
     #[serde(default)]
     pub description: String,
@@ -67,7 +67,7 @@ pub struct CodexReasoningLevel {
 
 /// One live Codex model, kept independent from the xAI model types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CodexCatalogModel {
+pub(crate) struct CodexCatalogModel {
     pub slug: String,
     pub display_name: String,
     #[serde(default)]
@@ -92,30 +92,44 @@ pub struct CodexCatalogModel {
 }
 
 impl CodexCatalogModel {
-    pub fn is_visible(&self) -> bool {
+    pub(crate) fn is_visible(&self) -> bool {
         self.visibility.is_list_visible()
     }
 }
 
 /// Account-scoped catalog snapshot returned by the live endpoint or cache.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CodexModelsCatalog {
+pub(crate) struct CodexModelsCatalog {
     pub models: Vec<CodexCatalogModel>,
     pub etag: Option<String>,
     account_fingerprint: String,
 }
 
 impl CodexModelsCatalog {
-    pub fn is_authoritative(&self) -> bool {
+    pub(crate) fn is_authoritative(&self) -> bool {
         self.models.iter().any(CodexCatalogModel::is_visible)
     }
 
-    pub fn list_visible_models(&self) -> impl Iterator<Item = &CodexCatalogModel> {
+    pub(crate) fn list_visible_models(&self) -> impl Iterator<Item = &CodexCatalogModel> {
         self.models.iter().filter(|model| model.is_visible())
     }
 
-    pub fn account_fingerprint(&self) -> &str {
+    pub(crate) fn account_fingerprint(&self) -> &str {
         &self.account_fingerprint
+    }
+
+    /// Test-only constructor for crate-internal tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        models: Vec<CodexCatalogModel>,
+        etag: Option<String>,
+        account_fingerprint: String,
+    ) -> Self {
+        Self {
+            models,
+            etag,
+            account_fingerprint,
+        }
     }
 }
 
@@ -216,7 +230,7 @@ impl CodexModelsAuthSource for ProductionCodexModelsAuthSource {
 
 /// Codex models transport and its provider-local cache policy.
 #[derive(Clone, Debug)]
-pub struct CodexModelsClient {
+pub(crate) struct CodexModelsClient {
     http: reqwest::Client,
     cache_path: PathBuf,
     base_url: String,
@@ -227,7 +241,7 @@ pub struct CodexModelsClient {
 }
 
 impl CodexModelsClient {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
             cache_path: crate::util::grok_home::grok_home().join(CODEX_MODELS_CACHE_FILE),
@@ -239,12 +253,12 @@ impl CodexModelsClient {
         }
     }
 
-    pub fn cache_path(&self) -> &Path {
+    pub(crate) fn cache_path(&self) -> &Path {
         &self.cache_path
     }
 
     /// Use only a fresh cache for the current account and endpoint.
-    pub fn load_fresh_cache(&self) -> Option<CodexModelsCatalog> {
+    pub(crate) fn load_fresh_cache(&self) -> Option<CodexModelsCatalog> {
         let credentials = self.auth.current_credentials().ok().flatten()?;
         self.load_fresh_cache_for(&credentials)
     }
@@ -254,7 +268,7 @@ impl CodexModelsClient {
     /// A matching cached catalog with an ETag turns this into a conditional
     /// request; a 304 revalidates the cache and extends its TTL without
     /// re-parsing a body.
-    pub async fn fetch_and_cache(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
+    pub(crate) async fn fetch_and_cache(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
         let Some(mut credentials) = self.auth.fresh_credentials().await? else {
             return Ok(None);
         };
@@ -311,7 +325,7 @@ impl CodexModelsClient {
         Ok(Some(catalog))
     }
 
-    pub async fn load_fresh_or_fetch(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
+    pub(crate) async fn load_fresh_or_fetch(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
         if let Some(catalog) = self.load_fresh_cache() {
             return Ok(Some(catalog));
         }
@@ -319,7 +333,7 @@ impl CodexModelsClient {
     }
 
     /// Recheck the stable account identity before publishing a completed fetch.
-    pub fn catalog_matches_current_account(&self, catalog: &CodexModelsCatalog) -> bool {
+    pub(crate) fn catalog_matches_current_account(&self, catalog: &CodexModelsCatalog) -> bool {
         self.auth
             .current_credentials()
             .ok()
@@ -329,7 +343,7 @@ impl CodexModelsClient {
     }
 
     /// Remove only the Codex catalog cache.
-    pub fn invalidate_cache(&self) {
+    pub(crate) fn invalidate_cache(&self) {
         match std::fs::remove_file(&self.cache_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -646,7 +660,11 @@ fn convert_model(wire: CodexWireModel) -> Option<CodexCatalogModel> {
     })
 }
 
-fn account_fingerprint(credentials: &CodexCredentials) -> Option<String> {
+/// Stable, non-reversible identity of a Codex account, used to scope the
+/// on-disk catalog cache and the in-memory `ModelsManager` catalog to the
+/// account that produced them. `None` when the credentials carry no stable
+/// identity at all.
+pub(crate) fn account_fingerprint(credentials: &CodexCredentials) -> Option<String> {
     if credentials.account_id.is_none()
         && credentials.chatgpt_user_id.is_none()
         && credentials.email.is_none()
