@@ -95,6 +95,27 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
         && responses_event_has_meaningful_content(event)
 }
 
+/// Whether a mid-stream deserialization failure names an event *kind* the
+/// typed enum does not know, as opposed to a known event whose payload is
+/// malformed.
+///
+/// The provider may add future side-channel events at any time; those must
+/// be skipped without failing the request (SPEC §9.4). A known event that
+/// fails to parse is a real wire-contract violation and stays a hard error —
+/// silently dropping it would corrupt the turn. The SSE decoder reports both
+/// as `SamplingError::Serialization`, so the split happens here on serde's
+/// stable unknown-variant message: only the top-level
+/// `ResponseStreamEvent` tag lists `response.created` among its expected
+/// variants, which keeps an unknown *nested* discriminator (a new output-item
+/// type inside a known event) on the hard-error path.
+fn is_unknown_response_event_kind(err: &SamplingError) -> bool {
+    let SamplingError::Serialization(serde_err) = err else {
+        return false;
+    };
+    let message = serde_err.to_string();
+    message.starts_with("unknown variant") && message.contains("`response.created`")
+}
+
 fn missing_tool_input_suffix(streamed: &mut String, complete: &str) -> Option<String> {
     let suffix = complete.strip_prefix(streamed.as_str())?;
     if suffix.is_empty() {
@@ -343,6 +364,30 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
 
             let event = match event_result {
                 Ok(event) => event,
+                // A future side-channel event kind the typed enum does not
+                // know: ignore it and keep the stream alive. It counts as
+                // liveness only, not content, so the content-aware idle
+                // check still applies before moving on.
+                Err(err) if is_unknown_response_event_kind(&err) => {
+                    tracing::debug!(
+                        request_id = %request_id,
+                        error = %err,
+                        "ignoring unknown Responses stream event kind"
+                    );
+                    if last_content_chunk_at.elapsed() > idle_timeout {
+                        let err = SamplingError::IdleTimeout {
+                            elapsed_secs: idle_timeout.as_secs(),
+                        };
+                        yield SamplingEvent::Failed {
+                            request_id: request_id.clone(),
+                            error: SamplingErrorInfo::from(&err),
+                        };
+                        return;
+                    }
+                    continue;
+                }
+                // Everything else — transport failures and known events with
+                // malformed payloads alike — fails the attempt loudly.
                 Err(err) => {
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
@@ -749,8 +794,12 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                     }
                 }
 
-                // All other events (intermediate progress, annotations,
-                // image gen, file search, etc.) — no action needed.
+                // All other *known* events (intermediate progress,
+                // annotations, image gen, file search, etc.) — parsed fine,
+                // no action needed. Unknown event kinds never reach this
+                // match: they are skipped at the deserialization boundary
+                // above, while known-but-malformed payloads fail the attempt
+                // there instead of being silently dropped here.
                 _ => {}
             }
 
@@ -1867,5 +1916,487 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ── Reasoning items, summary attribution, event policy ──────────────
+
+    fn reasoning_item(
+        id: &str,
+        summaries: &[&str],
+        encrypted: Option<&str>,
+    ) -> rs_types::OutputItem {
+        rs_types::OutputItem::Reasoning(rs_types::ReasoningItem {
+            id: id.into(),
+            summary: summaries
+                .iter()
+                .map(|text| {
+                    rs_types::SummaryPart::SummaryText(rs_types::SummaryTextContent {
+                        text: (*text).into(),
+                    })
+                })
+                .collect(),
+            content: None,
+            encrypted_content: encrypted.map(str::to_owned),
+            status: Some(rs_types::OutputStatus::Completed),
+        })
+    }
+
+    fn summary_delta_event(
+        output_index: u32,
+        summary_index: u32,
+        item_id: &str,
+        delta: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseReasoningSummaryTextDelta(
+            rs_types::ResponseReasoningSummaryTextDeltaEvent {
+                sequence_number: 0,
+                item_id: item_id.into(),
+                output_index,
+                summary_index,
+                delta: delta.into(),
+            },
+        )
+    }
+
+    fn reasoning_siblings(response: &ConversationResponse) -> Vec<&rs_types::ReasoningItem> {
+        response
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn summary_texts(reasoning: &rs_types::ReasoningItem) -> Vec<&str> {
+        reasoning
+            .summary
+            .iter()
+            .map(|part| match part {
+                rs_types::SummaryPart::SummaryText(t) => t.text.as_str(),
+            })
+            .collect()
+    }
+
+    /// A reasoning item in the terminal response keeps its wire identity —
+    /// item id and `encrypted_content` — in the conversation history, so a
+    /// later turn can replay it to the provider verbatim.
+    #[tokio::test]
+    async fn terminal_reasoning_item_keeps_id_and_encrypted_content() {
+        let mut final_resp = empty_completed_response();
+        final_resp.output = vec![
+            reasoning_item("rs_1", &["thought summary"], Some("enc-blob-1")),
+            output_message_item("msg-1", "the answer"),
+        ];
+        let completed =
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response: final_resp,
+                sequence_number: 1,
+            });
+        let raw = stream::iter(vec![Ok(completed)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = reasoning_siblings(response);
+                assert_eq!(reasoning.len(), 1);
+                assert_eq!(reasoning[0].id, "rs_1");
+                assert_eq!(reasoning[0].encrypted_content.as_deref(), Some("enc-blob-1"));
+                assert_eq!(summary_texts(reasoning[0]), vec!["thought summary"]);
+                assert_eq!(response.assistant_text(), "the answer");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A reasoning item that completed via `response.output_item.done`
+    /// survives a stream that dies before its terminal event, encrypted
+    /// content included (encrypted-reasoning durable recovery).
+    #[tokio::test]
+    async fn durable_recovery_keeps_encrypted_reasoning_item() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                reasoning_item("rs_enc", &[], Some("opaque-encrypted-bytes")),
+            )),
+            Ok(output_item_done_event(
+                1,
+                output_message_item("msg-1", "partial"),
+            )),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = reasoning_siblings(response);
+                assert_eq!(reasoning.len(), 1);
+                assert_eq!(reasoning[0].id, "rs_enc");
+                assert_eq!(
+                    reasoning[0].encrypted_content.as_deref(),
+                    Some("opaque-encrypted-bytes")
+                );
+                assert_eq!(response.assistant_text(), "partial");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Mixed recovery: a turn holding reasoning + a function call + text is
+    /// rebuilt whole from its durable items — the reasoning keeps its
+    /// identity and the tool call keeps its complete arguments, so the
+    /// replayed history is not missing the context the call is bound to.
+    #[tokio::test]
+    async fn mixed_reasoning_and_tool_durable_recovery_is_lossless() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                reasoning_item("rs_mix", &["will call the tool"], Some("enc-mix")),
+            )),
+            Ok(output_item_done_event(
+                1,
+                function_call_item("call_9", "run_query", "{\"sql\":\"select 1\"}"),
+            )),
+            Ok(output_item_done_event(
+                2,
+                output_message_item("msg-9", "running it"),
+            )),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = reasoning_siblings(response);
+                assert_eq!(reasoning.len(), 1);
+                assert_eq!(reasoning[0].id, "rs_mix");
+                assert_eq!(reasoning[0].encrypted_content.as_deref(), Some("enc-mix"));
+                let assistant = response.assistant().expect("assistant item");
+                assert_eq!(assistant.content.as_ref(), "running it");
+                assert_eq!(assistant.tool_calls.len(), 1);
+                assert_eq!(assistant.tool_calls[0].id.as_ref(), "call_9");
+                assert_eq!(assistant.tool_calls[0].name, "run_query");
+                assert_eq!(
+                    assistant.tool_calls[0].arguments.as_ref(),
+                    "{\"sql\":\"select 1\"}",
+                    "tool arguments must replay complete from the durable item"
+                );
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A client-executed custom tool call recovers its full input from the
+    /// durable item even when no delta ever streamed it.
+    #[tokio::test]
+    async fn custom_tool_call_durable_recovery_keeps_input() {
+        let done = output_item_done_event(
+            0,
+            rs_types::OutputItem::CustomToolCall(
+                serde_json::from_value::<rs_types::CustomToolCall>(serde_json::json!({
+                    "call_id": "call-7",
+                    "id": "ctc-7",
+                    "name": "grep_tool",
+                    "input": "pattern: needle",
+                }))
+                .expect("custom tool call fields satisfy the schema"),
+            ),
+        );
+        let raw = stream::iter(vec![Ok(done)]).boxed();
+        let events = collect(stream_responses_with_client_custom_tools(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            vec!["grep_tool".to_string()],
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let assistant = response.assistant().expect("assistant item");
+                assert_eq!(assistant.tool_calls.len(), 1);
+                let call = &assistant.tool_calls[0];
+                assert!(call.is_custom(), "custom envelope id expected");
+                assert_eq!(call.call_id(), "call-7");
+                assert_eq!(call.custom_item_id(), Some("ctc-7"));
+                assert_eq!(call.name, "grep_tool");
+                assert_eq!(call.arguments.as_ref(), "pattern: needle");
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Two reasoning items with their own summaries stay two distinct
+    /// history items: neither the durable path nor the item conversion may
+    /// blend one item's summary into the other (SPEC §10.1).
+    #[tokio::test]
+    async fn two_reasoning_items_keep_summaries_separate_in_history() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            // Interleaved summary deltas for both items (UI channel).
+            Ok(summary_delta_event(0, 0, "rs_a", "A summarizes. ")),
+            Ok(summary_delta_event(1, 0, "rs_b", "B summarizes. ")),
+            Ok(summary_delta_event(0, 1, "rs_a", "A concludes.")),
+            Ok(summary_delta_event(1, 1, "rs_b", "B concludes.")),
+            // Durable copies, then the stream dies before its terminal.
+            Ok(output_item_done_event(
+                0,
+                reasoning_item("rs_a", &["A summarizes. ", "A concludes."], None),
+            )),
+            Ok(output_item_done_event(
+                1,
+                reasoning_item("rs_b", &["B summarizes. ", "B concludes."], None),
+            )),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = reasoning_siblings(response);
+                assert_eq!(reasoning.len(), 2, "one history item per reasoning item");
+                assert_eq!(reasoning[0].id, "rs_a");
+                assert_eq!(
+                    summary_texts(reasoning[0]),
+                    vec!["A summarizes. ", "A concludes."]
+                );
+                assert_eq!(reasoning[1].id, "rs_b");
+                assert_eq!(
+                    summary_texts(reasoning[1]),
+                    vec!["B summarizes. ", "B concludes."]
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Interleaved summary deltas from two reasoning items land in the
+    /// recovery capture attributed by item id + summary index: the replay
+    /// yields one item per id, each holding only its own text in summary
+    /// order.
+    #[tokio::test]
+    async fn interleaved_summary_deltas_stay_attributed_in_capture() {
+        let capture = FailedResponseCapture::armed();
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(summary_delta_event(0, 0, "rs_a", "A first. ")),
+            Ok(summary_delta_event(1, 0, "rs_b", "B first. ")),
+            Ok(summary_delta_event(0, 1, "rs_a", "A second.")),
+            Ok(summary_delta_event(1, 1, "rs_b", "B second.")),
+            Err(SamplingError::EventStreamError("conn reset".into())),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses_tracked(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            capture.clone(),
+        ))
+        .await;
+        assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+
+        let items = capture.take_items();
+        let reasoning: Vec<&rs_types::ReasoningItem> = items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 2, "one replayed item per reasoning item");
+        let text_of = |r: &rs_types::ReasoningItem| {
+            r.content
+                .as_ref()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .map(|p| p.text.as_str())
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(reasoning[0].id, "rs_a");
+        assert_eq!(text_of(reasoning[0]), "A first. A second.");
+        assert_eq!(reasoning[1].id, "rs_b");
+        assert_eq!(text_of(reasoning[1]), "B first. B second.");
+    }
+
+    /// After a retry, the terminal `output` list is authoritative for the
+    /// replay capture too: items recorded from earlier durable frames are
+    /// superseded, not duplicated.
+    #[tokio::test]
+    async fn terminal_output_supersedes_captured_durable_items() {
+        let capture = FailedResponseCapture::armed();
+        let mut final_resp = empty_completed_response();
+        final_resp.output = vec![output_message_item("msg-1", "final text")];
+        let completed =
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response: final_resp,
+                sequence_number: 3,
+            });
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                reasoning_item("rs_pre", &["stale thought"], None),
+            )),
+            Ok(output_item_done_event(
+                1,
+                output_message_item("msg-1", "streamed text"),
+            )),
+            Ok(completed),
+        ];
+        let raw = stream::iter(events).boxed();
+        let _ = collect(stream_responses_tracked(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            capture.clone(),
+        ))
+        .await;
+
+        let items = capture.take_items();
+        assert_eq!(items.len(), 1, "terminal output replaces durable copies");
+        match &items[0] {
+            ConversationItem::Assistant(a) => assert_eq!(a.content.as_ref(), "final text"),
+            other => panic!("expected the terminal assistant text, got {other:?}"),
+        }
+    }
+
+    // ── Event policy: malformed vs unknown event kinds ──────────────────
+
+    fn serialization_error_for(payload: &str) -> SamplingError {
+        SamplingError::Serialization(
+            serde_json::from_str::<rs::ResponseStreamEvent>(payload)
+                .expect_err("payload must not parse as a known stream event"),
+        )
+    }
+
+    #[test]
+    fn unknown_event_kind_classifier() {
+        // Unknown top-level event type → ignorable.
+        assert!(is_unknown_response_event_kind(&serialization_error_for(
+            r#"{"type":"response.reticulating_splines","sequence_number":1}"#
+        )));
+        // Known event type with a malformed payload → hard error.
+        assert!(!is_unknown_response_event_kind(&serialization_error_for(
+            r#"{"type":"response.output_text.delta","sequence_number":1}"#
+        )));
+        // Non-serialization errors are never reclassified.
+        assert!(!is_unknown_response_event_kind(
+            &SamplingError::EventStreamError("conn reset".into())
+        ));
+    }
+
+    /// A future side-channel event the enum does not know is skipped with a
+    /// debug log; the stream keeps flowing and completes normally.
+    #[tokio::test]
+    async fn unknown_future_event_is_ignored_and_stream_completes() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Err(serialization_error_for(
+                r#"{"type":"response.future_side_channel","sequence_number":1,"payload":{"x":1}}"#,
+            )),
+            Ok(text_delta_event("hello")),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Failed { .. })),
+            "unknown event kinds must not fail the stream"
+        );
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "");
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SamplingEvent::ChannelToken { text, .. } if text == "hello"
+        )));
+    }
+
+    /// A known event kind whose payload is malformed fails the attempt
+    /// explicitly rather than being skipped.
+    #[tokio::test]
+    async fn malformed_known_event_fails_the_stream() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(text_delta_event("hi")),
+            // Missing `item_id` / `output_index` / `delta` etc.
+            Err(serialization_error_for(
+                r#"{"type":"response.output_text.delta","sequence_number":2}"#,
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Serialization);
+            }
+            other => panic!("expected Failed(Serialization), got {other:?}"),
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SamplingEvent::Completed { .. })),
+            "a malformed known event must not be silently skipped"
+        );
     }
 }

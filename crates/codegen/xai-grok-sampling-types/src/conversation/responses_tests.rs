@@ -1945,6 +1945,206 @@ fn tool_result_image_only_parts_serialize_in_order() {
     );
 }
 
+/// An empty completed `rs::Response` shell for round-trip tests; callers
+/// fill in `output`.
+fn minimal_response() -> rs::Response {
+    rs::Response {
+        background: None,
+        billing: None,
+        conversation: None,
+        created_at: 0,
+        completed_at: None,
+        error: None,
+        id: "resp_rt".to_string(),
+        incomplete_details: None,
+        instructions: None,
+        max_output_tokens: None,
+        metadata: None,
+        model: "grok-3".to_string(),
+        object: "response".to_string(),
+        output: vec![],
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        reasoning: None,
+        safety_identifier: None,
+        service_tier: None,
+        status: rs::Status::Completed,
+        temperature: None,
+        text: None,
+        tool_choice: None,
+        tools: None,
+        top_logprobs: None,
+        top_p: None,
+        truncation: None,
+        usage: None,
+    }
+}
+
+/// A reasoning item must survive the whole round trip — wire response →
+/// conversation history → next-turn request input — with its item id,
+/// summary parts, reasoning text content, and `encrypted_content` intact.
+/// Only the output-only `status` field is stripped on the way back out.
+#[test]
+fn reasoning_item_round_trips_lossless_from_response_to_request() {
+    let wire_reasoning = rs::ReasoningItem {
+        id: "rs_lossless_1".to_string(),
+        summary: vec![
+            rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                text: "First summary paragraph.".to_string(),
+            }),
+            rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                text: "Second summary paragraph.".to_string(),
+            }),
+        ],
+        content: Some(vec![
+            rs::ReasoningTextContent {
+                text: "raw thought one".to_string(),
+            },
+            rs::ReasoningTextContent {
+                text: "raw thought two".to_string(),
+            },
+        ]),
+        encrypted_content: Some("enc_opaque_blob==".to_string()),
+        status: Some(rs::OutputStatus::Completed),
+    };
+
+    let mut response = minimal_response();
+    response.output = vec![
+        rs::OutputItem::Reasoning(wire_reasoning.clone()),
+        rs::OutputItem::Message(rs::OutputMessage {
+            content: vec![rs::OutputMessageContent::OutputText(
+                rs::OutputTextContent {
+                    text: "answer".to_string(),
+                    annotations: vec![],
+                    logprobs: None,
+                },
+            )],
+            id: "msg_1".to_string(),
+            role: rs::AssistantRole::Assistant,
+            status: rs::OutputStatus::Completed,
+        }),
+    ];
+
+    // Wire → history: the reasoning sibling is the wire item, verbatim.
+    let history = response_to_conversation_items(response);
+    let stored = history
+        .iter()
+        .find_map(|item| match item {
+            ConversationItem::Reasoning(r) => Some(r),
+            _ => None,
+        })
+        .expect("reasoning sibling in history");
+    assert_eq!(stored, &wire_reasoning, "history stores the wire item as-is");
+
+    // History → next request: replayed verbatim minus the output-only
+    // `status`.
+    let mut items = vec![ConversationItem::user("question")];
+    items.extend(history);
+    items.push(ConversationItem::user("follow-up"));
+    let req = ConversationRequest::from_items(items);
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(input_items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let replayed = input_items
+        .iter()
+        .find_map(|item| match item {
+            rs::InputItem::Item(rs::Item::Reasoning(r)) => Some(r),
+            _ => None,
+        })
+        .expect("reasoning input item");
+
+    let mut expected = wire_reasoning;
+    expected.status = None;
+    assert_eq!(
+        replayed, &expected,
+        "id, summary, content and encrypted_content replay losslessly; status is stripped"
+    );
+}
+
+/// Two reasoning items convert to two distinct history siblings, each
+/// keeping only its own summary, and replay in emission order — one item's
+/// summary must never bleed into the other (SPEC §10.1).
+#[test]
+fn two_reasoning_items_keep_summaries_apart_through_round_trip() {
+    let reasoning = |id: &str, summary: &str, enc: &str| {
+        rs::OutputItem::Reasoning(rs::ReasoningItem {
+            id: id.to_string(),
+            summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                text: summary.to_string(),
+            })],
+            content: None,
+            encrypted_content: Some(enc.to_string()),
+            status: Some(rs::OutputStatus::Completed),
+        })
+    };
+    let mut response = minimal_response();
+    response.output = vec![
+        reasoning("rs_a", "summary of A", "enc_a"),
+        reasoning("rs_b", "summary of B", "enc_b"),
+        rs::OutputItem::Message(rs::OutputMessage {
+            content: vec![rs::OutputMessageContent::OutputText(
+                rs::OutputTextContent {
+                    text: "done".to_string(),
+                    annotations: vec![],
+                    logprobs: None,
+                },
+            )],
+            id: "msg_ab".to_string(),
+            role: rs::AssistantRole::Assistant,
+            status: rs::OutputStatus::Completed,
+        }),
+    ];
+
+    let history = response_to_conversation_items(response);
+    let stored: Vec<&rs::ReasoningItem> = history
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Reasoning(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored.len(), 2);
+    let summary_of = |r: &rs::ReasoningItem| -> String {
+        r.summary
+            .iter()
+            .map(|sp| match sp {
+                rs::SummaryPart::SummaryText(t) => t.text.as_str(),
+            })
+            .collect()
+    };
+    assert_eq!(stored[0].id, "rs_a");
+    assert_eq!(summary_of(stored[0]), "summary of A");
+    assert_eq!(stored[0].encrypted_content.as_deref(), Some("enc_a"));
+    assert_eq!(stored[1].id, "rs_b");
+    assert_eq!(summary_of(stored[1]), "summary of B");
+    assert_eq!(stored[1].encrypted_content.as_deref(), Some("enc_b"));
+
+    // Replay keeps both items, in order, still separate.
+    let mut items = vec![ConversationItem::user("q")];
+    items.extend(history);
+    let req = ConversationRequest::from_items(items);
+    let responses_req: rs::CreateResponse = (&req).into();
+    let rs::InputParam::Items(input_items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    let replayed: Vec<&rs::ReasoningItem> = input_items
+        .iter()
+        .filter_map(|item| match item {
+            rs::InputItem::Item(rs::Item::Reasoning(r)) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(replayed[0].id, "rs_a");
+    assert_eq!(summary_of(replayed[0]), "summary of A");
+    assert_eq!(replayed[1].id, "rs_b");
+    assert_eq!(summary_of(replayed[1]), "summary of B");
+}
+
 #[test]
 fn tool_result_empty_parts_keeps_legacy_shape() {
     // Empty `parts` falls back to the legacy layout even when constructed
