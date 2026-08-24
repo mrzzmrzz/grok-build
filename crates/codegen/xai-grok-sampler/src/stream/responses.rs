@@ -338,6 +338,9 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
         // response id, ...) for a durable-output recovery.
         let mut created_response: Option<rs::Response> = None;
         let mut chunk_index: u64 = 0;
+        // (item_id, summary_index) of the last reasoning-summary delta, for
+        // paragraph breaks at part boundaries.
+        let mut last_summary_part: Option<(String, u32)> = None;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
         let mut reasoning_acc = String::new();
@@ -503,6 +506,28 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                             first_token_emitted = true;
                             yield SamplingEvent::FirstToken {
                                 request_id: request_id.clone(),
+                            };
+                        }
+                        // A reasoning item carries multiple summary parts
+                        // (distinct summary_index, and Codex regularly sends
+                        // several per item). The parts are separate paragraphs;
+                        // concatenating their deltas verbatim fuses them into
+                        // one line ("**A****B**"), so a part boundary emits a
+                        // paragraph break into the thought stream first.
+                        let part = (
+                            summary_event.item_id.clone(),
+                            summary_event.summary_index,
+                        );
+                        let crossed_boundary =
+                            last_summary_part.as_ref().is_some_and(|prev| prev != &part);
+                        last_summary_part = Some(part);
+                        if crossed_boundary {
+                            chunk_index += 1;
+                            yield SamplingEvent::ChannelToken {
+                                request_id: request_id.clone(),
+                                channel: SamplingChannel::Reasoning,
+                                text: "\n\n".to_string(),
+                                chunk_index,
                             };
                         }
                         chunk_index += 1;
@@ -2565,6 +2590,53 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// Distinct summary parts are separate paragraphs on the thought
+    /// channel: a part boundary emits a "\n\n" break, and deltas within one
+    /// part stay unseparated. Without the break, Codex's multi-part
+    /// summaries fuse into one line ("**A****B**").
+    #[tokio::test]
+    async fn summary_part_boundaries_break_paragraphs_on_the_thought_channel() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(summary_delta_event(0, 0, "rs_a", "**Planning the task**")),
+            Ok(summary_delta_event(0, 0, "rs_a", " continued")),
+            Ok(summary_delta_event(0, 1, "rs_a", "**Verifying the env**")),
+            Ok(summary_delta_event(1, 0, "rs_b", "**Next item**")),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let reasoning_texts: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning_texts.concat(),
+            "**Planning the task** continued\n\n**Verifying the env**\n\n**Next item**"
+        );
+        assert_eq!(
+            reasoning_texts
+                .iter()
+                .filter(|t| t.as_str() == "\n\n")
+                .count(),
+            2,
+            "exactly one break per part boundary"
+        );
     }
 
     /// Interleaved summary deltas from two reasoning items land in the

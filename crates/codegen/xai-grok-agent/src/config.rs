@@ -349,6 +349,10 @@ fn codex_toolset() -> ToolServerConfig {
             (&codex::ApplyPatchTool).into(),
             (&codex::CodexListDirTool).into(),
             (&codex::CodexGrepFilesTool).into(),
+            // Subagent spawning. The set already carried the task *output*
+            // and kill tools; without the spawner itself, a "use a subagent"
+            // request sends the model hunting for lookalike MCP automations.
+            task_tool_config(),
             kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             task_output_tool_config(),
