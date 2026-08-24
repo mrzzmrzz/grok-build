@@ -30,12 +30,23 @@ fn codex_feedback_agent_id(app: &AppView) -> AgentId {
     }
 }
 
+/// Bump the Codex auth operation generation: each login/logout supersedes
+/// any still-pending predecessor, whose completion is then dropped as stale
+/// by [`handle_codex_auth_result`]. Latest intent wins — e.g. a `/logout
+/// codex` issued while `/login codex` still waits on its browser callback
+/// must not have the old login report success afterwards.
+fn next_codex_auth_generation(app: &mut AppView) -> u64 {
+    app.codex_auth_generation += 1;
+    app.codex_auth_generation
+}
+
 /// `/login codex` — run the shell's Codex browser OAuth flow. Provider-
 /// isolated: xAI auth state and the welcome-screen login UI are untouched.
 /// The shell replies when the OAuth callback lands (or fails), and pushes a
 /// `x.ai/models/update` on success so GPT models appear without a restart.
 pub(super) fn dispatch_codex_login(app: &mut AppView) -> Vec<Effect> {
     let agent_id = codex_feedback_agent_id(app);
+    let generation = next_codex_auth_generation(app);
     let notice = "Connecting OpenAI Codex: finish signing in via your browser\u{2026}";
     if let ActiveView::Agent(id) = app.active_view
         && let Some(agent) = app.agents.get_mut(&id)
@@ -47,23 +58,45 @@ pub(super) fn dispatch_codex_login(app: &mut AppView) -> Vec<Effect> {
     } else {
         app.show_toast(notice);
     }
-    vec![Effect::CodexLogin { agent_id }]
+    vec![Effect::CodexLogin {
+        agent_id,
+        generation,
+    }]
 }
 
 /// `/logout codex` — remove only the Codex credential; xAI auth is kept and
 /// no view change happens (unlike the bare `/logout` welcome-screen flow).
 pub(super) fn dispatch_codex_logout(app: &mut AppView) -> Vec<Effect> {
     let agent_id = codex_feedback_agent_id(app);
-    vec![Effect::CodexLogout { agent_id }]
+    let generation = next_codex_auth_generation(app);
+    vec![Effect::CodexLogout {
+        agent_id,
+        generation,
+    }]
 }
 
 /// Route a Codex login/logout result message: scrollback when the owning
 /// agent is still in view, otherwise a toast (first line only).
+///
+/// A result from a superseded operation (`generation` older than the current
+/// one) is dropped without touching UI state: reporting "Connected" after
+/// the user already ran `/logout codex` (or vice versa) would misstate their
+/// latest intent. The shell owns the credential store, so only the report is
+/// suppressed here; a debug trace records the drop.
 pub(super) fn handle_codex_auth_result(
     app: &mut AppView,
     agent_id: AgentId,
+    generation: u64,
     message: String,
 ) -> Vec<Effect> {
+    if generation < app.codex_auth_generation {
+        tracing::debug!(
+            generation,
+            current = app.codex_auth_generation,
+            "dropping stale Codex auth result superseded by a newer operation"
+        );
+        return vec![];
+    }
     let on_agent_view = matches!(app.active_view, ActiveView::Agent(id) if id == agent_id);
     if on_agent_view && let Some(agent) = app.agents.get_mut(&agent_id) {
         super::queue::push_and_page_flip(&mut agent.scrollback, RenderBlock::system(message));

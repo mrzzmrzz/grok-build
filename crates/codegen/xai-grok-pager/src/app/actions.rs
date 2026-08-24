@@ -2193,9 +2193,12 @@ pub enum Effect {
         nonce: u64,
     },
     /// Run the shell's Codex browser login (`x.ai/codex/login`).
-    CodexLogin { agent_id: AgentId },
+    /// `generation` is the operation generation stamped at dispatch; the
+    /// result handler drops completions older than the current one.
+    CodexLogin { agent_id: AgentId, generation: u64 },
     /// Remove the Codex credential (`x.ai/codex/logout`).
-    CodexLogout { agent_id: AgentId },
+    /// `generation`: see [`Effect::CodexLogin`].
+    CodexLogout { agent_id: AgentId, generation: u64 },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions. `agent_id` rides
@@ -2854,14 +2857,18 @@ pub enum TaskResult {
         nonce: u64,
     },
     /// `/login codex` finished. `Err` is a transport-level failure; an OAuth
-    /// failure arrives as `Ok(resp)` with `resp.ok == false`.
+    /// failure arrives as `Ok(resp)` with `resp.ok == false`. Dropped as
+    /// stale when `generation` is older than the current Codex auth
+    /// generation (a newer login/logout superseded this operation).
     CodexLoginFinished {
         agent_id: AgentId,
+        generation: u64,
         result: Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
     },
-    /// `/logout codex` finished.
+    /// `/logout codex` finished. Same staleness gate as `CodexLoginFinished`.
     CodexLogoutFinished {
         agent_id: AgentId,
+        generation: u64,
         result: Result<Box<xai_grok_shell::extensions::codex::CodexAuthActionResponse>, String>,
     },
     /// Feedback submitted successfully (fire-and-forget).

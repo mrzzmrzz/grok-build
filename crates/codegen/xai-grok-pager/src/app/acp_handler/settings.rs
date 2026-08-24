@@ -485,18 +485,23 @@ pub(super) fn apply_announcements_update(
     );
     let announcements = xai_grok_announcements::filter_expired(merged);
 
-    // Selection-stage severity gate (shared predicate with the startup pick in
-    // `event_loop`): a retained current announcement must still be displayable,
-    // and the random re-pick draws from displayable (critical) notices only.
+    // Selection-stage visibility gate (shared predicate with the startup pick
+    // in `event_loop` and the welcome hero fallback): a retained current
+    // announcement must still be displayable, and the random re-pick draws
+    // from displayable (live, unhidden critical) notices only.
     app.announcement = match app.announcement.as_ref() {
         Some(current) => announcements
             .iter()
             .find(|a| {
-                *a == current && crate::views::announcements::is_displayable_announcement(a)
+                *a == current
+                    && crate::views::announcements::is_displayable_announcement(
+                        a,
+                        &app.hidden_announcement_ids,
+                    )
             })
             .cloned()
-            .or_else(|| pick_random_announcement(&announcements)),
-        None => pick_random_announcement(&announcements),
+            .or_else(|| pick_random_announcement(&announcements, &app.hidden_announcement_ids)),
+        None => pick_random_announcement(&announcements, &app.hidden_announcement_ids),
     };
     app.active_announcements = announcements;
     app.announcements_last_gen = next_gen;
@@ -513,16 +518,18 @@ pub(super) fn apply_announcements_update(
     app.sync_session_announcement_slash_gate();
 }
 
-/// Uniform random pick over the displayable (critical-only) announcements.
-/// The severity filter runs at selection time — the same
-/// `is_displayable_announcement` predicate the startup pick uses — so a
-/// promotional announcement can never enter the pool.
+/// Uniform random pick over the displayable (live, unhidden critical)
+/// announcements. The visibility filter runs at selection time — the same
+/// `is_displayable_announcement` predicate the startup pick and the welcome
+/// hero fallback use — so a promotional, hidden, expired, or empty
+/// announcement can never enter the pool.
 pub(super) fn pick_random_announcement(
     announcements: &[xai_grok_announcements::RemoteAnnouncement],
+    hidden_ids: &std::collections::BTreeSet<String>,
 ) -> Option<xai_grok_announcements::RemoteAnnouncement> {
     let displayable: Vec<&xai_grok_announcements::RemoteAnnouncement> = announcements
         .iter()
-        .filter(|a| crate::views::announcements::is_displayable_announcement(a))
+        .filter(|a| crate::views::announcements::is_displayable_announcement(a, hidden_ids))
         .collect();
     if displayable.is_empty() {
         return None;

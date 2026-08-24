@@ -1193,14 +1193,24 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             crate::app::status_blocks::codex_usage_block_text(&usage),
             nonce,
         ),
-        TaskResult::CodexLoginFinished { agent_id, result } => handle_codex_auth_result(
+        TaskResult::CodexLoginFinished {
+            agent_id,
+            generation,
+            result,
+        } => handle_codex_auth_result(
             app,
             agent_id,
+            generation,
             crate::app::status_blocks::codex_login_result_text(&result),
         ),
-        TaskResult::CodexLogoutFinished { agent_id, result } => handle_codex_auth_result(
+        TaskResult::CodexLogoutFinished {
+            agent_id,
+            generation,
+            result,
+        } => handle_codex_auth_result(
             app,
             agent_id,
+            generation,
             crate::app::status_blocks::codex_logout_result_text(&result),
         ),
         TaskResult::FeedbackComplete { .. } => vec![],

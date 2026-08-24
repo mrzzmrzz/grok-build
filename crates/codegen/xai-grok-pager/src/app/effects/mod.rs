@@ -3559,22 +3559,24 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::CodexLogin { agent_id } => {
+        Effect::CodexLogin { agent_id, generation } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
                     TaskResult::CodexLoginFinished {
                         agent_id,
+                        generation,
                         result: codex_auth_rpc("x.ai/codex/login", &tx).await,
                     }
                 });
         }
-        Effect::CodexLogout { agent_id } => {
+        Effect::CodexLogout { agent_id, generation } => {
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
                     TaskResult::CodexLogoutFinished {
                         agent_id,
+                        generation,
                         result: codex_auth_rpc("x.ai/codex/logout", &tx).await,
                     }
                 });

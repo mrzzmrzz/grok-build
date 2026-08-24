@@ -175,6 +175,7 @@ pub(crate) fn test_app() -> AppView {
         auth_code_input: LineEditor::default(),
         next_auth_request_seq: 1,
         auth_url_poll_handle: None,
+        codex_auth_generation: 0,
         deferred_startup: Default::default(),
         auth_use_oauth: false,
         auth_clipboard_delivery: None,

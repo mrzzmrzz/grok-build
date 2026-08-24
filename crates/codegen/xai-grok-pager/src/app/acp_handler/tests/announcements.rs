@@ -275,6 +275,59 @@
         );
     }
 
+    /// Hidden ids gate the settings-push pick and retention too (the shared
+    /// visibility predicate covers hidden/expiry/content, not just severity):
+    /// a critical whose hide key is stored can neither be picked nor retained
+    /// as `app.announcement`, so the welcome hero fallback cannot redisplay a
+    /// hidden critical the banner selection correctly skips.
+    #[test]
+    fn announcements_update_pick_and_retention_skip_hidden() {
+        let mut app = make_app_with_agent("sess-ann");
+        app.hidden_announcement_ids = ["outage-a".to_string()].into_iter().collect();
+        apply_announcements_update(
+            &mut app,
+            1,
+            &[critical_announcement("outage-a")],
+            None,
+            None,
+            None,
+        );
+        assert!(
+            app.announcement.is_none(),
+            "hidden critical must not enter the random pool"
+        );
+
+        // A previously-picked critical the user has since hidden must be
+        // dropped by the retention leg on the next push, not kept alive for
+        // the welcome fallback.
+        let mut app = make_app_with_agent("sess-ann");
+        apply_announcements_update(
+            &mut app,
+            1,
+            &[critical_announcement("outage-a")],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            app.announcement.as_ref().and_then(|a| a.id.as_deref()),
+            Some("outage-a")
+        );
+        app.hidden_announcement_ids.insert("outage-a".to_string());
+        apply_announcements_update(
+            &mut app,
+            2,
+            &[critical_announcement("outage-a")],
+            None,
+            None,
+            None,
+        );
+        assert!(
+            app.announcement.is_none(),
+            "a now-hidden current announcement must not be retained"
+        );
+    }
+
     /// A mid-session push must open the `/announcements` gate on already-live
     /// subagent child views, not just top-level agents. Driven through the
     /// layer-injected seam (no real `~/.grok` reads).

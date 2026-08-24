@@ -40,15 +40,33 @@ fn is_critical(a: &xai_grok_announcements::RemoteAnnouncement) -> bool {
     a.severity.as_deref() == Some("critical")
 }
 
-/// The ONE selection-pool predicate for passive announcement surfaces:
-/// only critical operational notices may be displayed. Every seam that
-/// picks an announcement for passive UI (random selection at startup,
-/// re-pick on a settings push, the welcome hero fallback) filters through
-/// this so promotional severities can never re-enter by one path drifting.
+/// The ONE visibility predicate for passive announcement surfaces:
+/// critical severity, non-empty (trimmed) message, not expired, and not
+/// hidden (with the non-dismissible exception in [`is_hidden`]). Every seam
+/// that picks or shows an announcement for passive UI — the session-banner
+/// selection, the random pick at startup, the re-pick on a settings push,
+/// and the welcome hero fallback — filters through this, so no path can
+/// drift and redisplay a promotional, hidden, expired, or empty notice.
 pub(crate) fn is_displayable_announcement(
     a: &xai_grok_announcements::RemoteAnnouncement,
+    hidden_ids: &BTreeSet<String>,
 ) -> bool {
-    is_critical(a)
+    is_displayable_announcement_at(a, hidden_ids, chrono::Utc::now())
+}
+
+/// [`is_displayable_announcement`] with an injectable clock.
+fn is_displayable_announcement_at(
+    a: &xai_grok_announcements::RemoteAnnouncement,
+    hidden_ids: &BTreeSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    has_visible_message(a) && is_live_critical(a, now) && !is_hidden(a, hidden_ids)
+}
+
+/// Non-empty trimmed message — the same "visible" meaning as the
+/// announcements crate's `visible_announcements` list filter.
+fn has_visible_message(a: &xai_grok_announcements::RemoteAnnouncement) -> bool {
+    a.message.as_ref().is_some_and(|m| !m.trim().is_empty())
 }
 
 /// One definition of "live critical" (visible message + critical + not expired)
@@ -93,19 +111,20 @@ fn first_critical_session_announcement<'a>(
 /// unhidden one. Info/warning stay welcome-only and do not open the
 /// in-session slot. Private: prod consumers go through
 /// [`first_session_announcement`]'s `.or_else` leg so slot precedence is
-/// structurally enforced. Skips expired items at selection (draw) time so an
-/// `expires_at` crossed mid-session stops rendering before the next server
-/// push; the per-call timestamp parse and hide-key build are
-/// allocation-light and the gate runs at most a few times per frame over a
-/// tiny list, so no caching is needed.
+/// structurally enforced. Selection is the shared
+/// [`is_displayable_announcement_at`] predicate, so it skips expired items
+/// at selection (draw) time — an `expires_at` crossed mid-session stops
+/// rendering before the next server push; the per-call timestamp parse and
+/// hide-key build are allocation-light and the gate runs at most a few
+/// times per frame over a tiny list, so no caching is needed.
 fn first_critical_session_announcement_at<'a>(
     announcements: &'a [xai_grok_announcements::RemoteAnnouncement],
     hidden_ids: &BTreeSet<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<&'a xai_grok_announcements::RemoteAnnouncement> {
-    visible_announcements(announcements)
-        .into_iter()
-        .find(|a| is_live_critical(a, now) && !is_hidden(a, hidden_ids))
+    announcements
+        .iter()
+        .find(|a| is_displayable_announcement_at(a, hidden_ids, now))
 }
 
 /// The single banner-slot item: the first live, unhidden critical notice.
@@ -600,7 +619,7 @@ mod tests {
         // The selection-pool predicate (event_loop / settings-push random pick
         // and the welcome hero fallback all share it) must not pass a promo.
         assert!(
-            !is_displayable_announcement(&announcements[0]),
+            !is_displayable_announcement(&announcements[0], &no_hidden()),
             "promo must not pass the selection predicate"
         );
 
@@ -613,35 +632,145 @@ mod tests {
         assert!(!rendered.contains("Upgrade"), "passive promo leaked: {rendered:?}");
     }
 
-    /// The shared selection predicate is critical-only: it gates the random
-    /// pick in `event_loop`, `pick_random_announcement` on a settings push,
-    /// and the welcome hero's `self.announcement` fallback, so any severity
-    /// other than critical must be rejected here.
+    /// The shared visibility predicate gates the random pick in `event_loop`,
+    /// `pick_random_announcement` on a settings push, the session banner
+    /// selection, and the welcome hero's `self.announcement` fallback. Any
+    /// severity other than critical must be rejected here.
     #[test]
     fn is_displayable_announcement_permits_critical_only() {
         for severity in [Some("info"), Some("warning"), Some("promo"), None] {
             assert!(
-                !is_displayable_announcement(&ann(severity, Some("msg"))),
+                !is_displayable_announcement(&ann(severity, Some("msg")), &no_hidden()),
                 "severity {severity:?} must not be displayable"
             );
         }
-        assert!(is_displayable_announcement(&ann(
-            Some("critical"),
-            Some("outage")
-        )));
+        assert!(is_displayable_announcement(
+            &ann(Some("critical"), Some("outage")),
+            &no_hidden()
+        ));
         // Welcome-fallback shape: `.filter(is_displayable_announcement)` on a
         // stored announcement drops a promo and keeps a critical.
         let stored = Some(promo("p", "upsell", Some(("Go", "https://x.ai"))));
         assert!(
-            stored.as_ref().filter(|a| is_displayable_announcement(a)).is_none(),
+            stored
+                .as_ref()
+                .filter(|a| is_displayable_announcement(a, &no_hidden()))
+                .is_none(),
             "welcome fallback must not render a non-critical announcement"
         );
         let stored = Some(ann(Some("critical"), Some("outage")));
         assert!(
             stored
                 .as_ref()
-                .filter(|a| is_displayable_announcement(a))
+                .filter(|a| is_displayable_announcement(a, &no_hidden()))
                 .is_some()
+        );
+    }
+
+    /// Hidden, expired, and empty-content criticals must fail the shared
+    /// predicate too — the welcome hero fallback previously rechecked only
+    /// severity, so a critical the primary selection correctly filtered
+    /// could resurface through it.
+    #[test]
+    fn is_displayable_announcement_rejects_hidden_expired_and_empty() {
+        // Hidden critical: filtered — the fallback cannot redisplay it.
+        let crit = RemoteAnnouncement {
+            id: Some("c".into()),
+            severity: Some("critical".into()),
+            message: Some("outage".into()),
+            ..Default::default()
+        };
+        let hidden: BTreeSet<String> = ["c".to_string()].into_iter().collect();
+        assert!(
+            !is_displayable_announcement(&crit, &hidden),
+            "hidden critical must not be displayable via any surface"
+        );
+        // ... except an explicit `dismissible: false`, matching the primary
+        // selection's server-flag override of a stored hide key.
+        let pinned = RemoteAnnouncement {
+            dismissible: Some(false),
+            ..crit.clone()
+        };
+        assert!(
+            is_displayable_announcement(&pinned, &hidden),
+            "non-dismissible critical ignores stored hide keys"
+        );
+
+        // Expired critical: filtered at check (draw) time even though it may
+        // still sit in the stored pick or the ingested list.
+        let expired = RemoteAnnouncement {
+            severity: Some("critical".into()),
+            message: Some("gone".into()),
+            expires_at: Some("2000-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(
+            !is_displayable_announcement(&expired, &no_hidden()),
+            "expired critical must not be displayable"
+        );
+
+        // Empty / whitespace-only message: nothing to show.
+        for message in [None, Some("   ")] {
+            assert!(
+                !is_displayable_announcement(&ann(Some("critical"), message), &no_hidden()),
+                "empty-content critical must not be displayable (message={message:?})"
+            );
+        }
+    }
+
+    /// The banner selection and the fallback predicate are the SAME gate:
+    /// whenever `first_session_announcement` skips an item (hidden, expired,
+    /// promo, empty), the fallback predicate must skip it too — no
+    /// announcement can be filtered by the primary path yet resurface
+    /// through the welcome hero fallback.
+    #[test]
+    fn primary_selection_and_fallback_share_one_visibility_gate() {
+        let now = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let hidden: BTreeSet<String> = ["hidden-crit".to_string()].into_iter().collect();
+        let items = vec![
+            RemoteAnnouncement {
+                id: Some("hidden-crit".into()),
+                severity: Some("critical".into()),
+                message: Some("hidden".into()),
+                ..Default::default()
+            },
+            RemoteAnnouncement {
+                id: Some("expired-crit".into()),
+                severity: Some("critical".into()),
+                message: Some("expired".into()),
+                expires_at: Some("2000-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            promo("promo", "upsell", None),
+            ann(Some("critical"), Some("   ")),
+        ];
+        for a in &items {
+            assert!(
+                !is_displayable_announcement_at(a, &hidden, now),
+                "fallback predicate must reject {:?}",
+                a.id
+            );
+        }
+        assert!(
+            first_session_announcement_at(&items, &hidden, now).is_none(),
+            "primary selection rejects the same set"
+        );
+
+        let live = RemoteAnnouncement {
+            id: Some("live".into()),
+            severity: Some("critical".into()),
+            message: Some("live outage".into()),
+            ..Default::default()
+        };
+        assert!(is_displayable_announcement_at(&live, &hidden, now));
+        let mut with_live = items.clone();
+        with_live.push(live);
+        assert_eq!(
+            first_session_announcement_at(&with_live, &hidden, now).and_then(|a| a.id.as_deref()),
+            Some("live"),
+            "both gates admit the one live, unhidden critical"
         );
     }
 

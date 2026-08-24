@@ -1121,6 +1121,12 @@ pub struct AppView {
     /// Abort handle for the in-flight `PollAuthUrl` task (with its request_seq).
     /// Aborted alongside the Authenticate task in single-flight re-login.
     pub auth_url_poll_handle: Option<(u64, tokio::task::AbortHandle)>,
+    /// Operation generation for Codex login/logout. Each `/login codex` or
+    /// `/logout codex` bumps it; a completion stamped with an older value is
+    /// stale (a newer operation superseded it) and is dropped instead of
+    /// reporting an outcome the user already overrode. Mirrors the usage
+    /// modal's fetch-nonce gate.
+    pub codex_auth_generation: u64,
     /// Every session/chat/worktree/prompt action deferred behind startup gates.
     pub deferred_startup: crate::app::session_startup::DeferredStartupActions,
     /// Whether deferred welcome-screen login should force OAuth.
@@ -1635,6 +1641,7 @@ impl AppView {
             auth_code_input: LineEditor::default(),
             next_auth_request_seq: 1,
             auth_url_poll_handle: None,
+            codex_auth_generation: 0,
             deferred_startup: Default::default(),
             auth_use_oauth: false,
             auth_clipboard_delivery: None,
@@ -4606,17 +4613,24 @@ impl AppView {
                         };
                         // Welcome hero announcement: the live critical session
                         // banner selection, else the stored random pick — which
-                        // the shared critical-only predicate re-filters
-                        // (belt-and-braces with the selection-stage gate) so a
-                        // non-critical announcement can never render here.
+                        // the shared visibility predicate re-filters at draw
+                        // time (belt-and-braces with the selection-stage gate)
+                        // so a non-critical, hidden, expired, or empty stored
+                        // announcement can never resurface through the
+                        // fallback.
                         let hero_announcement =
                             crate::views::announcements::first_session_announcement(
                                 &self.active_announcements,
                                 &self.hidden_announcement_ids,
                             )
-                            .or(self.announcement.as_ref().filter(|a| {
-                                crate::views::announcements::is_displayable_announcement(a)
-                            }));
+                            .or(self.announcement.as_ref().filter(
+                                |a| {
+                                    crate::views::announcements::is_displayable_announcement(
+                                        a,
+                                        &self.hidden_announcement_ids,
+                                    )
+                                },
+                            ));
                         let welcome_params = crate::views::welcome::WelcomeRenderParams {
                             prompt_focus: if self.welcome_prompt_focused {
                                 WelcomePromptFocus::Focused

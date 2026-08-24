@@ -499,6 +499,17 @@ fn suspend_for_child(
     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let _ = crossterm::event::read();
     }
+    // Re-query the CURRENT color scheme now that stale input is drained: mode
+    // 2031 was disabled while the child owned the terminal, so a theme switch
+    // during the child went unreported (and any report the child's own toggle
+    // provoked was just discarded above). Re-enabling only reports FUTURE
+    // switches — the one-shot query is what reconciles auto theming
+    // immediately, mirroring the startup enable+request pairing in
+    // `app::run`. The reply arrives as a `ThemeModeChanged` event once the
+    // reader unparks and flows through the normal routing.
+    xai_grok_shell::util::with_locked_stderr(|stderr| {
+        let _ = write_theme_mode_resync(stderr);
+    });
     // Post-child cursor probe: `Some` iff the child left the cursor somewhere
     // other than where it found it; restore_after_child uses that to re-anchor
     // minimal mode after main-screen output.
@@ -510,6 +521,16 @@ fn suspend_for_child(
     while input_rx.try_recv().is_ok() {}
     input_paused.store(false, Ordering::Release);
     Ok(moved_cursor)
+}
+
+/// One-shot theme-mode query (`CSI ? 996 n`) issued when a child process
+/// returns the terminal. Split out over a generic writer so the resume
+/// path's query bytes are unit-testable — the mode-2031 re-enable alone only
+/// reports future theme switches, so without this query a theme changed
+/// while the child owned the terminal would stay stale until the next
+/// switch.
+fn write_theme_mode_resync(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::execute!(writer, crossterm::event::RequestThemeMode)
 }
 
 /// Coalesces draw requests, gates in-flight frames, and owns draw cadence.
@@ -1519,13 +1540,19 @@ pub(crate) async fn run(
             remote_announcements,
         );
         app.active_announcements = xai_grok_announcements::filter_expired(announcements);
-        // Selection-stage severity gate: only critical notices may enter the
-        // random pool (the shared predicate keeps this in lockstep with the
-        // settings-push re-pick in `acp_handler::settings`).
+        // Selection-stage visibility gate: only live, unhidden critical
+        // notices may enter the random pool (the shared predicate keeps this
+        // in lockstep with the settings-push re-pick in
+        // `acp_handler::settings` and the welcome hero fallback).
         let displayable: Vec<&xai_grok_announcements::RemoteAnnouncement> = app
             .active_announcements
             .iter()
-            .filter(|a| crate::views::announcements::is_displayable_announcement(a))
+            .filter(|a| {
+                crate::views::announcements::is_displayable_announcement(
+                    a,
+                    &app.hidden_announcement_ids,
+                )
+            })
             .collect();
         if !displayable.is_empty() {
             use rand::Rng;
@@ -4517,6 +4544,26 @@ fn process_effects(
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    /// The child-resume theme resync must emit the one-shot mode-996 query
+    /// (`CSI ? 996 n`) — the same query the startup pairing in `app::run`
+    /// issues — and NOT rely on the mode-2031 re-enable, which only reports
+    /// future switches. Guards the fix for a theme gone stale across a child
+    /// process (e.g. the OS theme flipped while an editor owned the tty).
+    #[test]
+    fn theme_mode_resync_emits_one_shot_query() {
+        let mut out: Vec<u8> = Vec::new();
+        write_theme_mode_resync(&mut out).expect("write to Vec cannot fail");
+        let s = String::from_utf8(out).expect("query is ASCII");
+        assert!(
+            s.contains("\x1b[?996n"),
+            "resume resync must request the CURRENT theme mode; got {s:?}"
+        );
+        assert!(
+            !s.contains("?2031"),
+            "resync is the query alone; mode-2031 enable is re-armed separately"
+        );
+    }
 
     #[test]
     fn typeahead_classification_keeps_text_drops_noise_and_control() {

@@ -814,15 +814,32 @@ fn auth_complete_preserves_show_resolved_model_when_absent() {
 
 // ── Codex login/logout dispatch tests ────────────────────────────────
 
-fn codex_auth_ok(email: Option<&str>, plan: Option<&str>) -> TaskResult {
+fn codex_auth_ok(generation: u64, email: Option<&str>, plan: Option<&str>) -> TaskResult {
     TaskResult::CodexLoginFinished {
         agent_id: AgentId(0),
+        generation,
         result: Ok(Box::new(
             xai_grok_shell::extensions::codex::CodexAuthActionResponse {
                 ok: true,
                 email: email.map(String::from),
                 plan_type: plan.map(String::from),
                 was_logged_in: None,
+                error: None,
+            },
+        )),
+    }
+}
+
+fn codex_logout_ok(generation: u64) -> TaskResult {
+    TaskResult::CodexLogoutFinished {
+        agent_id: AgentId(0),
+        generation,
+        result: Ok(Box::new(
+            xai_grok_shell::extensions::codex::CodexAuthActionResponse {
+                ok: true,
+                email: None,
+                plan_type: None,
+                was_logged_in: Some(true),
                 error: None,
             },
         )),
@@ -837,7 +854,8 @@ fn codex_login_from_agent_view_pushes_notice_and_effect() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::CodexLogin { agent_id }] if *agent_id == AgentId(0)
+            [Effect::CodexLogin { agent_id, generation }]
+                if *agent_id == AgentId(0) && *generation == 1
         ),
         "got: {effects:?}"
     );
@@ -854,9 +872,10 @@ fn codex_login_from_agent_view_pushes_notice_and_effect() {
 #[test]
 fn codex_login_result_lands_in_active_agent_scrollback() {
     let mut app = test_app_with_agent();
+    dispatch(Action::CodexLogin, &mut app);
     let before = agent_scrollback_len(&app);
     let effects = dispatch(
-        Action::TaskComplete(codex_auth_ok(Some("dev@example.com"), Some("plus"))),
+        Action::TaskComplete(codex_auth_ok(1, Some("dev@example.com"), Some("plus"))),
         &mut app,
     );
     assert!(effects.is_empty());
@@ -874,7 +893,7 @@ fn codex_login_result_toasts_when_agent_not_in_view() {
     app.active_view = ActiveView::Welcome;
     let before = agent_scrollback_len(&app);
     dispatch(
-        Action::TaskComplete(codex_auth_ok(Some("dev@example.com"), None)),
+        Action::TaskComplete(codex_auth_ok(0, Some("dev@example.com"), None)),
         &mut app,
     );
     assert_eq!(agent_scrollback_len(&app), before, "no scrollback push");
@@ -895,6 +914,7 @@ fn codex_login_failure_hints_device_auth_flow() {
     dispatch(
         Action::TaskComplete(TaskResult::CodexLoginFinished {
             agent_id: AgentId(0),
+            generation: 0,
             result: Err("could not open a browser".to_string()),
         }),
         &mut app,
@@ -914,29 +934,85 @@ fn codex_logout_dispatches_effect_and_reports_result() {
     assert!(
         matches!(
             effects.as_slice(),
-            [Effect::CodexLogout { agent_id }] if *agent_id == AgentId(0)
+            [Effect::CodexLogout { agent_id, generation }]
+                if *agent_id == AgentId(0) && *generation == 1
         ),
         "got: {effects:?}"
     );
-    dispatch(
-        Action::TaskComplete(TaskResult::CodexLogoutFinished {
-            agent_id: AgentId(0),
-            result: Ok(Box::new(
-                xai_grok_shell::extensions::codex::CodexAuthActionResponse {
-                    ok: true,
-                    email: None,
-                    plan_type: None,
-                    was_logged_in: Some(true),
-                    error: None,
-                },
-            )),
-        }),
-        &mut app,
-    );
+    dispatch(Action::TaskComplete(codex_logout_ok(1)), &mut app);
     assert!(
         last_system_text(&app, AgentId(0)).contains("Disconnected OpenAI Codex."),
         "logout confirmation expected"
     );
     // Bare-logout welcome flow must not trigger.
     assert_eq!(app.active_view, ActiveView::Agent(AgentId(0)));
+}
+
+/// `login -> logout -> old login callback`: the login completion carries the
+/// superseded generation and must be dropped — no scrollback push, no toast —
+/// while the logout's own completion still reports normally. The user's final
+/// intent (logged out) is what the UI reflects.
+#[test]
+fn codex_stale_login_result_after_logout_is_dropped() {
+    let mut app = test_app_with_agent();
+    let login_effects = dispatch(Action::CodexLogin, &mut app);
+    let logout_effects = dispatch(Action::CodexLogout, &mut app);
+    assert!(matches!(
+        login_effects.as_slice(),
+        [Effect::CodexLogin { generation: 1, .. }]
+    ));
+    assert!(matches!(
+        logout_effects.as_slice(),
+        [Effect::CodexLogout { generation: 2, .. }]
+    ));
+
+    // Logout completes first, then the old login's browser callback lands.
+    dispatch(Action::TaskComplete(codex_logout_ok(2)), &mut app);
+    assert!(
+        last_system_text(&app, AgentId(0)).contains("Disconnected OpenAI Codex."),
+        "current-generation logout must report"
+    );
+
+    let before = agent_scrollback_len(&app);
+    let effects = dispatch(
+        Action::TaskComplete(codex_auth_ok(1, Some("dev@example.com"), Some("plus"))),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(
+        agent_scrollback_len(&app),
+        before,
+        "stale login success must not be reported"
+    );
+    assert!(
+        !last_system_text(&app, AgentId(0)).contains("Connected to OpenAI Codex"),
+        "stale login must not override the logout report"
+    );
+}
+
+/// Two rapid logins: only the newest generation's completion is reported;
+/// the superseded one is dropped even though both are login results.
+#[test]
+fn codex_back_to_back_logins_report_only_latest() {
+    let mut app = test_app_with_agent();
+    dispatch(Action::CodexLogin, &mut app); // generation 1
+    dispatch(Action::CodexLogin, &mut app); // generation 2
+
+    let before = agent_scrollback_len(&app);
+    let stale = dispatch(
+        Action::TaskComplete(codex_auth_ok(1, Some("old@example.com"), None)),
+        &mut app,
+    );
+    assert!(stale.is_empty());
+    assert_eq!(agent_scrollback_len(&app), before, "stale login dropped");
+
+    dispatch(
+        Action::TaskComplete(codex_auth_ok(2, Some("new@example.com"), None)),
+        &mut app,
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(
+        text.contains("new@example.com") && !text.contains("old@example.com"),
+        "only the latest login reports; got: {text}"
+    );
 }
