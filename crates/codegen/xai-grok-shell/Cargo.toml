@@ -155,6 +155,8 @@ xai-grok-session-search = { workspace = true }
 xai-token-estimation = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
 xai-grok-tools = { path = "../xai-grok-tools" }
+xai-grok-code-mode = { workspace = true }
+xai-grok-code-mode-protocol = { workspace = true }
 xai-tty-utils = { workspace = true }
 xai-workflow = { path = "../xai-workflow" }
 xai-system-power = { workspace = true }

@@ -553,6 +553,14 @@ fn encode_custom_tool_call_id(call_id: &str, item_id: &str) -> Arc<str> {
     ))
 }
 
+/// Whether `id` sits in the reserved native custom-tool-call namespace (see
+/// [`CUSTOM_TOOL_CALL_ID_PREFIX`]). Lets the shell distinguish a native
+/// custom call (raw text input, e.g. Code Mode `exec`) from an ordinary
+/// function call without widening the persisted `ToolCall` shape.
+pub fn is_reserved_custom_tool_call_id(id: &str) -> bool {
+    decode_custom_tool_call_id(id).is_some()
+}
+
 fn decode_custom_tool_call_id(id: &str) -> Option<(&str, &str)> {
     if let Some(encoded) = id.strip_prefix(CUSTOM_TOOL_CALL_ID_V2_PREFIX) {
         let (len, rest) = encoded.split_once(':')?;
@@ -1763,13 +1771,21 @@ pub fn upgrade_legacy_reasoning(
                         kind: BackendToolKind::WebSearch(ws),
                     }));
                 }
+                // A custom tool call in legacy raw_output is only a backend
+                // x_search carrier when it is NOT a client-executed custom
+                // tool: Code Mode's `exec` also arrives as
+                // `rs::OutputItem::CustomToolCall`, and it is already
+                // represented as a `ToolCall` on the assistant row — lifting
+                // it to a BackendToolCall sibling would duplicate it and
+                // misclassify it as x_search.
                 rs::OutputItem::CustomToolCall(ct)
-                    if sibling_btc_ids_seen.insert(ct.id.clone()) =>
+                    if ct.name != "exec" && sibling_btc_ids_seen.insert(ct.id.clone()) =>
                 {
                     siblings.push(ConversationItem::BackendToolCall(BackendToolCallItem {
                         kind: BackendToolKind::XSearch(ct),
                     }));
                 }
+                rs::OutputItem::CustomToolCall(_) => {}
                 rs::OutputItem::CodeInterpreterCall(ci)
                     if sibling_btc_ids_seen.insert(ci.id.clone()) =>
                 {
@@ -2168,6 +2184,15 @@ pub fn transform_conversation_cwd(
                 if t.content.contains(source_cwd) {
                     t.content = Arc::<str>::from(t.content.replace(source_cwd, target_cwd));
                 }
+                // Ordered parts are authoritative on the Responses wire when
+                // non-empty; rewrite them in lockstep with the legacy mirror.
+                for part in t.parts.iter_mut() {
+                    if let ContentPart::Text { text } = part
+                        && text.contains(source_cwd)
+                    {
+                        *text = Arc::<str>::from(text.replace(source_cwd, target_cwd));
+                    }
+                }
             }
             // Backend tool calls don't contain workspace paths — no-op.
             ConversationItem::BackendToolCall(_) => {}
@@ -2555,6 +2580,48 @@ mod compaction_item_bridge_tests {
 #[cfg(test)]
 mod custom_tool_call_id_tests {
     use super::*;
+
+    #[test]
+    fn reserved_namespace_predicate_matches_both_prefix_generations() {
+        assert!(is_reserved_custom_tool_call_id(
+            "custom_tool_call.v2:6:call_1fc_9"
+        ));
+        assert!(is_reserved_custom_tool_call_id("custom_tool_call:call_1:fc_9"));
+        assert!(!is_reserved_custom_tool_call_id("call_ordinary"));
+        assert!(!is_reserved_custom_tool_call_id("fc_123"));
+    }
+
+    /// Legacy-row upgrade must not lift a client-executed custom tool call
+    /// (Code Mode `exec`) into a BackendToolCall(XSearch) sibling — it is
+    /// already represented as a `ToolCall` on the assistant row.
+    #[test]
+    fn upgrade_legacy_reasoning_skips_client_custom_exec_calls() {
+        let mut seen = std::collections::HashSet::new();
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "content": "",
+            "raw_output": [
+                {"type":"custom_tool_call","id":"ct_exec","call_id":"call_1",
+                 "name":"exec","input":"text('hi')"},
+                {"type":"custom_tool_call","id":"ct_x","call_id":"call_2",
+                 "name":"x_search_internal","input":"query"}
+            ]
+        });
+        let siblings = upgrade_legacy_reasoning(&raw, &mut seen);
+        let btc_ids: Vec<&str> = siblings
+            .iter()
+            .filter_map(|s| match s {
+                ConversationItem::BackendToolCall(b) => Some(b.id()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            btc_ids,
+            vec!["ct_x"],
+            "exec must be excluded, the backend custom carrier kept"
+        );
+        assert!(!seen.contains("ct_exec"));
+    }
 
     fn round_trip(call_id: &str, item_id: &str) {
         let encoded = encode_custom_tool_call_id(call_id, item_id);

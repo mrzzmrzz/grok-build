@@ -1,6 +1,9 @@
 //! Session/plan-mode concern for `SessionActor` (`handle_session_mode`,
-//! plan-mode reminders and persistence, active-template detection).
+//! plan-mode reminders and persistence, active-template detection), plus the
+//! Code Mode session integration (per-turn plan refresh, nested-call bridge,
+//! cell termination).
 use super::*;
+use super::tool_calls::{PlanEditGate, plan_mode_edit_gate};
 pub(super) fn prompt_mode_from_session_mode_id(session_mode_id: &acp::SessionModeId) -> PromptMode {
     use xai_grok_tools::types::SessionMode;
     match SessionMode::from_id(session_mode_id.0.as_ref()) {
@@ -402,5 +405,673 @@ impl SessionActor {
             .notifications
             .persistence_tx
             .send(PersistenceMsg::PlanModeState(snapshot));
+    }
+}
+// ---------------------------------------------------------------------------
+// Code Mode session integration
+// ---------------------------------------------------------------------------
+impl SessionActor {
+    /// Cached effective Code Mode plan for the current model.
+    pub(crate) fn code_mode_plan(&self) -> crate::tools::code_mode::CodeModeTurnPlan {
+        self.tool_context.code_mode.plan()
+    }
+    /// Recompute the effective Code Mode plan for the current model and bring
+    /// the session's runtime/tool registrations in line with it.
+    ///
+    /// Runs at every turn start, after the tool definitions are prepared:
+    /// - Mode comes from the merged account-scoped catalog (`tool_mode`,
+    ///   absent ⇒ Classic — fail closed) and the transport from the model's
+    ///   provider profile.
+    /// - Entering code mode lazily creates the jitless V8 runtime, registers
+    ///   `exec`/`wait` on the toolset, mounts the [`CodeModeHandle`] resource,
+    ///   and refreshes the nested-tool projection.
+    /// - Leaving code mode (or staying Classic) tears the runtime down and
+    ///   unregisters the tools.
+    ///
+    /// Returns `Err` when the catalog declares a code mode but the runtime
+    /// cannot initialize; the caller must fail the turn (never silently fall
+    /// back to the classic tool list).
+    ///
+    /// [`CodeModeHandle`]: xai_grok_tools::implementations::code_mode::CodeModeHandle
+    pub(crate) async fn refresh_code_mode_for_turn(
+        self: &Arc<Self>,
+        defs: &[crate::sampling::types::ToolDefinition],
+    ) -> Result<(), String> {
+        use crate::tools::code_mode::CodeModeTurnPlan;
+        let model_id = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|c| c.model)
+            .unwrap_or_default();
+        let mode = crate::agent::config::model_tool_mode(
+            &self.models_manager.models(),
+            &model_id,
+        );
+        if !mode.is_code_mode() {
+            let previously_active = self.tool_context.code_mode.code_mode_active()
+                || self.tool_context.code_mode.handle().is_some();
+            self.tool_context.code_mode.set_plan(CodeModeTurnPlan {
+                model_id,
+                mode,
+                ..CodeModeTurnPlan::default()
+            });
+            if previously_active {
+                self.tool_context
+                    .code_mode
+                    .shutdown_detached("model is classic mode");
+                self.agent
+                    .borrow()
+                    .tool_bridge()
+                    .toolset()
+                    .unregister_code_mode_tools();
+            }
+            return Ok(());
+        }
+        let provider = self.model_auth_facts(&model_id).model_provider;
+        let transport =
+            xai_grok_sampling_types::ProviderProfile::for_provider(provider).code_mode_transport;
+        let raw_defs = Self::code_mode_nested_projection(defs);
+        let exec_description = xai_grok_code_mode_protocol::build_exec_tool_description(
+            &raw_defs,
+            /*deferred_tools*/ &[],
+            &std::collections::BTreeMap::new(),
+            /*code_mode_only*/ mode == crate::agent::config::ToolMode::CodeModeOnly,
+        );
+        match self.tool_context.code_mode.ensure_runtime() {
+            Ok((handle, bridge_rx)) => {
+                let enabled_for_runtime = raw_defs
+                    .into_iter()
+                    .map(xai_grok_code_mode_protocol::augment_tool_definition)
+                    .collect();
+                self.tool_context
+                    .code_mode
+                    .update_enabled_tools(enabled_for_runtime);
+                let bridge = self.agent.borrow().tool_bridge().clone();
+                bridge.toolset().register_code_mode_tools();
+                bridge.update_resource(handle).await;
+                if let Some((rx, generation)) = bridge_rx {
+                    self.spawn_code_mode_bridge_consumer(rx, generation);
+                }
+                self.tool_context.code_mode.set_plan(CodeModeTurnPlan {
+                    model_id,
+                    mode,
+                    transport: Some(transport),
+                    exec_description,
+                    init_error: None,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id = %self.session_info.id.0,
+                    model_id = %model_id,
+                    error = %error,
+                    "code mode runtime initialization failed; failing turn closed"
+                );
+                self.tool_context.code_mode.set_plan(CodeModeTurnPlan {
+                    model_id,
+                    mode,
+                    transport: Some(transport),
+                    exec_description: String::new(),
+                    init_error: Some(error.clone()),
+                });
+                Err(format!(
+                    "This model requires Code Mode, but the Code Mode runtime failed to \
+                     initialize: {error}"
+                ))
+            }
+        }
+    }
+    /// Project the registry tool definitions into the code-mode nested-tool
+    /// namespace, excluding `exec`/`wait` themselves.
+    fn code_mode_nested_projection(
+        defs: &[crate::sampling::types::ToolDefinition],
+    ) -> Vec<xai_grok_code_mode_protocol::ToolDefinition> {
+        defs.iter()
+            .filter(|d| {
+                xai_grok_code_mode_protocol::is_code_mode_nested_tool(&d.function.name)
+            })
+            .map(|d| xai_grok_code_mode_protocol::ToolDefinition {
+                name: d.function.name.clone(),
+                tool_name: xai_grok_code_mode_protocol::ToolName::plain(
+                    d.function.name.clone(),
+                ),
+                description: d.function.description.clone().unwrap_or_default(),
+                kind: xai_grok_code_mode_protocol::CodeModeToolKind::Function,
+                input_schema: Some(d.function.parameters.clone()),
+                output_schema: None,
+            })
+            .collect()
+    }
+    /// Consume nested calls / notifications bridged from cell tasks; each
+    /// nested call runs on the actor's `LocalSet` so it can re-enter the
+    /// hook, permission, and plan-mode gates.
+    ///
+    /// Every message is fenced against the runtime `generation` this consumer
+    /// was spawned for: after `shutdown_detached` bumps the generation (model
+    /// switch / close / rewind), queued work is rejected synchronously here —
+    /// a write queued under the previous runtime can never dispatch.
+    fn spawn_code_mode_bridge_consumer(
+        self: &Arc<Self>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::tools::code_mode::CodeModeBridgeMsg>,
+        generation: u64,
+    ) {
+        use crate::tools::code_mode::CodeModeBridgeMsg;
+        let weak = Arc::downgrade(self);
+        tokio::task::spawn_local(async move {
+            while let Some(msg) = rx.recv().await {
+                let Some(session) = weak.upgrade() else { break };
+                let stale =
+                    session.tool_context.code_mode.current_generation() != generation;
+                match msg {
+                    CodeModeBridgeMsg::NestedCall {
+                        call,
+                        cancellation_token,
+                        respond_to,
+                    } => {
+                        if stale {
+                            let _ = respond_to.send(Err(
+                                "code mode runtime was shut down; nested call rejected"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        tokio::task::spawn_local(async move {
+                            let result = tokio::select! {
+                                biased;
+                                _ = cancellation_token.cancelled() => {
+                                    Err("nested tool call cancelled".to_string())
+                                }
+                                result = session.run_code_mode_nested_call(&call) => result,
+                            };
+                            let _ = respond_to.send(result);
+                        });
+                    }
+                    CodeModeBridgeMsg::Notify {
+                        tool_call_id,
+                        cell_id,
+                        text,
+                        respond_to,
+                    } => {
+                        if stale {
+                            let _ = respond_to.send(Ok(()));
+                            continue;
+                        }
+                        session
+                            .handle_code_mode_notify(tool_call_id, cell_id, text)
+                            .await;
+                        let _ = respond_to.send(Ok(()));
+                    }
+                }
+            }
+        });
+    }
+    /// One nested tool call from a running cell. Re-enters the PreToolUse
+    /// hooks (deny + rewritten-input reparse), the plan-mode write gate, and
+    /// the permission gate exactly like a model-issued call, serializes
+    /// same-path writes on the shared per-path lock, and fires the
+    /// PostToolUse / PostToolUseFailure hooks and telemetry afterwards.
+    ///
+    /// Contract with the cell: logical failures (`ToolOutput::is_error`) and
+    /// every rejection reject the JS promise with a clean error string;
+    /// successes resolve with the tool's structured value where it has one
+    /// (MCP `CallToolResult` shape, image content) and a plain string for
+    /// purely textual outputs.
+    ///
+    /// Deliberate deviations from the batch path, kept narrow: client-side
+    /// (reverse-request) PreToolUse gate hooks are not consulted — their deny
+    /// path writes a paired tool_result into the conversation, which a nested
+    /// call must never do — and session-lifecycle tools (plan mode
+    /// enter/exit) are rejected outright rather than intercepted.
+    async fn run_code_mode_nested_call(
+        self: &Arc<Self>,
+        call: &xai_grok_code_mode_protocol::CodeModeNestedToolCall,
+    ) -> Result<serde_json::Value, String> {
+        let wire_name = call.tool_name.to_string();
+        if !xai_grok_code_mode_protocol::is_code_mode_nested_tool(&wire_name) {
+            return Err(format!("tool `{wire_name}` cannot be called from inside exec"));
+        }
+        let mut input_value = call
+            .input
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        let mut tool_input = self
+            .tool_bridge_handle()
+            .try_parse(&wire_name, input_value.clone())
+            .await
+            .map_err(|e| format!("invalid input for `{wire_name}`: {e}"))?;
+        Self::reject_lifecycle_nested_tool(&wire_name, &tool_input)?;
+        let ui_call_id = format!("codemode-{}-{}", call.cell_id, call.runtime_tool_call_id);
+        // PreToolUse hooks — same registry dispatcher and rewrite semantics
+        // as prepare_tool_call.
+        let mut resolved_tool_name = tool_input
+            .dispatch_target_name()
+            .unwrap_or_else(|| wire_name.clone());
+        if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PreToolUse) {
+            let envelope =
+                self.make_pre_tool_use_envelope(&resolved_tool_name, &ui_call_id, &input_value);
+            let hook_registry_snapshot = self.hook_registry.borrow().clone();
+            if let Some(registry) = hook_registry_snapshot {
+                let ctx = self.hook_run_ctx();
+                let pre_result =
+                    xai_grok_hooks::dispatcher::dispatch_pre_tool_use(&registry, &envelope, &ctx)
+                        .await;
+                self.send_hook_execution(
+                    "pre_tool_use",
+                    Some(&resolved_tool_name),
+                    None,
+                    &pre_result.results,
+                )
+                .await;
+                self.emit_hook_executed_telemetry(
+                    "pre_tool_use",
+                    Some(&resolved_tool_name),
+                    &pre_result.results,
+                )
+                .await;
+                if let xai_grok_hooks::result::HookDecision::Deny { reason, hook_name } =
+                    pre_result.decision
+                {
+                    return Err(format!(
+                        "Tool `{resolved_tool_name}` was denied by hook `{hook_name}`: {reason}"
+                    ));
+                }
+                if let Some(rewrite) = pre_result.updated_input {
+                    let updated = rewrite.input;
+                    tool_input = self
+                        .tool_bridge_handle()
+                        .try_parse(&wire_name, updated.clone())
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "PreToolUse hook '{}' returned an invalid updatedInput: {e}",
+                                rewrite.hook_name
+                            )
+                        })?;
+                    Self::reject_lifecycle_nested_tool(&wire_name, &tool_input)?;
+                    input_value = updated;
+                    resolved_tool_name = tool_input
+                        .dispatch_target_name()
+                        .unwrap_or_else(|| wire_name.clone());
+                }
+            }
+        }
+        let access_kind = AccessKind::from(&tool_input);
+        // Plan-mode write gate (same funnel as prepare_tool_call).
+        let plan_gate = plan_mode_edit_gate(&self.plan_mode.lock(), &tool_input, &access_kind);
+        if plan_gate != PlanEditGate::Allow {
+            return Err(self.plan_mode_edit_rejected_message().await);
+        }
+        // Register the nested call as a real ACP tool call so the permission
+        // prompt has an anchor and the client renders it.
+        let ui_id = acp::ToolCallId::new(Arc::from(ui_call_id.clone()));
+        let marker = serde_json::json!({"codeModeCellId": call.cell_id.as_str()})
+            .as_object()
+            .cloned();
+        let meta = self.stamp_tool_meta(marker, &wire_name, Some(&tool_input));
+        let raw_input = serde_json::to_value(&tool_input).ok();
+        self.send_update(
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(ui_id.clone(), wire_name.clone())
+                    .kind(acp::ToolKind::Other)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(raw_input.clone())
+                    .meta(meta),
+            ),
+            None,
+        )
+        .await;
+        // Permission gate (same resolver as prepare_tool_call).
+        let tool_call_update = acp::ToolCallUpdate::new(
+            ui_id.clone(),
+            acp::ToolCallUpdateFields::new()
+                .title(Some(wire_name.clone()))
+                .raw_input(raw_input),
+        );
+        let path_context = Some(xai_grok_workspace::permission::types::RequestPathContext {
+            real_cwd: std::path::PathBuf::from(self.session_info.cwd.as_str()),
+            display_cwd: self
+                .display_cwd
+                .get()
+                .map(|cwd| std::path::PathBuf::from(cwd.as_str())),
+        });
+        let resolution = self
+            .permissions
+            .request_with_path_context_resolved(
+                access_kind.clone(),
+                tool_call_update,
+                path_context,
+                Some(self.session_info.id.0.to_string()),
+                None,
+                None,
+            )
+            .await;
+        let denial = match resolution.decision {
+            Decision::Allow | Decision::Ask => None,
+            Decision::PolicyDeny(ref reason) | Decision::Reject(ref reason) => Some(format!(
+                "Tool `{wire_name}` was not executed: {reason}"
+            )),
+            Decision::Cancelled => {
+                Some(format!("User cancelled the execution for tool `{wire_name}`"))
+            }
+            Decision::FollowupMessage(_) => Some(format!(
+                "The user declined to run tool `{wire_name}` from exec"
+            )),
+        };
+        if let Some(message) = denial {
+            self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
+            return Err(message);
+        }
+        let is_read_only = matches!(
+            access_kind,
+            AccessKind::Read(_) | AccessKind::Grep { .. }
+        );
+        let prepared = PreparedToolCall {
+            call_id: ui_id.0.to_string(),
+            tool_call_id: ui_id.clone(),
+            tool_name: wire_name.clone(),
+            raw_arguments: input_value.to_string(),
+            parsed_args: input_value.clone(),
+            model_id: String::new(),
+            concatenated_json_count: 0,
+            dispatch_target_name: tool_input.dispatch_target_name(),
+            is_read_only,
+        };
+        // Same-path write serialization (Promise.all parity with the batch
+        // path's per-file mutexes).
+        let path_lock = if is_read_only {
+            None
+        } else {
+            lock_path_for_args(&input_value)
+                .map(|path| self.tool_context.code_mode.nested_path_lock(path))
+        };
+        let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
+        self.signals_handle().record_tool_call(&wire_name);
+        let result = {
+            let _path_guard = match path_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            call_with_auth_retry(
+                self.auth_manager.as_ref(),
+                None,
+                &wire_name,
+                || async {
+                    dispatch_tool(&self.workspace_ops, &prepared, session_id.as_ref()).await
+                },
+            )
+            .await
+        };
+        match result {
+            Ok(run_result) => {
+                let failed = run_result.output.is_error();
+                self.finish_code_mode_nested_ui(&ui_id, !failed, &run_result.prompt_text)
+                    .await;
+                if failed {
+                    self.signals_handle().record_tool_failure(&wire_name);
+                } else {
+                    self.signals_handle().record_tool_success(&wire_name);
+                }
+                // PostToolUse hooks (same payload shape as the batch path).
+                if self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUse) {
+                    let tool_result_value = serde_json::to_value(&run_result.output)
+                        .unwrap_or(serde_json::Value::Null);
+                    let (tool_input_value, tool_input_truncated) =
+                        xai_grok_hooks::event::truncate_payload(input_value.clone());
+                    let (tool_result_val, tool_result_truncated) =
+                        xai_grok_hooks::event::truncate_payload(tool_result_value);
+                    self.dispatch_hook(
+                        xai_grok_hooks::event::HookEventName::PostToolUse,
+                        xai_grok_hooks::event::HookPayload::PostToolUse {
+                            tool_name: resolved_tool_name.clone(),
+                            tool_use_id: ui_call_id.clone(),
+                            tool_input: tool_input_value,
+                            tool_result: tool_result_val,
+                            tool_input_truncated,
+                            tool_result_truncated,
+                            duration_ms: None,
+                            is_backgrounded: false,
+                            subagent_type: self.subagent_type_label(),
+                        },
+                        None,
+                        Some(&resolved_tool_name),
+                    )
+                    .await;
+                }
+                // Contract with the cell: a logical failure rejects the JS
+                // promise (finding 4); a success resolves with the tool's
+                // structured value where it has one (finding 5).
+                if failed {
+                    return Err(run_result.prompt_text);
+                }
+                Ok(Self::nested_result_value(&run_result))
+            }
+            Err(error) => {
+                let message = format!("Tool `{wire_name}` failed: {error}");
+                self.signals_handle().record_tool_failure(&wire_name);
+                self.finish_code_mode_nested_ui(&ui_id, false, &message).await;
+                if self
+                    .may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure)
+                {
+                    let (tool_input_value, tool_input_truncated) =
+                        xai_grok_hooks::event::truncate_payload(input_value.clone());
+                    self.dispatch_hook(
+                        xai_grok_hooks::event::HookEventName::PostToolUseFailure,
+                        xai_grok_hooks::event::HookPayload::PostToolUseFailure {
+                            tool_name: resolved_tool_name.clone(),
+                            tool_use_id: ui_call_id.clone(),
+                            tool_input: tool_input_value,
+                            tool_input_truncated,
+                            error: message.clone(),
+                            subagent_type: self.subagent_type_label(),
+                        },
+                        None,
+                        Some(&resolved_tool_name),
+                    )
+                    .await;
+                }
+                Err(message)
+            }
+        }
+    }
+    /// Session-lifecycle tools that require top-level interception (plan
+    /// approval dialogs) must not be reachable from inside `exec`.
+    fn reject_lifecycle_nested_tool(
+        wire_name: &str,
+        tool_input: &ToolInput,
+    ) -> Result<(), String> {
+        if matches!(
+            tool_input,
+            ToolInput::ExitPlanMode(_) | ToolInput::EnterPlanMode(_)
+        ) {
+            return Err(format!(
+                "tool `{wire_name}` manages the session lifecycle and must be called as a \
+                 top-level tool, not from inside exec"
+            ));
+        }
+        Ok(())
+    }
+    /// The JSON value a nested call resolves with (finding 5): preserve the
+    /// structured shape where the tool has one, use a plain string only for
+    /// genuinely textual outputs.
+    ///
+    /// - MCP tools resolve with an MCP `CallToolResult`-shaped object
+    ///   (`{content: [{type: "text", ...}], isError}`), matching the
+    ///   `result.content[0]` contract in the exec description.
+    /// - Image-producing reads resolve with `{content: [{type: "image",
+    ///   data, mimeType}]}` so `image(result.content[0])` forwarding works.
+    /// - Everything else resolves with the prompt-facing text.
+    fn nested_result_value(run_result: &ToolRunResult) -> serde_json::Value {
+        use xai_grok_tools::types::output::MCPOutputDetails;
+        match &run_result.output {
+            ToolsToolOutput::MCP(mcp) => {
+                let text = match mcp.output() {
+                    MCPOutputDetails::OkayOutput(text) => text.clone(),
+                    MCPOutputDetails::Error(error) => error.clone(),
+                };
+                serde_json::json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": mcp.is_error,
+                })
+            }
+            ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(image)) => {
+                serde_json::json!({
+                    "content": [{
+                        "type": "image",
+                        "data": image.data,
+                        "mimeType": image.mime_type,
+                    }],
+                })
+            }
+            ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(pdf)) => {
+                let pages: Vec<serde_json::Value> = pdf
+                    .pages
+                    .iter()
+                    .map(|page| {
+                        serde_json::json!({
+                            "type": "image",
+                            "data": page.data,
+                            "mimeType": page.mime_type,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "content": pages })
+            }
+            _ => serde_json::Value::String(run_result.prompt_text.clone()),
+        }
+    }
+    /// Terminal ACP update for a nested call registered by
+    /// [`Self::run_code_mode_nested_call`].
+    async fn finish_code_mode_nested_ui(
+        &self,
+        ui_id: &acp::ToolCallId,
+        success: bool,
+        text: &str,
+    ) {
+        let status = if success {
+            acp::ToolCallStatus::Completed
+        } else {
+            acp::ToolCallStatus::Failed
+        };
+        self.send_update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                ui_id.clone(),
+                acp::ToolCallUpdateFields::new()
+                    .status(Some(status))
+                    .content(Some(vec![acp::ToolCallContent::from(
+                        acp::ContentBlock::Text(acp::TextContent::new(text.to_string())),
+                    )])),
+            )),
+            None,
+        )
+        .await;
+    }
+    /// `notify(...)` from a running cell → progress on the owning exec tool
+    /// call.
+    async fn handle_code_mode_notify(
+        &self,
+        tool_call_id: String,
+        cell_id: xai_grok_code_mode_protocol::CellId,
+        text: String,
+    ) {
+        tracing::debug!(
+            session_id = %self.session_info.id.0,
+            cell_id = %cell_id,
+            "code mode notify"
+        );
+        self.send_update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(Arc::from(tool_call_id)),
+                acp::ToolCallUpdateFields::new()
+                    .status(Some(acp::ToolCallStatus::InProgress))
+                    .content(Some(vec![acp::ToolCallContent::from(
+                        acp::ContentBlock::Text(acp::TextContent::new(text)),
+                    )])),
+            )),
+            None,
+        )
+        .await;
+    }
+    /// Explicitly terminate yielded cells; the abort-based turn cancel only
+    /// drops the `exec`/`wait` futures, never the isolates.
+    pub(super) fn terminate_code_mode_cells(&self, reason: &'static str) {
+        self.tool_context
+            .code_mode
+            .terminate_live_cells_detached(reason);
+    }
+}
+#[cfg(test)]
+mod code_mode_nested_tests {
+    use super::*;
+    use xai_grok_tools::types::output::{MCPOutput, ToolRunResult};
+
+    fn run_result(output: ToolsToolOutput, prompt_text: &str) -> ToolRunResult {
+        ToolRunResult {
+            output,
+            prompt_text: prompt_text.to_string(),
+            effective_tool_name: None,
+        }
+    }
+
+    /// Session-lifecycle tools are rejected from inside exec (finding 3).
+    #[test]
+    fn plan_lifecycle_tools_are_rejected_from_exec() {
+        use xai_grok_tools::implementations::grok_build::exit_plan_mode::ExitPlanModeInput;
+        let exit = ToolInput::ExitPlanMode(ExitPlanModeInput {});
+        let err = SessionActor::reject_lifecycle_nested_tool("exit_plan_mode", &exit)
+            .expect_err("exit_plan_mode must be rejected");
+        assert!(err.contains("top-level tool"), "{err}");
+        let read = ToolInput::ReadFile(
+            serde_json::from_value(serde_json::json!({"target_file": "/x"})).unwrap(),
+        );
+        assert!(SessionActor::reject_lifecycle_nested_tool("read_file", &read).is_ok());
+    }
+
+    /// Structured nested-result contract (finding 5): MCP results resolve as
+    /// CallToolResult-shaped objects, image reads as image content, plain
+    /// text as a string.
+    #[test]
+    fn nested_result_preserves_structured_shapes() {
+        let mcp = run_result(
+            ToolsToolOutput::MCP(MCPOutput::okay_output(
+                "linear__save_issue".to_string(),
+                "linear".to_string(),
+                "issue saved".to_string(),
+            )),
+            "issue saved",
+        );
+        let value = SessionActor::nested_result_value(&mcp);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "issue saved");
+        assert_eq!(value["isError"], false);
+
+        let image = run_result(
+            ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(
+                xai_grok_tools::types::output::ImageContent {
+                    data: "QUJD".to_string(),
+                    mime_type: "image/png".to_string(),
+                    annotations: None,
+                    uri: None,
+                    meta: None,
+                },
+            )),
+            "[Image content...]",
+        );
+        let value = SessionActor::nested_result_value(&image);
+        assert_eq!(value["content"][0]["type"], "image");
+        assert_eq!(value["content"][0]["mimeType"], "image/png");
+        assert_eq!(value["content"][0]["data"], "QUJD");
+
+        let text = run_result(
+            ToolsToolOutput::Text(xai_grok_tools::types::output::TextOutput::from(
+                "plain".to_string(),
+            )),
+            "plain",
+        );
+        assert_eq!(
+            SessionActor::nested_result_value(&text),
+            serde_json::Value::String("plain".to_string())
+        );
     }
 }

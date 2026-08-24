@@ -221,6 +221,10 @@ pub struct ToolContext {
     /// Same Arc as `SessionRegistry`'s retained heal lock so the actor tick
     /// and tray `list_running` cannot double-emit `SubagentFinished`.
     pub(crate) live_orphan_heal_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-session Code Mode state (effective tool-mode plan, lazily-created
+    /// V8 runtime, live-cell tracking). Fresh per constructed context, so
+    /// top-level sessions and subagents never share stored cell state.
+    pub(crate) code_mode: crate::tools::code_mode::CodeModeSessionState,
 }
 impl ToolContext {
     pub(crate) fn clamp_task_model_request(
@@ -306,6 +310,7 @@ impl ToolContext {
             sampler_retry_only_before_output: false,
             process_scope: None,
             live_orphan_heal_lock: Arc::new(tokio::sync::Mutex::new(())),
+            code_mode: crate::tools::code_mode::CodeModeSessionState::default(),
         }
     }
     pub(crate) fn with_file_state_handle(mut self, handle: FileStateHandle) -> Self {
@@ -397,6 +402,7 @@ mod tests {
                 sampler_retry_only_before_output: false,
                 process_scope: None,
                 live_orphan_heal_lock: Arc::new(tokio::sync::Mutex::new(())),
+                code_mode: crate::tools::code_mode::CodeModeSessionState::default(),
             }
         }
     }

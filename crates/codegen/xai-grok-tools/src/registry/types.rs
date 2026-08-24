@@ -1880,6 +1880,103 @@ impl FinalizedToolset {
         });
         Ok(())
     }
+    /// Dynamically register the Code Mode `exec`/`wait` tools.
+    ///
+    /// Called by the session when the current model declares a Code Mode
+    /// `tool_mode`; idempotent (re-registration is a no-op). The tools
+    /// resolve their runtime through the [`CodeModeHandle`] resource — with
+    /// no handle mounted every call fails closed.
+    ///
+    /// [`CodeModeHandle`]: crate::implementations::code_mode::CodeModeHandle
+    pub fn register_code_mode_tools(&self) {
+        use crate::implementations::code_mode::{
+            EXEC_TOOL_NAME, ExecTool, WAIT_TOOL_NAME, WaitTool,
+        };
+        let mut tools = self.tools.write();
+        if !tools.iter().any(|t| t.client_name == EXEC_TOOL_NAME) {
+            tools.push(Self::code_mode_finalized_tool(
+                &self.local_registry,
+                EXEC_TOOL_NAME,
+                ExecTool,
+                Arc::new(|json| {
+                    let input: crate::implementations::code_mode::ExecToolInput =
+                        serde_json::from_value(json).map_err(|e| {
+                            xai_tool_runtime::ToolError::invalid_arguments(format!(
+                                "exec expects {{\"source\": \"<raw JavaScript>\"}}: {e}"
+                            ))
+                        })?;
+                    Ok(ToolInput::CodeModeExec(input))
+                }),
+            ));
+        }
+        if !tools.iter().any(|t| t.client_name == WAIT_TOOL_NAME) {
+            tools.push(Self::code_mode_finalized_tool(
+                &self.local_registry,
+                WAIT_TOOL_NAME,
+                WaitTool,
+                Arc::new(|json| {
+                    let input: crate::implementations::code_mode::WaitToolInput =
+                        serde_json::from_value(json).map_err(|e| {
+                            xai_tool_runtime::ToolError::invalid_arguments(format!(
+                                "wait expects {{\"cell_id\": \"...\"}}: {e}"
+                            ))
+                        })?;
+                    Ok(ToolInput::CodeModeWait(input))
+                }),
+            ));
+        }
+    }
+
+    /// Remove the Code Mode tools registered by
+    /// [`Self::register_code_mode_tools`]. Idempotent.
+    pub fn unregister_code_mode_tools(&self) {
+        use crate::implementations::code_mode::{EXEC_TOOL_NAME, WAIT_TOOL_NAME};
+        self.unregister_tool_by_name(EXEC_TOOL_NAME);
+        self.unregister_tool_by_name(WAIT_TOOL_NAME);
+    }
+
+    /// Shared construction for one dynamically-registered Code Mode tool.
+    fn code_mode_finalized_tool<T>(
+        local_registry: &xai_computer_hub_sdk::LocalRegistry,
+        name: &str,
+        tool: T,
+        parse_input: Arc<
+            dyn Fn(serde_json::Value) -> Result<ToolInput, xai_tool_runtime::ToolError>
+                + Send
+                + Sync,
+        >,
+    ) -> FinalizedTool
+    where
+        T: xai_tool_runtime::Tool + ToolMetadata + std::fmt::Debug + Send + Sync + 'static,
+        T::Output: serde::Serialize,
+    {
+        let description = tool.sanitized_description_template();
+        let kind = ToolMetadata::kind(&tool);
+        let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
+        let input_schema = generate_schema_cached::<T::Args>();
+        let definition = ToolDefinition::function(name, Some(&description), input_schema.clone());
+        local_registry.register(tool);
+        FinalizedTool {
+            namespace: ToolNamespace::GrokBuild.to_string(),
+            id: name.to_owned(),
+            registry_id,
+            client_name: name.to_owned(),
+            metadata: Arc::new(DefaultToolMetadata { kind, description }),
+            output_converter: Arc::new(|value| {
+                serde_json::from_value::<crate::implementations::code_mode::CodeModeCallOutput>(
+                    value,
+                )
+                .map(ToolOutput::CodeMode)
+            }),
+            definition,
+            effective_params: serde_json::Value::Object(Default::default()),
+            input_schema,
+            reverse_params: HashMap::new(),
+            parse_input,
+            contract_version: None,
+        }
+    }
+
     pub fn unregister_tools_by_prefix(&self, prefix: &str) -> usize {
         let mut tools = self.tools.write();
         let before = tools.len();

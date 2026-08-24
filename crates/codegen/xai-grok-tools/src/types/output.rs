@@ -648,6 +648,8 @@ pub enum ToolOutput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
+    /// Code Mode `exec`/`wait` result (ordered text/image parts).
+    CodeMode(crate::implementations::code_mode::CodeModeCallOutput),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -693,6 +695,7 @@ impl ToolOutput {
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
             ToolOutput::GrepSearch(g) => g.exit_code > 1,
+            ToolOutput::CodeMode(c) => c.is_error(),
             _ => false,
         }
     }
@@ -882,6 +885,7 @@ impl ToolOutput {
                 }
             },
             ToolOutput::SearchTool(out) => out.content.clone(),
+            ToolOutput::CodeMode(out) => out.to_prompt_format(),
             ToolOutput::SubagentCompleted(sub) => {
                 let mut text = sub.output.clone();
                 if let Some(ref wt) = sub.worktree_path {

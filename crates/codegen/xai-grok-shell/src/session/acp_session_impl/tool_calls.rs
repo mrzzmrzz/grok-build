@@ -1020,10 +1020,21 @@ impl SessionActor {
                 }
             }
         }
+        // A native custom-grammar `exec` call carries raw JavaScript source
+        // text, not JSON arguments — wrap it into the exec input shape
+        // instead of JSON-parsing it (raw JS that happens to parse as JSON
+        // must not be misread as arguments).
+        let code_mode_custom_exec = self.tool_context.code_mode.code_mode_active()
+            && call.function.name == xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME
+            && xai_grok_sampling_types::conversation::is_reserved_custom_tool_call_id(&call.id);
         let args_str = crate::session::helpers::tool_input_parsing::normalize_empty_arguments(
             &call.function.arguments,
         );
-        let parse_result = serde_json::from_str::<serde_json::Value>(args_str);
+        let parse_result = if code_mode_custom_exec {
+            Ok(json!({ "source": call.function.arguments.clone() }))
+        } else {
+            serde_json::from_str::<serde_json::Value>(args_str)
+        };
         let mut concatenated_json_count: usize = 0;
         let mut raw_input = match &parse_result {
             Ok(value) => value.clone(),
@@ -1913,6 +1924,18 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
+            ToolInput::CodeModeExec(_) => (
+                "exec".to_string(),
+                acp::ToolKind::Execute,
+                vec![],
+                vec![],
+            ),
+            ToolInput::CodeModeWait(ref wait) => (
+                format!("wait: cell {}", wait.cell_id),
+                acp::ToolKind::Execute,
+                vec![],
+                vec![],
+            ),
             ToolInput::MemorySearch(ms) => {
                 let end = ms
                     .query
@@ -2132,7 +2155,7 @@ impl SessionActor {
             trigger: xai_grok_telemetry::events::SkillTrigger::SkillMdRead,
         });
     }
-    fn make_pre_tool_use_envelope(
+    pub(super) fn make_pre_tool_use_envelope(
         &self,
         resolved_tool_name: &str,
         call_id: &str,
@@ -2425,6 +2448,72 @@ impl SessionActor {
         if let Some(acp_plan) = acp_plan_update(&result.output) {
             self.send_update(acp::SessionUpdate::Plan(acp_plan), None)
                 .await;
+        }
+        // Code Mode results keep their ordered text/image parts on the wire
+        // (`ToolResultItem.parts`); the `acp_tool_update` table above has no
+        // arm for them, so the terminal ACP update is sent here too.
+        if let ToolsToolOutput::CodeMode(ref code_mode_output) = result.output {
+            use xai_grok_tools::implementations::code_mode::CodeModePart;
+            let status = if code_mode_output.is_error() {
+                acp::ToolCallStatus::Failed
+            } else {
+                acp::ToolCallStatus::Completed
+            };
+            self.send_update(
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new()
+                            .status(Some(status))
+                            .content(Some(vec![acp::ToolCallContent::from(
+                                acp::ContentBlock::Text(acp::TextContent::new(
+                                    result.prompt_text.clone(),
+                                )),
+                            )]))
+                            .raw_output(serde_json::to_value(&result.output).ok()),
+                    ),
+                ),
+                None,
+            )
+            .await;
+            let mut parts: Vec<ContentPart> = code_mode_output
+                .parts
+                .iter()
+                .map(|part| match part {
+                    CodeModePart::Text { text } => ContentPart::Text {
+                        text: Arc::<str>::from(text.as_str()),
+                    },
+                    CodeModePart::Image { image_url, .. } => ContentPart::Image {
+                        url: Arc::<str>::from(image_url.as_str()),
+                    },
+                })
+                .collect();
+            // Status/error trailer plus anything the tool pipeline appended
+            // beyond the base rendering (system reminders).
+            let mut trailer = code_mode_output.trailer_text();
+            if let Some(appended) = result
+                .prompt_text
+                .strip_prefix(&code_mode_output.to_prompt_format())
+                && !appended.trim().is_empty()
+            {
+                trailer.push_str(appended);
+            }
+            if !trailer.is_empty() {
+                parts.push(ContentPart::Text {
+                    text: Arc::<str>::from(trailer.as_str()),
+                });
+            }
+            if parts.is_empty() {
+                parts.push(ContentPart::Text {
+                    text: Arc::<str>::from("(no output)"),
+                });
+            }
+            self.chat_state_handle
+                .push_tool_result(ConversationItem::tool_result_with_parts(
+                    call_id.to_string(),
+                    parts,
+                ));
+            return Ok(Vec::new());
         }
         #[allow(unused_mut)]
         let mut prompt_text = if concatenated_json_count > 0 && !self.is_cursor_harness() {

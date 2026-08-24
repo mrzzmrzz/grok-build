@@ -4462,3 +4462,68 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
         block.output
     );
 }
+
+/// Finding-11 regression: the shell serializes `ToolOutput` (internally
+/// tagged, `{"type":"CodeMode", ...}`) into `raw_output`; the tracker must
+/// parse that exact shape into a fully populated Code Mode exec block.
+#[test]
+fn shell_serialized_code_mode_output_maps_to_exec_block() {
+    use xai_grok_tools::implementations::code_mode::{
+        CodeModeCallOutput, CodeModeCellStatus, CodeModePart,
+    };
+    use xai_grok_tools::types::output::ToolOutput as ToolsToolOutput;
+    let output = ToolsToolOutput::CodeMode(CodeModeCallOutput {
+        cell_id: "3".to_string(),
+        status: CodeModeCellStatus::Yielded,
+        parts: vec![CodeModePart::Text {
+            text: "partial".to_string(),
+        }],
+        error_text: None,
+    });
+    let raw_output = serde_json::to_value(&output).expect("serialize like the shell");
+    assert_eq!(raw_output["type"], "CodeMode", "shell wire shape");
+
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("exec-1")), "exec")
+        .kind(acp::ToolKind::Execute)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(
+            serde_json::json!({"variant": "CodeModeExec", "source": "text('hi')"}),
+        ))
+        .raw_output(Some(raw_output));
+    match tool_call_to_block(&tc, None) {
+        RenderBlock::ToolCall(ToolCallBlock::CodeModeExec(block)) => {
+        assert_eq!(block.source, "text('hi')");
+        assert_eq!(block.cell_id.as_deref(), Some("3"));
+        assert_eq!(block.status.as_deref(), Some("yielded"));
+        assert!(block.error.is_none());
+        assert!(
+            block.output.as_deref().unwrap_or("").contains("partial"),
+            "{:?}",
+            block.output
+        );
+        }
+        other => panic!("expected a CodeModeExec block, got {other:?}"),
+    }
+
+    // A logical failure carries the cell error into the block.
+    let failed = ToolsToolOutput::CodeMode(CodeModeCallOutput {
+        cell_id: "4".to_string(),
+        status: CodeModeCellStatus::Completed,
+        parts: Vec::new(),
+        error_text: Some("ReferenceError: boom".to_string()),
+    });
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("exec-2")), "exec")
+        .kind(acp::ToolKind::Execute)
+        .status(acp::ToolCallStatus::Failed)
+        .raw_input(Some(
+            serde_json::json!({"variant": "CodeModeExec", "source": "boom()"}),
+        ))
+        .raw_output(Some(serde_json::to_value(&failed).unwrap()));
+    match tool_call_to_block(&tc, None) {
+        RenderBlock::ToolCall(ToolCallBlock::CodeModeExec(block)) => {
+            assert_eq!(block.error.as_deref(), Some("ReferenceError: boom"));
+            assert_eq!(block.status.as_deref(), Some("completed"));
+        }
+        other => panic!("expected a CodeModeExec block, got {other:?}"),
+    }
+}

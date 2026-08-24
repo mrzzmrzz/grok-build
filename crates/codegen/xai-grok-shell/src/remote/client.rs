@@ -942,6 +942,9 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportsBackendSearch")))
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // Remote /models-v2 entries cannot declare Code Mode in this build:
+        // the capability fails closed to Classic.
+        tool_mode: None,
         compactions_remaining: obj
             .get("compactionsRemaining")
             .or_else(|| obj.get("compactions_remaining"))

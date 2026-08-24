@@ -2076,6 +2076,16 @@ impl SessionActor {
         let mut prompt_timing = Some(crate::session::prompt_timing::PromptTiming::start());
         let tool_prep_start = std::time::Instant::now();
         let (tool_definitions, mcp_wait_ms) = self.prepare_tool_definitions_timed().await;
+        // Effective Code Mode plan for this turn (mode + transport + nested
+        // projection). Fails the turn closed when the catalog declares a code
+        // mode but the runtime cannot initialize.
+        // Boxed so the (rarely hot) refresh future does not grow the already
+        // enormous turn future.
+        if let Err(message) =
+            Box::pin(self.refresh_code_mode_for_turn(&tool_definitions)).await
+        {
+            return Err(acp::Error::internal_error().data(message));
+        }
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
         if let Some(ref mut pt) = prompt_timing {
             pt.record_tool_prep(mcp_wait_ms, total_prep_ms);
@@ -2295,6 +2305,8 @@ impl SessionActor {
                 });
             }
             let build_req_start = std::time::Instant::now();
+            let chat_state_handle_ever_used_codex =
+                self.chat_state_handle.ever_used_codex().await;
             let request = self
                 .chat_state_handle
                 .build_request(
@@ -2303,6 +2315,10 @@ impl SessionActor {
                     self.memory.is_enabled(),
                     trace_gcs_config
                         .clone()
+                        // Defense in depth behind the get_trace_context gate:
+                        // provenance can flip mid-session (model switch to
+                        // Codex) after the upload context was built.
+                        .filter(|_| !chat_state_handle_ever_used_codex)
                         .map(|cfg| -> Box<dyn crate::sampling::TraceContext> {
                             Box::new(crate::sampling::ConversationRequestTrace {
                                 gcs_config: cfg,

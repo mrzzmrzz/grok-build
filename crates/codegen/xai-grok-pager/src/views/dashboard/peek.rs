@@ -1015,6 +1015,7 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             RenderBlock::ToolCall(tc) => {
                 let label = match tc {
                     ToolCallBlock::Execute(_) => Some("Bash"),
+                    ToolCallBlock::CodeModeExec(_) => Some("Exec"),
                     ToolCallBlock::Read(_) => Some("Read"),
                     ToolCallBlock::Edit(_) => Some("Edit"),
                     ToolCallBlock::ListDir(_) => Some("List"),

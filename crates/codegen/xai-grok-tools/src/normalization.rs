@@ -129,6 +129,8 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
         | ToolInput::Workflow(_)
+        | ToolInput::CodeModeExec(_)
+        | ToolInput::CodeModeWait(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }

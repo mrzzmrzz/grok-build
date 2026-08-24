@@ -13329,6 +13329,7 @@ dependencies = [
 name = "xai-chat-state"
 version = "0.1.0"
 dependencies = [
+ "async-openai",
  "indexmap",
  "serde",
  "serde_json",
@@ -14525,6 +14526,8 @@ dependencies = [
  "xai-grok-announcements",
  "xai-grok-auth",
  "xai-grok-bundle",
+ "xai-grok-code-mode",
+ "xai-grok-code-mode-protocol",
  "xai-grok-compaction",
  "xai-grok-config",
  "xai-grok-config-types",
@@ -14795,6 +14798,8 @@ dependencies = [
  "xai-computer-hub-sdk",
  "xai-file-utils",
  "xai-grok-auth",
+ "xai-grok-code-mode",
+ "xai-grok-code-mode-protocol",
  "xai-grok-config",
  "xai-grok-env",
  "xai-grok-extra-ca",

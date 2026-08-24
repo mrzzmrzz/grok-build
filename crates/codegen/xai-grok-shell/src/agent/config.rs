@@ -3820,6 +3820,9 @@ struct DefaultModelJson {
     supported_in_api: bool,
     #[serde(default)]
     supports_backend_search: bool,
+    /// Per-model Code Mode capability declaration; absent means Classic.
+    #[serde(default)]
+    tool_mode: Option<ToolMode>,
     #[serde(default)]
     compactions_remaining: Option<CompactionsRemaining>,
     #[serde(default)]
@@ -3830,6 +3833,43 @@ struct DefaultModelJson {
     auto_compact_threshold_percent: Option<u8>,
     #[serde(default)]
     system_prompt_label: Option<String>,
+}
+/// How a model drives client-side tools.
+///
+/// Declared per catalog entry (`tool_mode` in `default_models.json`,
+/// `[model.*]` config, or a live catalog); **absent always means
+/// [`ToolMode::Classic`]** so the capability fails closed for every model
+/// source that does not explicitly opt in.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    /// Ordinary function tools only (the default).
+    #[default]
+    Classic,
+    /// Code Mode `exec`/`wait` are exposed alongside nothing else, but the
+    /// model may still receive classic fallback behavior where Code Mode is
+    /// unavailable.
+    CodeMode,
+    /// The model only understands Code Mode tooling.
+    CodeModeOnly,
+}
+impl ToolMode {
+    pub(crate) fn is_code_mode(self) -> bool {
+        matches!(self, Self::CodeMode | Self::CodeModeOnly)
+    }
+}
+/// Effective tool mode for `model_id` resolved against the merged,
+/// account-scoped catalog `models` (the same source that supplied the picker
+/// entry). Unknown models fail closed to [`ToolMode::Classic`].
+pub(crate) fn model_tool_mode(
+    models: &IndexMap<String, ModelEntry>,
+    model_id: &str,
+) -> ToolMode {
+    find_model_by_id(models, model_id)
+        .and_then(|entry| entry.info().tool_mode)
+        .unwrap_or(ToolMode::Classic)
 }
 fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryConfig> {
     let root: serde_json::Value = serde_json::from_str(crate::models::DEFAULT_MODELS_JSON)
@@ -3886,6 +3926,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: m.reasoning_efforts,
                 supports_backend_search: m.supports_backend_search,
+                tool_mode: m.tool_mode,
                 compactions_remaining: m.compactions_remaining,
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
@@ -3998,6 +4039,9 @@ pub struct ModelEntryConfig {
     pub supported_in_api: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub supports_backend_search: bool,
+    /// Per-model Code Mode capability; `None` (the default) means Classic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<ToolMode>,
     /// Per-model config for the `x-compactions-remaining` header; `None` disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions_remaining: Option<CompactionsRemaining>,
@@ -4081,6 +4125,8 @@ pub struct ConfigModelOverride {
     pub supports_reasoning_effort: Option<bool>,
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
     pub supports_backend_search: Option<bool>,
+    /// Per-model Code Mode capability override; absent inherits the base entry.
+    pub tool_mode: Option<ToolMode>,
     /// Aliases must be registered in `config_model_override_parse::ALIASES`;
     /// serde rejects a table that contains both spellings otherwise.
     #[serde(alias = "send_compactions_remaining")]
@@ -4175,6 +4221,9 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.supports_backend_search {
             entry.info.supports_backend_search = v;
+        }
+        if self.tool_mode.is_some() {
+            entry.info.tool_mode = self.tool_mode;
         }
         if self.compactions_remaining.is_some() {
             entry.info.compactions_remaining = self.compactions_remaining;
@@ -4273,6 +4322,11 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
     pub supports_backend_search: bool,
+    /// Per-model Code Mode capability. `None` (also the deserialization
+    /// default for configs written before the field existed) means Classic —
+    /// the capability fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<ToolMode>,
     /// Per-model config for the `x-compactions-remaining` header; `None` disables it.
     pub compactions_remaining: Option<CompactionsRemaining>,
     /// Per-model config for the `x-compaction-at` header; `None` disables it.
@@ -4342,6 +4396,7 @@ impl ModelInfo {
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            tool_mode: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,
@@ -4381,6 +4436,7 @@ impl ModelInfo {
             supports_reasoning_effort: entry.supports_reasoning_effort,
             reasoning_efforts: entry.reasoning_efforts.clone(),
             supports_backend_search: entry.supports_backend_search,
+            tool_mode: entry.tool_mode,
             compactions_remaining: entry.compactions_remaining,
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
@@ -5226,6 +5282,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
                 supports_backend_search: false,
+                tool_mode: None,
                 compactions_remaining: None,
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
@@ -5498,6 +5555,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            tool_mode: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,

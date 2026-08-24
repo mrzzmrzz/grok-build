@@ -625,6 +625,7 @@ pub fn consumed_completion_ids(output: &ToolOutput) -> Vec<&str> {
         | ToolOutput::ImageToVideo(_)
         | ToolOutput::ReferenceToVideo(_)
         | ToolOutput::ImageEdit(_)
+        | ToolOutput::CodeMode(_)
         | ToolOutput::Dynamic(_) => {}
     }
     ids

@@ -2866,7 +2866,11 @@ async fn unsupported_backend_search_sends_no_hosted_tool_on_either_channel() {
             actor.supports_backend_search.set(true);
             assert!(!actor.hosted_tools_for_turn().is_empty());
             assert_eq!(
-                xai_grok_sampling_types::extra_tool_entries(&actor.hosted_tools_for_turn()).len(),
+                xai_grok_sampling_types::extra_tool_entries(
+                    &actor.hosted_tools_for_turn(),
+                    xai_grok_sampling_types::ProviderProfile::XAI,
+                )
+                .len(),
                 1
             );
 
@@ -2877,8 +2881,11 @@ async fn unsupported_backend_search_sends_no_hosted_tool_on_either_channel() {
                 "the backend-search gate must drop the hosted tool"
             );
             assert!(
-                xai_grok_sampling_types::extra_tool_entries(&actor.hosted_tools_for_turn())
-                    .is_empty(),
+                xai_grok_sampling_types::extra_tool_entries(
+                    &actor.hosted_tools_for_turn(),
+                    xai_grok_sampling_types::ProviderProfile::XAI,
+                )
+                .is_empty(),
                 "and so no raw-JSON entry is produced to splice"
             );
         })

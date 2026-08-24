@@ -1064,6 +1064,7 @@ fn test_model_entry(
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            tool_mode: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,
@@ -2144,6 +2145,7 @@ fn model_info_from_config_propagates_use_concise() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        tool_mode: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -2305,6 +2307,7 @@ fn model_info_from_config_propagates_agent_type() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        tool_mode: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -2859,6 +2862,7 @@ fn inference_idle_timeout_propagates_to_model_info() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        tool_mode: None,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -6842,6 +6846,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            tool_mode: None,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,
@@ -7787,4 +7792,91 @@ fn codex_only_start_allowed_requires_codex_model_and_login() {
     assert!(!codex_only_start_allowed(Some(&codex), false));
     assert!(!codex_only_start_allowed(Some(&xai), true));
     assert!(!codex_only_start_allowed(None, true));
+}
+
+// ---------------------------------------------------------------------------
+// Code Mode `tool_mode` capability schema
+// ---------------------------------------------------------------------------
+
+/// Configs written before the field existed keep deserializing; absent means
+/// Classic (fail closed).
+#[test]
+fn tool_mode_is_backward_compatible_and_fails_closed_to_classic() {
+    let legacy: ModelEntryConfig = serde_json::from_value(serde_json::json!({
+        "model": "legacy-model",
+        "base_url": "https://api.example",
+        "context_window": 100_000u64
+    }))
+    .expect("legacy entry without tool_mode must deserialize");
+    assert_eq!(legacy.tool_mode, None);
+    let info = ModelInfo::from_config(&legacy);
+    assert_eq!(info.tool_mode, None);
+
+    // Serialization omits the absent field (round-trip stability for legacy
+    // configs).
+    let serialized = serde_json::to_value(&legacy).expect("serialize");
+    assert!(serialized.get("tool_mode").is_none());
+}
+
+#[test]
+fn tool_mode_parses_all_declared_variants() {
+    for (wire, expected) in [
+        ("classic", ToolMode::Classic),
+        ("code_mode", ToolMode::CodeMode),
+        ("code_mode_only", ToolMode::CodeModeOnly),
+    ] {
+        let entry: ModelEntryConfig = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "base_url": "https://api.example",
+            "context_window": 100_000u64,
+            "tool_mode": wire
+        }))
+        .unwrap_or_else(|e| panic!("tool_mode={wire} must parse: {e}"));
+        assert_eq!(entry.tool_mode, Some(expected));
+        assert_eq!(ModelInfo::from_config(&entry).tool_mode, Some(expected));
+    }
+    assert!(ToolMode::CodeMode.is_code_mode());
+    assert!(ToolMode::CodeModeOnly.is_code_mode());
+    assert!(!ToolMode::Classic.is_code_mode());
+}
+
+/// `model_tool_mode` resolves from the merged catalog and fails closed for
+/// unknown models; `[model.*]` overrides can grant and revoke the capability.
+#[test]
+fn model_tool_mode_resolves_from_catalog_and_fails_closed() {
+    let endpoints = EndpointsConfig::default();
+    let mut entry = ModelEntry::fallback("cm-model", &endpoints);
+    entry.info.tool_mode = Some(ToolMode::CodeModeOnly);
+    let mut models: IndexMap<String, ModelEntry> = IndexMap::new();
+    models.insert("cm-model".to_string(), entry);
+
+    assert_eq!(model_tool_mode(&models, "cm-model"), ToolMode::CodeModeOnly);
+    assert_eq!(model_tool_mode(&models, "unknown-model"), ToolMode::Classic);
+
+    // Override grants…
+    let over = ConfigModelOverride {
+        tool_mode: Some(ToolMode::CodeMode),
+        ..Default::default()
+    };
+    let base = models.get("cm-model").cloned();
+    let applied = over.apply("cm-model", base, &endpoints);
+    assert_eq!(applied.info.tool_mode, Some(ToolMode::CodeMode));
+
+    // …and an absent override inherits the base declaration.
+    let noop = ConfigModelOverride::default();
+    let applied = noop.apply("cm-model", models.get("cm-model").cloned(), &endpoints);
+    assert_eq!(applied.info.tool_mode, Some(ToolMode::CodeModeOnly));
+}
+
+/// Every bundled default model stays Classic: `default_models.json` must not
+/// declare a Code Mode capability.
+#[test]
+fn bundled_default_models_declare_no_code_mode() {
+    let endpoints = EndpointsConfig::default();
+    for (key, model) in default_models(&endpoints) {
+        assert_eq!(
+            model.tool_mode, None,
+            "default model {key} must not declare tool_mode"
+        );
+    }
 }

@@ -95,6 +95,10 @@ impl MvpAgent {
         let Some(handle) = self.resident_handle(id) else {
             return false;
         };
+        // Drive the Code Mode V8 runtime down with the session: terminates
+        // outstanding cells and drops stored state (bounded, detached, so the
+        // close budget is unaffected).
+        handle.tool_context.code_mode.shutdown_detached("session hard stop");
         let _ = handle.cmd_tx.send(SessionCommand::Cancel(CancelOptions {
             cancel_subagents: true,
             kill_background_tasks: true,

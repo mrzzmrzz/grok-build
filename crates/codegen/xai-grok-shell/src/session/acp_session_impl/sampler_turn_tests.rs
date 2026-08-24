@@ -99,3 +99,69 @@ fn inherited_cutoff_agrees_with_the_wire_echo_so_the_two_implementations_cannot_
         assert_eq!(wire_echo, inherited, "seed={seed:?} base={base:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Code Mode wire shapes
+// ---------------------------------------------------------------------------
+
+fn code_mode_plan(
+    transport: xai_grok_sampling_types::CodeModeTransport,
+) -> crate::tools::code_mode::CodeModeTurnPlan {
+    crate::tools::code_mode::CodeModeTurnPlan {
+        model_id: "test-model".to_string(),
+        mode: crate::agent::config::ToolMode::CodeMode,
+        transport: Some(transport),
+        exec_description: "EXEC DESC".to_string(),
+        init_error: None,
+    }
+}
+
+/// Function-envelope transport (xAI): both `exec` and `wait` are plain
+/// function tools; `exec` takes `{"source": string}`.
+#[test]
+fn function_envelope_code_mode_lists_exec_and_wait_function_tools() {
+    let specs = super::code_mode_turn_specs(&code_mode_plan(
+        xai_grok_sampling_types::CodeModeTransport::FunctionEnvelope,
+    ));
+    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["exec", "wait"]);
+    let exec = &specs[0];
+    assert_eq!(exec.description.as_deref(), Some("EXEC DESC"));
+    assert_eq!(
+        exec.parameters["required"],
+        serde_json::json!(["source"]),
+        "{}",
+        exec.parameters
+    );
+    assert_eq!(exec.parameters["properties"]["source"]["type"], "string");
+    let wait = &specs[1];
+    assert_eq!(wait.parameters["required"], serde_json::json!(["cell_id"]));
+}
+
+/// Native custom-grammar transport (Codex): only `wait` stays a function
+/// tool; `exec` rides `hosted_tools` as a `ClientCustom` custom tool whose
+/// serialized entry is `{"type":"custom","name":"exec",...}`.
+#[test]
+fn native_custom_grammar_code_mode_moves_exec_to_a_custom_tool_entry() {
+    let specs = super::code_mode_turn_specs(&code_mode_plan(
+        xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar,
+    ));
+    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["wait"]);
+
+    let hosted = vec![xai_grok_sampling_types::HostedTool::ClientCustom(
+        xai_grok_sampling_types::CustomToolSpec {
+            name: "exec".to_string(),
+            description: Some("EXEC DESC".to_string()),
+            format: Default::default(),
+        },
+    )];
+    let entries = xai_grok_sampling_types::conversation::extra_tool_entries(
+        &hosted,
+        xai_grok_sampling_types::ProviderProfile::CODEX,
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["type"], "custom");
+    assert_eq!(entries[0]["name"], "exec");
+    assert_eq!(entries[0]["description"], "EXEC DESC");
+}

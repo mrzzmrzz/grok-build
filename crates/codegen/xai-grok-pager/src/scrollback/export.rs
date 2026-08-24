@@ -81,6 +81,10 @@ fn tool_summary(tc: &ToolCallBlock) -> String {
             format!("Read: {}{}", r.path, range)
         }
         ToolCallBlock::Edit(e) => format!("Edit: {}", e.path),
+        ToolCallBlock::CodeModeExec(e) => {
+            let first = e.source.lines().next().unwrap_or_default();
+            format!("Exec (Code Mode): {}", first)
+        }
         ToolCallBlock::Execute(ex) => {
             let desc = ex
                 .description

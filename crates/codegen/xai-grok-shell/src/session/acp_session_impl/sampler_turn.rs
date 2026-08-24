@@ -3,6 +3,63 @@
 //! recovery, and per-response usage recording.
 use super::*;
 const CLASSIFIER_REQUEST_TOKEN_RESERVE: u64 = 16_384;
+/// The model-facing tool specs for a Code Mode turn: `exec` + `wait` for the
+/// function-envelope transport, `wait` alone for the native custom-grammar
+/// transport (`exec` then rides `hosted_tools` as a `ClientCustom` entry).
+/// All ordinary tools are hidden from the manifest — they are only reachable
+/// through the isolate's `tools.*` namespace.
+fn code_mode_turn_specs(plan: &crate::tools::code_mode::CodeModeTurnPlan) -> Vec<ToolSpec> {
+    let wait_spec = ToolSpec {
+        name: xai_grok_code_mode_protocol::WAIT_TOOL_NAME.to_string(),
+        description: Some(
+            xai_grok_code_mode_protocol::build_wait_tool_description().to_string(),
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cell_id": {
+                    "type": "string",
+                    "description": "Identifies the running exec cell to resume."
+                },
+                "yield_time_ms": {
+                    "type": "number",
+                    "description": "How long to wait for more output before yielding again. Defaults to 10000 ms."
+                },
+                "terminate": {
+                    "type": "boolean",
+                    "description": "true stops the running cell; false or omitted waits for output."
+                },
+                "max_tokens": {
+                    "type": "number",
+                    "description": "Limits how much new output this wait call returns."
+                }
+            },
+            "required": ["cell_id"],
+            "additionalProperties": false
+        }),
+    };
+    if plan.transport
+        == Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar)
+    {
+        return vec![wait_spec];
+    }
+    let exec_spec = ToolSpec {
+        name: xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME.to_string(),
+        description: Some(plan.exec_description.clone()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Raw JavaScript source text (not JSON or markdown fences). Optionally start with a first-line pragma like `// @exec: {\"yield_time_ms\": 10000}`."
+                }
+            },
+            "required": ["source"],
+            "additionalProperties": false
+        }),
+    };
+    vec![exec_spec, wait_spec]
+}
 fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bool {
     input_tokens <= context_window.saturating_sub(CLASSIFIER_REQUEST_TOKEN_RESERVE)
 }
@@ -140,9 +197,18 @@ impl SessionActor {
     /// (`prepare_tool_definitions_*`); this applies only the `web_search` drop
     /// under backend search and the `ToolSpec::from` mapping.
     pub(crate) fn turn_base_tool_specs(&self, defs: &[ToolDefinition]) -> Vec<ToolSpec> {
+        let code_mode_plan = self.code_mode_plan();
+        if code_mode_plan.mode.is_code_mode() {
+            return code_mode_turn_specs(&code_mode_plan);
+        }
         let backend_search_active = self.backend_search_active();
         defs.iter()
             .filter(|td| !backend_search_active || td.function.name != "web_search")
+            // Defensive: the Code Mode tools are session-registered; they
+            // must never leak into a classic-mode manifest.
+            .filter(|td| {
+                xai_grok_code_mode_protocol::is_code_mode_nested_tool(&td.function.name)
+            })
             .cloned()
             .map(ToolSpec::from)
             .collect()
@@ -166,11 +232,28 @@ impl SessionActor {
         self.resolve_hosted().0
     }
     pub(crate) fn hosted_tools_for_turn(&self) -> Vec<xai_grok_sampling_types::HostedTool> {
-        if self.backend_search_active() {
+        let mut tools = if self.backend_search_active() {
             self.effective_hosted_tools()
         } else {
             Vec::new()
+        };
+        // Native custom-grammar Code Mode transport: `exec` rides the request
+        // as a client-executed custom tool ({"type":"custom", ...}); `wait`
+        // stays a plain function tool (see `code_mode_turn_specs`).
+        let plan = self.code_mode_plan();
+        if plan.mode.is_code_mode()
+            && plan.transport
+                == Some(xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar)
+        {
+            tools.push(xai_grok_sampling_types::HostedTool::ClientCustom(
+                xai_grok_sampling_types::CustomToolSpec {
+                    name: xai_grok_code_mode_protocol::PUBLIC_TOOL_NAME.to_string(),
+                    description: Some(plan.exec_description.clone()),
+                    format: Default::default(),
+                },
+            ));
         }
+        tools
     }
     /// The applied overrides to echo, or `None` when backend search is off.
     pub(crate) fn effective_tool_overrides(
@@ -781,10 +864,14 @@ impl SessionActor {
         slug: &str,
     ) -> Option<xai_grok_sampler::SamplerConfig> {
         let creds = self.chat_state_handle.get_credentials().await;
+        // xAI-only: a Codex OAuth key must never be adopted as the Tier-2
+        // xAI-proxy bearer (mirrors the user_id filter above).
         let session_key = self
             .auth_manager
             .as_ref()
-            .and_then(|am| am.current_or_expired().map(|a| a.key.clone()));
+            .and_then(|am| am.current_or_expired())
+            .filter(|a| a.is_xai_auth())
+            .map(|a| a.key.clone());
         let models = self.models_manager.models();
         let endpoints = self.models_manager.endpoints();
         let disable_api_key_auth = self

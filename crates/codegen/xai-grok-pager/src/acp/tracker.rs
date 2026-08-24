@@ -11,7 +11,8 @@ use crate::scrollback::blocks::tool::search::{
     SearchFileMatch, SearchInputMeta, SearchLineMatch, SearchOutputMode, SearchToolCallBlock,
 };
 use crate::scrollback::blocks::tool::{
-    DiscoveredTool, EditHighlightPhase, EditToolCallBlock, ExecuteToolCallBlock,
+    CodeModeExecToolCallBlock, DiscoveredTool, EditHighlightPhase, EditToolCallBlock,
+    ExecuteToolCallBlock,
     IntegrationSearchToolCallBlock, LineRange, MemorySearchToolCallBlock, OtherToolCallBlock,
     ReadMediaKind, ReadToolCallBlock, ToolCallBlock, UseToolCallBlock, WebFetchToolCallBlock,
     WebSearchToolCallBlock,
@@ -1779,9 +1780,64 @@ fn execute_command_from_tool_call(tc: &acp::ToolCall) -> String {
 /// Parses `tool_call.kind` to create the appropriate block type,
 /// extracting fields from `raw_input` JSON when available. `session_cwd` sets
 /// execute `header_display` when a leading `cd <cwd>` is redundant.
+/// Build the Code Mode `exec` block from a tool-call event: JS source from
+/// `raw_input.source`, cell state from the internally tagged `ToolOutput`
+/// serialization in `raw_output` (`{"type":"CodeMode", ...}`; an external
+/// `{"CodeMode": {...}}` child is accepted defensively).
+fn code_mode_exec_block(tc: &acp::ToolCall, success: bool) -> RenderBlock {
+    let source = extract_raw_field(tc, "source").unwrap_or_default();
+    let mut block = CodeModeExecToolCallBlock::new(source);
+    let parsed = tc.raw_output.as_ref().and_then(|v| {
+        let candidate = if v.get("type").and_then(|t| t.as_str()) == Some("CodeMode") {
+            Some(v)
+        } else {
+            v.get("CodeMode")
+        };
+        candidate.and_then(|v| {
+            serde_json::from_value::<
+                xai_grok_tools::implementations::code_mode::CodeModeCallOutput,
+            >(v.clone())
+            .ok()
+        })
+    });
+    if let Some(out) = parsed {
+        use xai_grok_tools::implementations::code_mode::CodeModeCellStatus;
+        block.cell_id = Some(out.cell_id.clone());
+        block.status = Some(
+            match out.status {
+                CodeModeCellStatus::Yielded => "yielded",
+                CodeModeCellStatus::Completed => "completed",
+                CodeModeCellStatus::Terminated => "terminated",
+            }
+            .to_string(),
+        );
+        block.error = out.error_text.clone();
+        let text = content_text(tc);
+        block.output = Some(if text.is_empty() {
+            out.to_prompt_format()
+        } else {
+            text
+        });
+    } else {
+        let text = content_text(tc);
+        if !text.is_empty() {
+            block.output = Some(text);
+        }
+        if !success {
+            block.error = Some("exec failed".to_string());
+        }
+    }
+    RenderBlock::ToolCall(ToolCallBlock::CodeModeExec(block))
+}
+
 fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderBlock {
     let success = !matches!(tc.status, acp::ToolCallStatus::Failed);
     match tc.kind {
+        // Code Mode `exec` also carries ToolKind::Execute; route it before
+        // the bash handling.
+        acp::ToolKind::Execute if extract_variant(tc) == Some("CodeModeExec") => {
+            code_mode_exec_block(tc, success)
+        }
         acp::ToolKind::Execute => {
             let command = execute_command_from_tool_call(tc);
             let header_display = peeled_if_changed(&command, session_cwd);
@@ -2148,6 +2204,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
         {
             media_gen_block(tc, success)
         }
+        _ if extract_variant(tc) == Some("CodeModeExec") => code_mode_exec_block(tc, success),
         _ if tc.title.starts_with("Memory search:") => {
             let query = tc
                 .title

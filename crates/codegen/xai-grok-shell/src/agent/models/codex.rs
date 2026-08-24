@@ -35,10 +35,13 @@ fn codex_entries_from_models<'a>(
 
 /// The single `CodexCatalogModel` → `ModelEntry` mapping.
 ///
-/// Capabilities are intentionally conservative: no code-mode, compaction, or
+/// Capabilities are intentionally conservative: no compaction or
 /// backend-search declarations until those are implemented for the Codex
 /// transport, and `supported_in_api: false` because this transport is
 /// OAuth-only (visibility is provider-aware, see `ModelEntry::visible_for`).
+/// `tool_mode` is the exception: Code Mode is implemented for the Codex
+/// transport, so the catalog's declaration is honored (unknown values warn
+/// and fail closed to Classic).
 fn codex_model_entry(model: &CodexCatalogModel, base_url: &str) -> ModelEntry {
     let mut info = config::ModelInfo::fallback(&model.slug);
     info.id = Some(model.slug.clone());
@@ -53,12 +56,35 @@ fn codex_model_entry(model: &CodexCatalogModel, base_url: &str) -> ModelEntry {
         info.context_window = context_window;
     }
     info.reasoning_efforts = codex_reasoning_efforts(model);
+    info.tool_mode = codex_tool_mode(model);
     ModelEntry {
         info,
         api_key: None,
         env_key: None,
         auth_provider: None,
         api_base_url: None,
+    }
+}
+
+/// Parse the live catalog's `tool_mode` string into the local capability.
+/// Known wire values map 1:1; anything else warns once per model and fails
+/// closed to `None` (⇒ Classic), so an unrecognized future mode can never
+/// grant Code Mode by accident.
+fn codex_tool_mode(model: &CodexCatalogModel) -> Option<config::ToolMode> {
+    match model.tool_mode.as_deref() {
+        None => None,
+        Some("classic") => Some(config::ToolMode::Classic),
+        Some("code_mode") => Some(config::ToolMode::CodeMode),
+        Some("code_mode_only") => Some(config::ToolMode::CodeModeOnly),
+        Some(other) => {
+            tracing::warn!(
+                model = %model.slug,
+                tool_mode = %other,
+                "Codex catalog declares a tool_mode this build does not know; \
+                 failing closed to classic"
+            );
+            None
+        }
     }
 }
 
@@ -158,6 +184,47 @@ mod tests {
             ],
             supports_search_tool: true,
             tool_mode: None,
+        }
+    }
+
+    /// Live-catalog Code Mode chain: the wire `tool_mode` string reaches
+    /// `ModelInfo.tool_mode` at the single mapping site, resolves through the
+    /// catalog capability lookup, and selects the native custom-grammar exec
+    /// transport for the Codex provider profile (the plan → turn-spec /
+    /// hosted-tool link is covered by the sampler-turn wire-shape tests).
+    #[test]
+    fn live_catalog_tool_mode_reaches_the_effective_code_mode_chain() {
+        for (wire, expected) in [
+            (None, None),
+            (Some("classic"), Some(config::ToolMode::Classic)),
+            (Some("code_mode"), Some(config::ToolMode::CodeMode)),
+            (Some("code_mode_only"), Some(config::ToolMode::CodeModeOnly)),
+            // Unknown value warns and fails closed.
+            (Some("hologram_mode"), None),
+        ] {
+            let mut model = catalog_model("gpt-6-live");
+            model.tool_mode = wire.map(str::to_owned);
+            let entries = codex_entries_from_models([&model]);
+            let info = entries["gpt-6-live"].info();
+            assert_eq!(info.tool_mode, expected, "wire tool_mode {wire:?}");
+
+            let effective = config::model_tool_mode(&entries, "gpt-6-live");
+            assert_eq!(
+                effective,
+                expected.unwrap_or(config::ToolMode::Classic),
+                "effective mode for wire {wire:?}"
+            );
+            if effective.is_code_mode() {
+                let transport = xai_grok_sampling_types::ProviderProfile::for_provider(
+                    info.provider(),
+                )
+                .code_mode_transport;
+                assert_eq!(
+                    transport,
+                    xai_grok_sampling_types::CodeModeTransport::NativeCustomGrammar,
+                    "Codex code mode must ride the native custom-grammar transport"
+                );
+            }
         }
     }
 

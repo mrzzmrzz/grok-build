@@ -84,6 +84,36 @@ impl SessionActor {
         // key needs no clearing — it is re-derived per request from the
         // provider, so a provider switch changes it automatically.
         crate::session::turn_affinity::clear_turn_state(&mut self.codex_turn_state.borrow_mut());
+        // Code Mode capability recompute (same pattern as the
+        // `supports_backend_search` Cell above, but the cache lives on
+        // `tool_context.code_mode` because it also carries the runtime).
+        // Any model switch tears the V8 runtime and its `store()` state down;
+        // the next turn's `refresh_code_mode_for_turn` lazily re-creates it
+        // when the new model still declares a code mode.
+        {
+            use crate::tools::code_mode::CodeModeTurnPlan;
+            let new_mode = crate::agent::config::model_tool_mode(
+                &self.models_manager.models(),
+                model_id.0.as_ref(),
+            );
+            let was_active = self.tool_context.code_mode.code_mode_active()
+                || self.tool_context.code_mode.handle().is_some();
+            self.tool_context.code_mode.set_plan(CodeModeTurnPlan {
+                model_id: model_id.0.to_string(),
+                mode: new_mode,
+                ..CodeModeTurnPlan::default()
+            });
+            if was_active {
+                self.tool_context
+                    .code_mode
+                    .shutdown_detached("model switch");
+                self.agent
+                    .borrow()
+                    .tool_bridge()
+                    .toolset()
+                    .unregister_code_mode_tools();
+            }
+        }
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {

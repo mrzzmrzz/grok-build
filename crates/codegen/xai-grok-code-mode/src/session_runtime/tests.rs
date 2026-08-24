@@ -142,6 +142,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
             .stored_values
             .lock()
             .await
+            .values
             .contains_key("candidate")
     );
 
@@ -174,6 +175,160 @@ fn execute_request(source: &str) -> CreateCellRequest {
         enabled_tools: Vec::new(),
         source: source.to_string(),
     }
+}
+
+/// Test delegate that parks every nested tool call on a shared barrier, so a
+/// test can hold several cells at the same execution point (each with a
+/// snapshot taken before any of them committed).
+struct BarrierDelegate {
+    barrier: tokio::sync::Barrier,
+}
+
+impl SessionRuntimeDelegate for BarrierDelegate {
+    async fn invoke_tool(
+        &self,
+        _invocation: NestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> Result<JsonValue, String> {
+        self.barrier.wait().await;
+        Ok(JsonValue::Null)
+    }
+
+    async fn notify(
+        &self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+fn gated_store_request(tool_call_id: &str, key: &str, value_bytes: usize) -> CreateCellRequest {
+    CreateCellRequest {
+        tool_call_id: tool_call_id.to_string(),
+        enabled_tools: vec![ToolDefinition {
+            name: "gate".to_string(),
+            tool_name: ToolName {
+                name: "gate".to_string(),
+                namespace: None,
+            },
+            description: String::new(),
+            kind: ToolKind::Function,
+        }],
+        source: format!(
+            r#"await tools.gate(); store("{key}", "x".repeat({value_bytes})); text("stored");"#
+        ),
+    }
+}
+
+/// Finding 6 regression: two cells that each snapshot an empty store and each
+/// stay under the cell-local cap must not jointly exceed the session-wide cap
+/// at the merge point. Exactly one delta merges; the loser's completion
+/// carries an explicit error and its delta is discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cells_cannot_jointly_exceed_the_global_stored_state_cap() {
+    const FIVE_MIB: usize = 5 * 1024 * 1024;
+    let runtime = SessionRuntime::new(Arc::new(BarrierDelegate {
+        barrier: tokio::sync::Barrier::new(2),
+    }));
+    let first = runtime
+        .execute(
+            gated_store_request("call-a", "a", FIVE_MIB),
+            ObserveMode::YieldAfter(Duration::from_secs(60)),
+        )
+        .await
+        .expect("start first cell");
+    let second = runtime
+        .execute(
+            gated_store_request("call-b", "b", FIVE_MIB),
+            ObserveMode::YieldAfter(Duration::from_secs(60)),
+        )
+        .await
+        .expect("start second cell");
+
+    let (first_event, second_event) =
+        tokio::join!(first.initial_event(), second.initial_event());
+    let events = [
+        first_event.expect("first completion"),
+        second_event.expect("second completion"),
+    ];
+    let mut rejected = 0;
+    let mut committed = 0;
+    for event in &events {
+        let CellEvent::Completed { error_text, .. } = event else {
+            panic!("expected a completion, got {event:?}");
+        };
+        match error_text {
+            Some(text) => {
+                assert!(
+                    text.contains("store() writes were discarded at session merge"),
+                    "unexpected completion error: {text}"
+                );
+                rejected += 1;
+            }
+            None => committed += 1,
+        }
+    }
+    assert_eq!((committed, rejected), (1, 1), "events: {events:?}");
+
+    let stored = runtime.inner.stored_values.lock().await;
+    assert_eq!(stored.values.len(), 1, "exactly one delta must merge");
+    assert!(
+        stored.bytes <= crate::runtime::MAX_STORED_STATE_BYTES,
+        "global accounting over cap: {}",
+        stored.bytes
+    );
+    let expected_bytes: usize = stored
+        .values
+        .iter()
+        .map(|(key, value)| crate::runtime::stored_entry_bytes(key, value))
+        .sum();
+    assert_eq!(stored.bytes, expected_bytes);
+    drop(stored);
+    runtime.shutdown().await.expect("shutdown runtime");
+}
+
+/// The merge-point check counts against the live global state: a delta that
+/// fits merges even when the committing cell raced another writer, as long as
+/// the merged total stays under the cap.
+#[tokio::test]
+async fn merge_point_accepts_deltas_that_fit_the_global_state() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let writer = runtime
+        .execute(
+            CreateCellRequest {
+                tool_call_id: "writer".to_string(),
+                enabled_tools: Vec::new(),
+                source: r#"store("small", "value"); text("ok");"#.to_string(),
+            },
+            ObserveMode::YieldAfter(Duration::from_secs(10)),
+        )
+        .await
+        .expect("start writer");
+    assert_eq!(
+        writer.initial_event().await,
+        Ok(CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "ok".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+    let stored = runtime.inner.stored_values.lock().await;
+    assert_eq!(
+        stored.values.get("small"),
+        Some(&JsonValue::String("value".to_string()))
+    );
+    assert_eq!(
+        stored.bytes,
+        crate::runtime::stored_entry_bytes("small", &JsonValue::String("value".to_string()))
+    );
+    drop(stored);
+    runtime.shutdown().await.expect("shutdown runtime");
 }
 
 #[tokio::test]

@@ -431,6 +431,7 @@ fn block_failed(block: &ToolCallBlock) -> bool {
         ToolCallBlock::IntegrationSearch(b) => !b.is_success(),
         ToolCallBlock::Skill(b) => !b.is_success(),
         ToolCallBlock::Execute(b) => !b.is_success(),
+        ToolCallBlock::CodeModeExec(b) => !b.is_success(),
         ToolCallBlock::Edit(b) => !b.is_success(),
         ToolCallBlock::UseTool(b) => !b.is_success(),
         ToolCallBlock::Other(b) => !b.is_success(),

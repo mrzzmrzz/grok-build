@@ -20,6 +20,7 @@ xai-grok-auth = { workspace = true }
 xai-grok-config = { path = "../xai-grok-config" }
 xai-grok-extra-ca = { workspace = true }
 xai-grok-tools-api = { path = "../xai-grok-tools-api" }
+xai-grok-code-mode-protocol = { workspace = true }
 xai-grok-workspace-types = { path = "../xai-grok-workspace-types" }
 xai-grok-version = { workspace = true }
 xai-interjection-core = { workspace = true }
@@ -107,6 +108,7 @@ windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 dirs = { workspace = true }
+xai-grok-code-mode = { workspace = true }
 pretty_assertions = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }

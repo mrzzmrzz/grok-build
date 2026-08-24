@@ -41,8 +41,19 @@ pub(crate) struct SessionRuntime<D: SessionRuntimeDelegate> {
     inner: Arc<Inner<D>>,
 }
 
+/// Session-global stored `store()` state plus its running serialized size.
+///
+/// `bytes` is the sum of [`crate::runtime::stored_entry_bytes`] over `values`
+/// and is maintained at the single merge point
+/// ([`RuntimeCellHost::commit_completion`]) so the 8 MiB cap can be enforced
+/// atomically against the *global* state, not each cell's snapshot.
+struct StoredState {
+    values: HashMap<String, JsonValue>,
+    bytes: usize,
+}
+
 struct Inner<D: SessionRuntimeDelegate> {
-    stored_values: Mutex<HashMap<String, JsonValue>>,
+    stored_values: Mutex<StoredState>,
     cells: Mutex<HashMap<CellId, CellHandle>>,
     cell_tasks: TaskTracker,
     shutdown_token: CancellationToken,
@@ -62,7 +73,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                stored_values: Mutex::new(HashMap::new()),
+                stored_values: Mutex::new(StoredState {
+                    values: HashMap::new(),
+                    bytes: 0,
+                }),
                 cells: Mutex::new(HashMap::new()),
                 cell_tasks: TaskTracker::new(),
                 shutdown_token: CancellationToken::new(),
@@ -159,7 +173,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<RuntimeEventFuture, Error> {
-        let stored_values = self.inner.stored_values.lock().await.clone();
+        let stored_values = self.inner.stored_values.lock().await.values.clone();
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
             inner: Arc::clone(&self.inner),
@@ -278,21 +292,89 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
         let cancellation_token = cell_state.cancellation_token();
-        let mut stored_values = tokio::select! {
+        let mut stored = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
                 return CompletionCommit::Rejected(event);
             }
-            stored_values = self.inner.stored_values.lock() => stored_values,
+            stored = self.inner.stored_values.lock() => stored,
         };
+        if stored_value_writes.is_empty() {
+            return cell_state.commit_completion(event, pending_initial_yield_items, || {});
+        }
+        // Session-wide atomic cap check at the single merge point: project the
+        // global size with this cell's writes applied. The isolate-local check
+        // in `runtime::callbacks` only saw the cell's own snapshot, so two
+        // concurrent cells can each pass it while their merged state exceeds
+        // the cap.
+        let projected = stored_value_writes
+            .iter()
+            .fold(stored.bytes, |projected, (key, value)| {
+                let new_bytes = crate::runtime::stored_entry_bytes(key, value);
+                let replaced_bytes = stored
+                    .values
+                    .get(key)
+                    .map(|old| crate::runtime::stored_entry_bytes(key, old))
+                    .unwrap_or(0);
+                projected
+                    .saturating_sub(replaced_bytes)
+                    .saturating_add(new_bytes)
+            });
+        if projected > crate::runtime::MAX_STORED_STATE_BYTES {
+            // Semantics: the completion itself still commits (the cell's
+            // content items are delivered), but its store() delta is rejected
+            // wholesale and the violation is surfaced explicitly to the cell
+            // observer via `error_text`.
+            let note = format!(
+                "store() writes were discarded at session merge: total stored session state \
+                 would be {projected} bytes, over the {} byte limit (another cell may have \
+                 stored data concurrently). The cell's other output is preserved. Overwrite \
+                 large keys with null to free space.",
+                crate::runtime::MAX_STORED_STATE_BYTES
+            );
+            let event = append_completion_error(event, &note);
+            return cell_state.commit_completion(event, pending_initial_yield_items, || {});
+        }
         cell_state.commit_completion(event, pending_initial_yield_items, || {
-            stored_values.extend(stored_value_writes);
+            for (key, value) in stored_value_writes {
+                let new_bytes = crate::runtime::stored_entry_bytes(&key, &value);
+                let replaced_bytes = stored
+                    .values
+                    .get(&key)
+                    .map(|old| crate::runtime::stored_entry_bytes(&key, old))
+                    .unwrap_or(0);
+                stored.bytes = stored
+                    .bytes
+                    .saturating_sub(replaced_bytes)
+                    .saturating_add(new_bytes);
+                stored.values.insert(key, value);
+            }
         })
     }
 
     async fn closed(&self) {
         self.inner.cells.lock().await.remove(&self.cell_id);
         self.inner.delegate.cell_closed(&self.cell_id);
+    }
+}
+
+/// Fold a merge-point rejection note into a completion event's `error_text`.
+///
+/// Only `Completed` events can carry store writes (they arrive with the
+/// runtime's `Result` event); any other shape passes through unchanged.
+fn append_completion_error(event: CellEvent, note: &str) -> CellEvent {
+    match event {
+        CellEvent::Completed {
+            content_items,
+            error_text,
+        } => CellEvent::Completed {
+            content_items,
+            error_text: Some(match error_text {
+                Some(existing) => format!("{existing}\n{note}"),
+                None => note.to_string(),
+            }),
+        },
+        other => other,
     }
 }
 

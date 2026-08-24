@@ -29,12 +29,30 @@ const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
 /// Ceiling on the total serialized size of `store()`d session state. The map
 /// is re-injected into every fresh isolate and persisted with the session, so
 /// unbounded growth degrades every later `exec` call in the conversation.
-pub(super) const MAX_STORED_STATE_BYTES: usize = 8 * 1024 * 1024;
+///
+/// The isolate-local check in [`callbacks`] is only a fast-fail heuristic
+/// against the cell's snapshot; the authoritative, session-wide check runs
+/// atomically at the completion merge point (see
+/// `session_runtime::RuntimeCellHost::commit_completion`), so two concurrent
+/// cells cannot each pass a local check and jointly exceed the cap.
+pub(crate) const MAX_STORED_STATE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Serialized footprint of one stored entry, as counted against
 /// [`MAX_STORED_STATE_BYTES`].
-pub(super) fn stored_entry_bytes(key: &str, value: &JsonValue) -> usize {
-    key.len() + value.to_string().len()
+///
+/// Counts the serialized representation of one `"key":value` member of the
+/// stored-state JSON object: the quoted-and-escaped key (so escaped keys are
+/// not undercounted), one colon, the compact serialization of the value, and
+/// **two** bytes of structural overhead per entry. A real object with `n`
+/// entries carries `n - 1` commas plus 2 braces = `n + 1` structural bytes;
+/// charging 2 per entry (`2n ≥ n + 1` for `n ≥ 1`) keeps the accounting
+/// strictly conservative — a map accounted at the cap can never serialize
+/// larger than the cap.
+pub(crate) fn stored_entry_bytes(key: &str, value: &JsonValue) -> usize {
+    let serialized_key_bytes = serde_json::to_string(key)
+        .map(|serialized| serialized.len())
+        .unwrap_or(key.len() + 2);
+    serialized_key_bytes + 1 + value.to_string().len() + 2
 }
 
 #[derive(Debug)]
@@ -372,6 +390,49 @@ mod tests {
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
+        }
+    }
+
+    /// Escaped-key boundary: the accounting must charge the serialized
+    /// (quoted, escaped) key representation, not the raw key length, plus the
+    /// member punctuation, so escape-heavy keys cannot undercount.
+    #[test]
+    fn stored_entry_bytes_counts_escaped_keys_and_punctuation() {
+        let value = serde_json::json!({"a": 1});
+        let value_len = value.to_string().len();
+
+        let plain = super::stored_entry_bytes("plain_key", &value);
+        // "plain_key" serializes to 9 + 2 quote bytes; +1 colon +2 structural.
+        assert_eq!(plain, 9 + 2 + value_len + 3);
+
+        let escaped_key = "quote\"backslash\\newline\n";
+        let escaped = super::stored_entry_bytes(escaped_key, &value);
+        let serialized_key_len = serde_json::to_string(escaped_key).unwrap().len();
+        assert_eq!(escaped, serialized_key_len + value_len + 3);
+        assert!(
+            escaped > escaped_key.len() + 2 + value_len + 3,
+            "escaped key must count larger than its raw length"
+        );
+    }
+
+    /// The per-entry accounting must never undercount the real serialized
+    /// map: `sum(stored_entry_bytes) >= serde_json::to_string(map).len()`.
+    #[test]
+    fn accounting_is_conservative_against_real_serialization() {
+        for entries in [1usize, 2, 5] {
+            let mut map = serde_json::Map::new();
+            for i in 0..entries {
+                map.insert(format!("key_{i}\""), serde_json::json!({"v": i}));
+            }
+            let accounted: usize = map
+                .iter()
+                .map(|(k, v)| super::stored_entry_bytes(k, v))
+                .sum();
+            let actual = serde_json::Value::Object(map).to_string().len();
+            assert!(
+                accounted >= actual,
+                "accounted {accounted} < actual {actual} for {entries} entries"
+            );
         }
     }
 

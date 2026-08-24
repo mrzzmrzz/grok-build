@@ -248,6 +248,10 @@ impl SessionActor {
     /// for the cancel to report. Callers read `epoch` under the lock they take the task from.
     fn abort_turn_task(&self, task: &AgentTask, epoch: super::turn_report_slot::TurnEpoch) {
         task.abort();
+        // Aborting the turn future only drops the exec/wait callers; any
+        // yielded Code Mode cell keeps its isolate running until explicitly
+        // terminated (single funnel for every cancel path).
+        self.terminate_code_mode_cells("turn aborted");
         self.turn_report.release_aborted(epoch);
     }
 
@@ -415,6 +419,14 @@ impl SessionActor {
                 if let Some(task) = state.running_task.take_if(|t| t.prompt_id == requested) {
                     self.abort_turn_task(&task, turn_epoch);
                 }
+                // A history rewind discards the turn's effects wholesale, so
+                // Code Mode is fully reset: the generation bump synchronously
+                // fences queued nested work, cells terminate, and the
+                // rewound turn's store() state is dropped with the runtime
+                // (recreated lazily if the next turn is still code mode).
+                self.tool_context
+                    .code_mode
+                    .shutdown_detached("history rewind");
                 if let Some(gate) = &self.tool_context.task_wake_suppressed {
                     gate.set(false);
                 }

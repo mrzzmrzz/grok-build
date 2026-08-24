@@ -4,6 +4,7 @@
 //! Types (ToolOutput, ToolInput, TodoState, etc.) come from `xai-grok-tools` directly.
 
 pub mod bridge;
+pub mod code_mode;
 pub mod config;
 pub mod notification_bridge;
 pub mod retry;
