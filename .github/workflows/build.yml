@@ -29,6 +29,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Port hard constraints (docs/codex-subscription-port-spec.md §2.1):
+      # no source-repo naming may leak into the tree; docs quoting the
+      # constraint and this workflow are the only allowed mentions.
+      - name: Forbidden-naming guard
+        run: |
+          if git grep -iE 'opengrok|open-grok' -- ':!docs/' ':!.github/workflows/build.yml'; then
+            echo "forbidden source-repo naming found" >&2
+            exit 1
+          fi
+
       - name: Workspace check
         run: cargo check --locked --workspace
 
