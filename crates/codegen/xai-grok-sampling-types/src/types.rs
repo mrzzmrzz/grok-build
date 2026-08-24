@@ -1208,6 +1208,10 @@ pub struct CreateResponseWrapper {
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
+
+    /// Opaque Codex turn-state token, sent as the `x-codex-turn-state`
+    /// request header — only under the Codex provider profile.
+    pub turn_state: Option<String>,
 }
 
 impl CreateResponseWrapper {
@@ -1224,6 +1228,7 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
+            turn_state: None,
         }
     }
 

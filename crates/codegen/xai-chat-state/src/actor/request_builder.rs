@@ -109,6 +109,9 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            // Stamped by the shell's turn loop (turn affinity), not here:
+            // chat-state has no provider knowledge.
+            turn_state: None,
         }
     }
 }

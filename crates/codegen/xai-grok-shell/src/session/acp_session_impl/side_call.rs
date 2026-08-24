@@ -103,6 +103,13 @@ impl SessionActor {
     /// Temperature stays unset: cli-chat-proxy may inject a `thinking` config, and the Messages API then requires temperature == 1.
     pub(crate) fn parent_cached_request(&self, call: AuxCall) -> ConversationRequest {
         let session_id = self.session_info.id.to_string();
+        // Provider-tagged so a Codex session's side-calls ride the same
+        // cache affinity as its main turns while never reusing an xAI key
+        // (SPEC §8.3). For xAI this derives the bare session id — the
+        // pre-existing behavior.
+        let provider = self.model_auth_facts(&call.model).model_provider;
+        let prompt_cache_key =
+            crate::session::turn_affinity::derive_prompt_cache_key(provider, &session_id);
         // Only the Responses mapping sends the cache key. On the other backends the conv id is what ties a call to its conversation,
         // so it has to stay the parent session id; the `btw-`/`recap-` label still shows up in `x_grok_req_id`.
         let conv_id = if call.backend.forwards_prompt_cache_key() {
@@ -123,7 +130,7 @@ impl SessionActor {
             x_grok_req_id: Some(call.req_id),
             x_grok_session_id: Some(session_id.clone()),
             x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-            prompt_cache_key: Some(session_id),
+            prompt_cache_key: Some(prompt_cache_key),
             ..Default::default()
         }
     }

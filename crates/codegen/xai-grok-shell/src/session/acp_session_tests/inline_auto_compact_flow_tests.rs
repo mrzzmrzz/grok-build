@@ -246,6 +246,7 @@ async fn create_test_actor(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        codex_turn_state: std::cell::RefCell::new(None),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
         title_refresh_task: std::cell::RefCell::new(None),
@@ -391,6 +392,7 @@ async fn test_response_header_context_window_downgrade_rejected() {
                     context_window: Some(256_000),
                     max_completion_tokens: None,
                     models_etag: None,
+                    turn_state: None,
                 })
                 .await;
             let cfg_after = actor.chat_state_handle.get_sampling_config().await.unwrap();
@@ -404,6 +406,7 @@ async fn test_response_header_context_window_downgrade_rejected() {
                     context_window: Some(1_000_000),
                     max_completion_tokens: None,
                     models_etag: None,
+                    turn_state: None,
                 })
                 .await;
             let cfg_upgraded = actor.chat_state_handle.get_sampling_config().await.unwrap();
@@ -723,6 +726,7 @@ async fn create_test_actor_with_memory(
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
+        codex_turn_state: std::cell::RefCell::new(None),
         turn_summary_task: std::cell::RefCell::new(None),
         turn_summary_generation: std::cell::Cell::new(0),
         title_refresh_task: std::cell::RefCell::new(None),
@@ -1199,6 +1203,7 @@ fn api_error_with_context_window(context_window: u64) -> xai_grok_sampler::Sampl
             context_window: Some(context_window),
             max_completion_tokens: None,
             models_etag: None,
+            turn_state: None,
         }),
         empty_response_context: None,
         doom_loop_triggers: None,
@@ -1521,6 +1526,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 last_recap_main_turn: std::cell::Cell::new(0),
                 recap_in_flight: std::cell::Cell::new(false),
                 recap_epoch: std::cell::Cell::new(0),
+                codex_turn_state: std::cell::RefCell::new(None),
                 turn_summary_task: std::cell::RefCell::new(None),
                 turn_summary_generation: std::cell::Cell::new(0),
                 title_refresh_task: std::cell::RefCell::new(None),

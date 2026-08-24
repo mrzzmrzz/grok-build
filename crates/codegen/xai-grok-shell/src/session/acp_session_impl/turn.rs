@@ -337,6 +337,12 @@ impl SessionActor {
         }
         if policy.authority.is_human_intent() {
             self.invalidate_side_calls_for_new_prompt();
+            // A new user prompt starts a new logical prompt: the Codex
+            // turn-state bound to the previous prompt must not be echoed
+            // by this turn's requests (SPEC §8.2).
+            crate::session::turn_affinity::clear_turn_state(
+                &mut self.codex_turn_state.borrow_mut(),
+            );
         }
         self.ensure_session_disk_writable().await?;
         self.signals_handle().increment_turn();
@@ -2330,6 +2336,22 @@ impl SessionActor {
                 request.json_schema = json_schema.clone();
             }
             request.hosted_tools = self.hosted_tools_for_turn();
+            // Codex turn affinity (SPEC §8.2/§8.3): echo the turn-state
+            // bound to this logical prompt and pin the prompt-cache key to
+            // the provider-tagged session identity. Runs on every loop
+            // iteration, so tool continuations and 401-refresh resubmits
+            // reuse the binding; xAI requests are left untouched.
+            {
+                let provider = self
+                    .model_auth_facts(request.model.as_deref().unwrap_or_default())
+                    .model_provider;
+                crate::session::turn_affinity::apply_turn_affinity(
+                    &mut request,
+                    provider,
+                    &self.session_info.id.to_string(),
+                    self.codex_turn_state.borrow().clone(),
+                );
+            }
             request.max_output_tokens = self
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)

@@ -78,6 +78,12 @@ impl SessionActor {
                 client_version: sampling_config.client_version.clone(),
             });
         self.invalidate_model_auth_memo();
+        // Any model switch invalidates the Codex turn-state binding: a
+        // switch to xAI must not leak it (SPEC §8.2 rule 6), and a
+        // different Codex model's binding is stale too. The prompt-cache
+        // key needs no clearing — it is re-derived per request from the
+        // provider, so a provider switch changes it automatically.
+        crate::session::turn_affinity::clear_turn_state(&mut self.codex_turn_state.borrow_mut());
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {

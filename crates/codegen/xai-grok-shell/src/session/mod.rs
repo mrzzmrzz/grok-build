@@ -432,6 +432,7 @@ pub(crate) mod telemetry;
 #[cfg(feature = "test-support")]
 pub mod testkit;
 pub mod tool_index;
+pub(crate) mod turn_affinity;
 pub(crate) mod turn_completion;
 pub mod unified_list;
 pub(crate) mod user_message;

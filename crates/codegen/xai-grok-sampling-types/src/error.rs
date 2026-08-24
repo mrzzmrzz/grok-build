@@ -77,6 +77,13 @@ pub struct ResponseModelMetadata {
     pub max_completion_tokens: Option<u32>,
     /// `x-models-etag` — triggers model catalog refresh when changed.
     pub models_etag: Option<String>,
+    /// `x-codex-turn-state` — opaque Codex turn-state token. Only Codex
+    /// responses carry it; the shell echoes it on every follow-up request
+    /// of the same logical prompt (retry, tool continuation, 401 refresh)
+    /// and clears it on a new user prompt or a provider/model switch.
+    /// Never persisted with the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_state: Option<String>,
 }
 
 /// Wire-credential provenance of a request that failed authentication.

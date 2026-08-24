@@ -88,6 +88,29 @@ impl GrokRequestHeaders<'_> {
     }
 }
 
+/// Attach the Codex `x-codex-turn-state` echo header to a Responses
+/// request. Codex-profile only: an xAI request never carries it, whatever
+/// the request says (belt to the shell's braces — the shell also only
+/// stamps `turn_state` from a Codex response header).
+///
+/// `x-codex-beta-features: remote_compaction_v2` is deliberately NOT sent
+/// here yet: remote compaction is unimplemented and the capability is not
+/// declared. When compaction lands, this is the injection point for that
+/// header.
+fn apply_codex_turn_state(
+    builder: reqwest::RequestBuilder,
+    profile: ProviderProfile,
+    turn_state: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if profile.provider != ModelProvider::Codex {
+        return builder;
+    }
+    match turn_state.filter(|s| !s.is_empty()) {
+        Some(state) => builder.header("x-codex-turn-state", state),
+        None => builder,
+    }
+}
+
 /// Parse the `Retry-After` response header as delta-seconds.
 /// Our inference backends only emit integer seconds (never HTTP-date),
 /// so we only handle that form. HTTP-dates silently return `None` and
@@ -277,11 +300,25 @@ fn extract_model_metadata(headers: &reqwest::header::HeaderMap) -> Option<Respon
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    if context_window.is_some() || max_completion_tokens.is_some() || models_etag.is_some() {
+    // Codex turn-state: opaque, echoed back verbatim by follow-up requests
+    // of the same logical prompt. Only Codex responses set it; response
+    // headers arrive before the body, so streaming needs no parser changes.
+    let turn_state = headers
+        .get("x-codex-turn-state")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    if context_window.is_some()
+        || max_completion_tokens.is_some()
+        || models_etag.is_some()
+        || turn_state.is_some()
+    {
         Some(ResponseModelMetadata {
             context_window,
             max_completion_tokens,
             models_etag,
+            turn_state,
         })
     } else {
         None
@@ -1320,9 +1357,12 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers
-            .apply(builder, self.defaults.provider_profile)
-            .json(&request_body);
+        let http_request = apply_codex_turn_state(
+            grok_headers.apply(builder, self.defaults.provider_profile),
+            self.defaults.provider_profile,
+            request.turn_state.as_deref(),
+        )
+        .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1464,9 +1504,12 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let mut http_request = grok_headers
-            .apply(builder, self.defaults.provider_profile)
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let mut http_request = apply_codex_turn_state(
+            grok_headers.apply(builder, self.defaults.provider_profile),
+            self.defaults.provider_profile,
+            request.turn_state.as_deref(),
+        )
+        .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         // The opt-in header is x-grok-*; a non-xAI profile must not send it
         // (the collector stays armed so a misbehaving server's check events
         // are still absorbed rather than breaking typed decode).
@@ -2015,6 +2058,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let turn_state = request.turn_state.clone();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
         // `splice_extra_tool_entries`, whose doc explains why each one does.
@@ -2029,6 +2073,7 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        wrapper.turn_state = turn_state;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2052,6 +2097,7 @@ impl SamplingClient {
         let x_grok_session_id = request.x_grok_session_id.clone();
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
+        let turn_state = request.turn_state.clone();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
         // `splice_extra_tool_entries`, whose doc explains why each one does.
@@ -2066,6 +2112,7 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        wrapper.turn_state = turn_state;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);

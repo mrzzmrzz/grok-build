@@ -1056,6 +1056,15 @@ pub(crate) struct SessionActor {
     /// Bumped on each real user prompt (queue accept + turn start); in-flight
     /// recap suppresses emit if this changes before commit.
     pub(crate) recap_epoch: std::cell::Cell<u64>,
+    /// `x-codex-turn-state` bound to the current logical prompt (SPEC §8.2).
+    /// Captured from Codex response headers via `ModelMetadata` events;
+    /// echoed by every follow-up request of the same prompt (retry, tool
+    /// continuation, client rebuild, 401 refresh); cleared on a new user
+    /// prompt and on any model switch. Deliberately NOT persisted — session
+    /// save/restore never carries it — and per-actor, so concurrent
+    /// prompts (subagent sessions) each keep an independent binding.
+    /// Lifecycle rules live in [`crate::session::turn_affinity`].
+    pub(crate) codex_turn_state: std::cell::RefCell<Option<String>>,
     /// The in-flight turn-summary side-call, if any. A newer completion (or a
     /// real prompt / rewind / cancel / shutdown) aborts it — its result would
     /// describe an older turn — and a completion respawns; see

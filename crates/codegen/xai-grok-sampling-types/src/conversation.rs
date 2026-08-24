@@ -723,6 +723,12 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Opaque Codex turn-state token to echo back as the
+    /// `x-codex-turn-state` request header. Captured from a Codex
+    /// response header by the shell and bound to the current logical
+    /// prompt. The client only puts it on the wire under the Codex
+    /// provider profile; xAI requests never send it.
+    pub turn_state: Option<String>,
 }
 
 impl ConversationRequest {

@@ -518,6 +518,15 @@ impl SessionActor {
         &self,
         metadata: crate::sampling::ResponseModelMetadata,
     ) {
+        // Codex turn-state: bind the freshest observed token to the current
+        // logical prompt (only Codex responses carry the header). Borrow is
+        // scoped so it never spans the awaits below.
+        if let Some(turn_state) = metadata.turn_state.clone() {
+            crate::session::turn_affinity::observe_turn_state(
+                &mut self.codex_turn_state.borrow_mut(),
+                turn_state,
+            );
+        }
         if let Some(ref etag) = metadata.models_etag {
             self.models_manager.refresh_if_new_etag(etag.clone()).await;
         }
