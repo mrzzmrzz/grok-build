@@ -37,6 +37,18 @@ impl SessionActor {
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
             .set(sampling_config.compaction_at_tokens);
+        // Provenance is marked at the switch itself, before the next prompt
+        // is persisted or sampled — waiting for a Codex response header would
+        // leave a window where the prompt reaches xAI remote/relay sync.
+        if sampling_config.provider_profile.provider
+            == xai_grok_sampling_types::ModelProvider::Codex
+        {
+            self.chat_state_handle.mark_ever_used_codex();
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(crate::session::persistence::PersistenceMsg::MarkEverUsedCodex);
+        }
         xai_grok_telemetry::unified_log::info(
             "backend_search: model switch",
             Some(self.session_info.id.0.as_ref()),
