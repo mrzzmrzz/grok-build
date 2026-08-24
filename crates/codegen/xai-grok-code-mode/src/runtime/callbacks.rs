@@ -9,6 +9,7 @@ use super::value::normalize_output_image;
 use super::value::serialize_output_text;
 use super::value::throw_type_error;
 use super::value::v8_value_to_json;
+use super::value::v8_value_to_json_with_limit;
 
 pub(super) fn tool_callback(
     scope: &mut v8::PinScope<'_, '_>,
@@ -198,7 +199,17 @@ pub(super) fn store_callback(
         }
     };
     let value = args.get(1);
-    let serialized = match v8_value_to_json(scope, value) {
+    let limit_error = format!(
+        "Unable to store {key:?}: serialized value exceeds the {} byte stored session state limit. \
+         Overwrite large keys with null to free space.",
+        super::MAX_STORED_STATE_BYTES
+    );
+    let serialized = match v8_value_to_json_with_limit(
+        scope,
+        value,
+        super::MAX_STORED_STATE_BYTES,
+        &limit_error,
+    ) {
         Ok(Some(value)) => value,
         Ok(None) => {
             throw_type_error(

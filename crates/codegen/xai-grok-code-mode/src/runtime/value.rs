@@ -7,17 +7,16 @@ use xai_grok_code_mode_protocol::ImageDetail;
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
 const REMOTE_IMAGE_URL_ERROR: &str = "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
-/// V8 string length is UTF-16 code units; at most four UTF-8 bytes can be
-/// produced per unit. This keeps any one callback conversion under roughly
-/// the actor's 8 MiB materialization ceiling before allocating the Rust String.
-const MAX_CALLBACK_STRING_UTF16_UNITS: usize = 2 * 1024 * 1024;
+/// Keeps any one callback conversion within the actor's 8 MiB materialization
+/// ceiling before allocating the Rust string.
+const MAX_CALLBACK_STRING_UTF8_BYTES: usize = 8 * 1024 * 1024;
 
 fn bounded_v8_string(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::String>,
     what: &str,
 ) -> Result<String, String> {
-    if value.length() > MAX_CALLBACK_STRING_UTF16_UNITS {
+    if value.utf8_length(scope) > MAX_CALLBACK_STRING_UTF8_BYTES {
         return Err(format!(
             "{what} exceeds the code-mode per-item output limit"
         ));
@@ -208,6 +207,20 @@ pub(super) fn v8_value_to_json(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> Result<Option<JsonValue>, String> {
+    v8_value_to_json_with_limit(
+        scope,
+        value,
+        MAX_CALLBACK_STRING_UTF8_BYTES,
+        "serialized JavaScript value exceeds the code-mode per-item output limit",
+    )
+}
+
+pub(super) fn v8_value_to_json_with_limit(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    max_utf8_bytes: usize,
+    limit_error: &str,
+) -> Result<Option<JsonValue>, String> {
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let Some(stringified) = v8::json::stringify(&tc, value) else {
@@ -219,7 +232,10 @@ pub(super) fn v8_value_to_json(
         }
         return Ok(None);
     };
-    let stringified = bounded_v8_string(&mut tc, stringified, "serialized JavaScript value")?;
+    if stringified.utf8_length(&tc) > max_utf8_bytes {
+        return Err(limit_error.to_string());
+    }
+    let stringified = stringified.to_rust_string_lossy(&tc);
     serde_json::from_str(&stringified)
         .map(Some)
         .map_err(|err| format!("failed to serialize JavaScript value: {err}"))
