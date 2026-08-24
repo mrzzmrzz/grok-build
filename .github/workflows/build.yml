@@ -39,6 +39,14 @@ jobs:
             exit 1
           fi
 
+      # The v8 crate keeps its prebuilt static library in the build OUT_DIR;
+      # a restored cache can carry the build fingerprint without the archive,
+      # which then fails linking ("could not find native static library
+      # rusty_v8"). Evicting v8's artifacts makes the build script re-fetch
+      # the archive deterministically at a small cost.
+      - name: Evict cached v8 build output
+        run: cargo clean -p v8 || true
+
       - name: Workspace check
         run: cargo check --locked --workspace
 
