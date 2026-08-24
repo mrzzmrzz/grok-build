@@ -369,12 +369,21 @@ impl FailedResponseCapture {
 
     /// Record the terminal `output` list, which supersedes anything recorded
     /// item by item: it is the turn's authoritative content and order.
+    ///
+    /// An *empty* terminal list supersedes nothing. The ChatGPT/Codex dialect
+    /// always terminates with `"output": []` and delivers the turn only on
+    /// `response.output_item.done`, so clearing there would erase the very
+    /// items a replay must carry. The terminal frame is still recorded as
+    /// seen — the turn did reach its end.
     pub(crate) fn record_terminal_output(&self, output: &[rs::OutputItem]) {
         if self.inner.is_none() {
             return;
         }
+        let supersedes = !output.is_empty();
         self.with(|captured| {
-            captured.typed.clear();
+            if supersedes {
+                captured.typed.clear();
+            }
             captured.terminal_seen = true;
         });
         for (output_index, item) in output.iter().enumerate() {

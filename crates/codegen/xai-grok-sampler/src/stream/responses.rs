@@ -865,6 +865,25 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
 
         // ── Build the final response ─────────────────────────────────
         let mut response = match final_response {
+            // The terminal response is authoritative *for its own content*.
+            // The ChatGPT/Codex dialect terminates with `response.completed`
+            // carrying `"output": []` — the turn's items only ever arrive on
+            // `response.output_item.done` — so an empty terminal projection
+            // over completed items is a dialect difference, not an empty
+            // turn. Splicing the durable copies back in is the only way that
+            // turn survives; discarding them made every Codex reply read as
+            // an empty response and drove the retry loop to resample the
+            // same turn until the user cancelled.
+            Some(mut r) if r.output.is_empty() && !durable_output.is_empty() => {
+                tracing::debug!(
+                    request_id = %request_id,
+                    recovered_items = durable_output.len(),
+                    "terminal response carried no output; \
+                     restoring the completed output items"
+                );
+                r.output = std::mem::take(&mut durable_output).into_values().collect();
+                r
+            }
             Some(r) => r,
             // The stream died before a terminal event but whole output items
             // completed: rebuild the turn from them instead of discarding
@@ -895,7 +914,7 @@ pub(crate) fn stream_responses_tracked_with_client_custom_tools<'a>(
                 } else {
                     Status::Incomplete
                 };
-                recovered.output = durable_output.into_values().collect();
+                recovered.output = std::mem::take(&mut durable_output).into_values().collect();
                 recovered
             }
             None => {
@@ -2086,6 +2105,156 @@ mod tests {
                     response.tool_calls().is_empty(),
                     "durable function call must not leak past the terminal output"
                 );
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The exact wire sequence a ChatGPT/Codex turn produces, captured from
+    /// `POST https://chatgpt.com/backend-api/codex/responses` with
+    /// `gpt-5.6-luna`: the assistant message rides
+    /// `response.output_item.done`, and `response.completed` reports
+    /// `"status": "completed"` with `"output": []`.
+    ///
+    /// Taking that empty projection as authoritative erased the reply, and
+    /// the resulting "empty response" made the sampler resample the same
+    /// turn until the user cancelled — the user-visible bug of a turn that
+    /// answers, then answers again, forever.
+    #[tokio::test]
+    async fn codex_completed_with_empty_output_keeps_the_streamed_message() {
+        let message = output_message_item("msg_0edf", "ok");
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(rs::ResponseStreamEvent::ResponseCreated(
+                rs_types::ResponseCreatedEvent {
+                    response: build_response(rs_types::Status::InProgress),
+                    sequence_number: 0,
+                },
+            )),
+            Ok(rs::ResponseStreamEvent::ResponseInProgress(
+                rs_types::ResponseInProgressEvent {
+                    response: build_response(rs_types::Status::InProgress),
+                    sequence_number: 1,
+                },
+            )),
+            Ok(rs::ResponseStreamEvent::ResponseOutputItemAdded(
+                rs_types::ResponseOutputItemAddedEvent {
+                    sequence_number: 2,
+                    output_index: 0,
+                    item: message.clone(),
+                },
+            )),
+            Ok(text_delta_event("ok")),
+            Ok(rs::ResponseStreamEvent::ResponseOutputTextDone(
+                rs_types::ResponseTextDoneEvent {
+                    sequence_number: 6,
+                    item_id: "msg_0edf".into(),
+                    output_index: 0,
+                    content_index: 0,
+                    text: "ok".into(),
+                    logprobs: None,
+                },
+            )),
+            Ok(output_item_done_event(0, message)),
+            // `output: []` — the Codex terminal projection.
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(
+                    response.assistant_text(),
+                    "ok",
+                    "the completed message must survive an empty terminal output"
+                );
+                assert!(
+                    !response.is_empty(),
+                    "a turn that produced a message is not an empty response"
+                );
+                assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        // Exactly one terminal event, so the reply is delivered once.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    SamplingEvent::Completed { .. } | SamplingEvent::Failed { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    /// Same dialect, agentic shape: reasoning and a function call also live
+    /// only on the done frames, so an empty terminal output must not drop
+    /// the tool call (which would strand the turn instead of running it).
+    #[tokio::test]
+    async fn codex_empty_terminal_output_keeps_reasoning_and_tool_calls() {
+        let events: Vec<Result<rs::ResponseStreamEvent, SamplingError>> = vec![
+            Ok(output_item_done_event(
+                0,
+                reasoning_item("rs_1", &["Checking"], Some("enc-1")),
+            )),
+            Ok(output_item_done_event(
+                1,
+                function_call_item("call_1", "do_thing", "{\"x\":1}"),
+            )),
+            Ok(completed_event()),
+        ];
+        let raw = stream::iter(events).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "do_thing");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"x\":1}");
+                let reasoning = reasoning_siblings(response);
+                assert_eq!(reasoning.len(), 1);
+                assert_eq!(reasoning[0].encrypted_content.as_deref(), Some("enc-1"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A terminal response that is empty *and* has no completed items stays
+    /// an empty turn: the splice may not invent content.
+    #[tokio::test]
+    async fn empty_terminal_output_without_durable_items_stays_empty() {
+        let raw = stream::iter(vec![Ok(completed_event())]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert!(response.is_empty());
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
             }
             other => panic!("expected Completed, got {other:?}"),
