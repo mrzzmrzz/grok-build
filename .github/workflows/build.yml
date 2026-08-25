@@ -145,6 +145,7 @@ jobs:
             -s \
             -k "$keychain_password" \
             "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
           if ! security find-identity -v -p codesigning "$keychain_path" | grep -F -- "$APPLE_SIGNING_IDENTITY"; then
             echo "::error::APPLE_SIGNING_IDENTITY does not match the imported certificate."
             exit 1
