@@ -1,9 +1,9 @@
-# Apple code signing
+# Apple code signing and notarization
 
 The macOS release job signs `grok` with a Developer ID Application certificate
-before uploading the artifact. The certificate is loaded into an ephemeral
-keychain and removed before the job finishes. Never commit the certificate or
-its password to the repository.
+and submits the signed binary to Apple's notary service before uploading the
+artifact. Signing and notarization credentials are removed before the job
+finishes. Never commit them to the repository.
 
 ## Required repository secrets
 
@@ -15,6 +15,9 @@ Actions**:
 | `APPLE_CERTIFICATE_BASE64` | Base64-encoded `.p12` containing the Developer ID Application certificate and private key |
 | `APPLE_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12` |
 | `APPLE_SIGNING_IDENTITY` | Full identity: `Developer ID Application: YY T (6F8LHK4H5P)` |
+| `APPLE_NOTARY_KEY` | Contents of the App Store Connect Team API key `.p8` file |
+| `APPLE_NOTARY_KEY_ID` | App Store Connect Team API key ID |
+| `APPLE_NOTARY_ISSUER_ID` | App Store Connect API issuer ID |
 
 Encode the certificate on macOS without adding line breaks:
 
@@ -34,8 +37,12 @@ missing; Linux builds never receive these secrets.
   outside the Mac App Store.
 - Set `APPLE_SIGNING_IDENTITY` exactly as shown by
   `security find-identity -v -p codesigning` after importing the certificate.
+- Create the notary API key under **App Store Connect → Users and Access →
+  Integrations → Team Keys** with Developer access. It must belong to the same
+  developer team as the signing certificate.
 
 The workflow applies a secure timestamp and the hardened runtime, then runs
-`codesign --verify` before publishing the binary. Code signing does not by
-itself notarize the artifact; notarization requires separate App Store Connect
-credentials and a submission step.
+`codesign --verify`. It submits a temporary ZIP containing the signed binary,
+waits for an `Accepted` result, prints the notarization log, and verifies the
+published binary with `spctl`. Standalone executables cannot carry a stapled
+ticket, so Gatekeeper retrieves their notarization ticket from Apple.

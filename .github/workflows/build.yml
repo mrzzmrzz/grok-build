@@ -174,7 +174,66 @@ jobs:
           grep -Fq "Authority=$APPLE_SIGNING_IDENTITY" "$signature_details"
           grep -Fq 'TeamIdentifier=6F8LHK4H5P' "$signature_details"
 
-      - name: Remove Apple code-signing keychain
+      - name: Notarize macOS binary
+        if: runner.os == 'macOS'
+        env:
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_NOTARY_KEY" || -z "$APPLE_NOTARY_KEY_ID" || -z "$APPLE_NOTARY_ISSUER_ID" ]]; then
+            echo "::error::Apple notarization secrets are not configured. See .github/APPLE_CODE_SIGNING.md."
+            exit 1
+          fi
+
+          notary_key_path="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          notary_archive_path="$RUNNER_TEMP/grok-macos-aarch64.zip"
+          notary_result_path="$RUNNER_TEMP/grok-notary-result.json"
+          notary_log_path="$RUNNER_TEMP/grok-notary-log.json"
+
+          echo "APPLE_NOTARY_KEY_PATH=$notary_key_path" >> "$GITHUB_ENV"
+          echo "APPLE_NOTARY_ARCHIVE_PATH=$notary_archive_path" >> "$GITHUB_ENV"
+          echo "APPLE_NOTARY_RESULT_PATH=$notary_result_path" >> "$GITHUB_ENV"
+          echo "APPLE_NOTARY_LOG_PATH=$notary_log_path" >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_NOTARY_KEY" > "$notary_key_path"
+          chmod 600 "$notary_key_path"
+          ditto -c -k --norsrc target/release/grok "$notary_archive_path"
+
+          set +e
+          xcrun notarytool submit "$notary_archive_path" \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait \
+            --timeout 30m \
+            --output-format json > "$notary_result_path"
+          submit_exit=$?
+          set -e
+
+          cat "$notary_result_path"
+          submission_id="$(jq -r '.id // empty' "$notary_result_path")"
+          status="$(jq -r '.status // empty' "$notary_result_path")"
+
+          if [[ -n "$submission_id" ]]; then
+            xcrun notarytool log "$submission_id" \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              "$notary_log_path"
+            cat "$notary_log_path"
+          fi
+
+          if [[ "$submit_exit" -ne 0 || "$status" != "Accepted" ]]; then
+            echo "::error::Apple notarization failed with status '${status:-unknown}'."
+            exit 1
+          fi
+
+          spctl --assess --type execute --verbose=2 target/release/grok
+
+      - name: Remove Apple signing credentials
         if: always() && runner.os == 'macOS'
         run: |
           if [[ -n "${APPLE_CERTIFICATE_PATH:-}" ]]; then
@@ -183,6 +242,15 @@ jobs:
           if [[ -n "${APPLE_KEYCHAIN_PATH:-}" ]]; then
             security delete-keychain "$APPLE_KEYCHAIN_PATH" || true
           fi
+          for temporary_path in \
+            "${APPLE_NOTARY_KEY_PATH:-}" \
+            "${APPLE_NOTARY_ARCHIVE_PATH:-}" \
+            "${APPLE_NOTARY_RESULT_PATH:-}" \
+            "${APPLE_NOTARY_LOG_PATH:-}"; do
+            if [[ -n "$temporary_path" ]]; then
+              rm -f "$temporary_path"
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:
