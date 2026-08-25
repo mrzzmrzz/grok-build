@@ -1,8 +1,8 @@
 //! Codex Responses prompt-cache telemetry for a live session.
 //!
-//! The tracker records each successful model request, excludes the first
-//! request from the steady-state hit rate, and keeps a bounded set of recent
-//! request-prefix diagnostics for `/cache`.
+//! The tracker records each successful model request, excludes the cold
+//! start and sub-cache-minimum requests from the steady-state hit rate, and
+//! keeps a bounded set of recent request-prefix diagnostics for `/cache`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{ConversationItem, ConversationRequest};
 
 const MAX_RECENT_TURNS: usize = 50;
+/// OpenAI only caches prompts of at least ~1024 tokens; below that a zero
+/// cached-token count is expected behavior, not a cache break.
+const MIN_CACHEABLE_PROMPT_TOKENS: u32 = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ItemSummary {
     kind: &'static str,
-    byte_len: usize,
     content_hash: u64,
 }
 
@@ -35,6 +37,9 @@ pub enum CacheStatus {
     Hit,
     PartialHit,
     Break,
+    /// Prompt was under the provider's caching minimum; zero cached tokens
+    /// are expected and not counted as a break.
+    BelowCacheMinimum,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +120,8 @@ pub struct CacheTurnRecord {
 pub struct CacheSummary {
     pub total_input_tokens: u64,
     pub total_cached_tokens: u64,
+    /// Steady-state totals exclude the cold-start request and requests below
+    /// the provider's caching minimum, so the rate reflects achievable reuse.
     pub steady_input_tokens: u64,
     pub steady_cached_tokens: u64,
     pub steady_hit_rate_pct: f64,
@@ -122,6 +129,8 @@ pub struct CacheSummary {
     pub hits: usize,
     pub partial_hits: usize,
     pub breaks: usize,
+    #[serde(default)]
+    pub below_min_turns: usize,
     pub last_break_diagnostic: Option<String>,
 }
 
@@ -159,13 +168,9 @@ impl CacheTracker {
         let items = request
             .items
             .iter()
-            .map(|item| {
-                let bytes = serde_json::to_vec(item).unwrap_or_default();
-                ItemSummary {
-                    kind: item_kind(item),
-                    byte_len: bytes.len(),
-                    content_hash: hash(&bytes),
-                }
+            .map(|item| ItemSummary {
+                kind: item_kind(item),
+                content_hash: hash_serialized(item),
             })
             .collect();
         RequestSummary {
@@ -237,18 +242,27 @@ impl CacheTracker {
         } else {
             (f64::from(cached_prompt_tokens) / f64::from(prompt_tokens)) * 100.0
         };
+        // Divergence-first classification: a Hit means the prompt prefix
+        // held (the uncached remainder is newly appended content, whatever
+        // the ratio); PartialHit means the prefix diverged but the provider
+        // still reused part of it.
         let status = if self.previous_request.is_none() {
             CacheStatus::FirstTurn
+        } else if cached_prompt_tokens == 0 && prompt_tokens < MIN_CACHEABLE_PROMPT_TOKENS {
+            CacheStatus::BelowCacheMinimum
         } else if cached_prompt_tokens == 0 {
             CacheStatus::Break
-        } else if hit_rate_pct >= 50.0 {
+        } else if divergence.is_intact() {
             CacheStatus::Hit
         } else {
             CacheStatus::PartialHit
         };
         let diagnostic = match status {
             CacheStatus::FirstTurn => divergence.diagnostic(),
-            CacheStatus::Hit if hit_rate_pct < 90.0 && divergence.is_intact() => format!(
+            CacheStatus::BelowCacheMinimum => format!(
+                "Prompt is {prompt_tokens} tokens, under the provider's ~{MIN_CACHEABLE_PROMPT_TOKENS}-token caching minimum; no cached tokens are expected."
+            ),
+            CacheStatus::Hit if hit_rate_pct < 90.0 => format!(
                 "Cache hit: {hit_rate_pct:.1}% ({cached_prompt_tokens}/{prompt_tokens} input tokens cached). Remaining tokens are newly appended content."
             ),
             CacheStatus::Hit => format!(
@@ -276,7 +290,10 @@ impl CacheTracker {
             .summary
             .total_cached_tokens
             .saturating_add(u64::from(cached_prompt_tokens));
-        if status != CacheStatus::FirstTurn {
+        if !matches!(
+            status,
+            CacheStatus::FirstTurn | CacheStatus::BelowCacheMinimum
+        ) {
             self.summary.steady_input_tokens = self
                 .summary
                 .steady_input_tokens
@@ -297,6 +314,9 @@ impl CacheTracker {
             CacheStatus::Hit => self.summary.hits = self.summary.hits.saturating_add(1),
             CacheStatus::PartialHit => {
                 self.summary.partial_hits = self.summary.partial_hits.saturating_add(1)
+            }
+            CacheStatus::BelowCacheMinimum => {
+                self.summary.below_min_turns = self.summary.below_min_turns.saturating_add(1)
             }
             CacheStatus::Break => {
                 self.summary.breaks = self.summary.breaks.saturating_add(1);
@@ -344,9 +364,22 @@ fn hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Streams the serialization straight into the hasher: this runs per request
+/// over the whole conversation, so it must not materialize the JSON bytes.
 fn hash_serialized(value: &impl Serialize) -> u64 {
-    serde_json::to_vec(value)
-        .map(|bytes| hash(&bytes))
+    struct HashWriter(DefaultHasher);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Hasher::write(&mut self.0, buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(DefaultHasher::new());
+    serde_json::to_writer(&mut writer, value)
+        .map(|()| writer.0.finish())
         .unwrap_or_default()
 }
 
@@ -422,7 +455,7 @@ mod tests {
             "s",
             "1",
             1,
-            100,
+            2_000,
             0,
             1,
             Instant::now(),
@@ -433,7 +466,7 @@ mod tests {
             "s",
             "2",
             1,
-            100,
+            2_000,
             0,
             1,
             Instant::now(),
@@ -445,5 +478,84 @@ mod tests {
             PrefixDivergence::ItemDiverged { index: 1, .. }
         ));
         assert_eq!(tracker.summary().breaks, 1);
+    }
+
+    #[test]
+    fn sub_minimum_prompts_are_not_breaks_and_stay_out_of_the_steady_rate() {
+        let mut tracker = CacheTracker::new();
+        let first = request("one");
+        tracker.record_turn_outcome(
+            "s",
+            "1",
+            1,
+            500,
+            0,
+            1,
+            Instant::now(),
+            CacheTracker::summarize_request(&first),
+        );
+        let record = tracker.record_turn_outcome(
+            "s",
+            "2",
+            1,
+            500,
+            0,
+            1,
+            Instant::now(),
+            CacheTracker::summarize_request(&first),
+        );
+        assert_eq!(record.status, CacheStatus::BelowCacheMinimum);
+        let summary = tracker.summary();
+        assert_eq!(summary.breaks, 0);
+        assert_eq!(summary.below_min_turns, 1);
+        assert_eq!(summary.steady_input_tokens, 0);
+        assert_eq!(summary.total_input_tokens, 1_000);
+    }
+
+    /// A large append on an intact prefix is a Hit whatever the ratio;
+    /// PartialHit is reserved for a diverged prefix with partial reuse.
+    #[test]
+    fn classification_follows_prefix_divergence_not_the_ratio() {
+        let mut tracker = CacheTracker::new();
+        let first = request("one");
+        tracker.record_turn_outcome(
+            "s",
+            "1",
+            1,
+            40_000,
+            0,
+            1,
+            Instant::now(),
+            CacheTracker::summarize_request(&first),
+        );
+        let mut appended = first.clone();
+        appended.items.push(ConversationItem::user("two"));
+        let record = tracker.record_turn_outcome(
+            "s",
+            "2",
+            1,
+            100_000,
+            40_000,
+            1,
+            Instant::now(),
+            CacheTracker::summarize_request(&appended),
+        );
+        assert_eq!(record.status, CacheStatus::Hit);
+
+        let diverged = request("rewritten");
+        let record = tracker.record_turn_outcome(
+            "s",
+            "3",
+            1,
+            100_000,
+            60_000,
+            1,
+            Instant::now(),
+            CacheTracker::summarize_request(&diverged),
+        );
+        assert_eq!(record.status, CacheStatus::PartialHit);
+        let summary = tracker.summary();
+        assert_eq!(summary.hits, 1);
+        assert_eq!(summary.partial_hits, 1);
     }
 }

@@ -271,9 +271,24 @@ pub(crate) fn session_cache_block_text(
             group_thousands(summary.steady_input_tokens),
         ));
     }
+    // Every request lands in exactly one bucket, but the cold start and
+    // below-minimum requests have none of their own — without them a
+    // single-request session reads as a total cache failure.
+    let bucketed = summary.hits + summary.partial_hits + summary.breaks + summary.below_min_turns;
+    let cold_starts = summary.total_turns.saturating_sub(bucketed);
+    let mut buckets = vec![
+        format!("{cold_starts} cold start"),
+        format!("{} hits", summary.hits),
+        format!("{} partial", summary.partial_hits),
+        format!("{} breaks", summary.breaks),
+    ];
+    if summary.below_min_turns > 0 {
+        buckets.push(format!("{} below cache minimum", summary.below_min_turns));
+    }
     rows.push(format!(
-        "  Responses requests: {} ({} hits · {} partial · {} breaks)",
-        summary.total_turns, summary.hits, summary.partial_hits, summary.breaks,
+        "  Responses requests: {} ({})",
+        summary.total_turns,
+        buckets.join(" · "),
     ));
     if let Some(diagnostic) = &summary.last_break_diagnostic {
         rows.push(format!("  Last break: {diagnostic}"));
@@ -599,6 +614,34 @@ mod tests {
         assert!(text.contains("75.0%"), "{text}");
         assert!(text.contains("600 of 800 input tokens cached"), "{text}");
         assert!(text.contains("cold start excluded"), "{text}");
+        // The cold-start request counts toward the total, so it needs a bucket
+        // of its own: 2 = 1 cold start + 1 hit.
+        assert!(
+            text.contains("Responses requests: 2 (1 cold start · 1 hits · 0 partial · 0 breaks)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn session_cache_block_buckets_account_for_every_request() {
+        let cache = xai_grok_shell::extensions::cache::SessionCacheResponse {
+            summary: xai_grok_shell::session::CacheSummary {
+                total_turns: 5,
+                hits: 1,
+                partial_hits: 1,
+                breaks: 1,
+                below_min_turns: 1,
+                ..Default::default()
+            },
+            recent_turns: Vec::new(),
+        };
+        let text = session_cache_block_text(&cache);
+        assert!(
+            text.contains(
+                "Responses requests: 5 (1 cold start · 1 hits · 1 partial · 1 breaks · 1 below cache minimum)"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
