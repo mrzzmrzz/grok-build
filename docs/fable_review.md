@@ -203,7 +203,7 @@ SPEC §19 的链路定义与硬约束清单其余部分**原样采纳**。
 
 阶段 0-8 的主体与前两轮外部评审整改（docs/codex-review-update.md）已落地；第三轮评审的整改与阶段 9 收尾进行中。"落地"不含下列显式延后项——在它们关闭前，本移植不应描述为完整达到 SPEC §19 验收：
 
-- **remote compaction v2 主体延后**：wire 分析、beta header/comp_hash/body 塑形管道、operation-scoped turn-state 已落地并测试，但端到端请求路径与 catalog 能力插线未完成（评审发现 14 的处置＝显式延后，不宣称已实现；设计文档与剩余清单见会话 scratchpad 的 remote-compaction-v2-design）。
+- **remote compaction v2 已接通端到端**（2026-08-25 更新）：wire 分析、beta header/comp_hash/body 塑形管道、operation-scoped turn-state、`compact_codex_conversation_v2` 请求路径与 catalog 能力门（`compaction_policy().remote_compaction_v2`，fail closed）均已落地；`comp_hash` 经 `codex_comp_hash_for_model` 读取 live catalog。剩余为第四/五轮评审发现的修复项（见 docs/codex-review-update.md）。
 - **Code Mode 的两处已记录限制**：客户端 reverse-request PreToolUse 的 **deny** 已在 nested 路径消费（决策/效果拆分后共享同一门）；仍不可表达的是客户端侧 **rewrite**——`ClientHookResponse` 无 `updatedInput` 字段，扩展协议后两个调用点即可直接消费。deferred nested tools 机制已接线但当前全量投影。
 - **V8 feature 边界未实施**（评审 lower 项）：方案已成文（shell 的 code-mode 依赖 optional + feature 门控），涉及 default/CI feature 集变更，留待构建策略决策。
 - **跨进程 login/logout**：进程内代次 + 磁盘 logout epoch 已闭环；同机双进程并发交错由文件锁 + epoch 双检兜底。
@@ -212,6 +212,6 @@ SPEC §19 的链路定义与硬约束清单其余部分**原样采纳**。
 ## 8. 遗留的未决问题（需工具链或上游信息）
 
 1. fork `async-openai@95b52ebd` 是否有 `rs::Tool::Custom` —— 待 `cargo doc`/源码核实（不阻塞，见 §3 第 3 条）；
-2. v8 149.2.0 在目标发布平台（darwin/linux × arch）的编译矩阵 —— 阶段 0 实测；
+2. ~~v8 149.2.0 在目标发布平台（darwin/linux × arch）的编译矩阵~~ —— 已实测：Linux/macOS release 构建均通过（CI + xm-02 128 核实测）；
 3. Codex catalog endpoint 的真实响应 schema 与 `codex_models.rs` 反序列化的匹配度 —— 需一次真实联调或上游 fixture；
-4. remote compaction v2 的 wire 细节 —— 依赖上游提交 `97925ae9` 的行为分析，放阶段 8 前完成。
+4. ~~remote compaction v2 的 wire 细节~~ —— 分析完成并已按其实现端到端路径（见 §7.5 首条）。
