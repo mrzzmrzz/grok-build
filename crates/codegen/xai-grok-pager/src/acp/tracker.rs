@@ -238,20 +238,26 @@ struct CodeModeStreamState {
     payload: String,
     dropped_chars: u64,
     entry_id: Option<EntryId>,
+    /// Monotonic insertion order, so eviction can pick the genuinely oldest
+    /// stream (`tool_index` restarts at 0 on every turn boundary).
+    inserted_at: u64,
 }
 
 impl CodeModeStreamState {
-    fn new(tool: CodeModeStreamTool) -> Self {
+    fn new(tool: CodeModeStreamTool, inserted_at: u64) -> Self {
         Self {
             tool,
             payload: String::new(),
             dropped_chars: 0,
             entry_id: None,
+            inserted_at,
         }
     }
 }
 
-fn code_mode_transport_kind(name: &str) -> Option<CodeModeStreamTool> {
+/// The single spelling of the Code Mode transport names: a rename here can
+/// never desync the tracker from its callers' `exec`/`wait` checks.
+pub(crate) fn code_mode_transport_kind(name: &str) -> Option<CodeModeStreamTool> {
     match name {
         CODE_MODE_EXEC_TOOL => Some(CodeModeStreamTool::Exec),
         CODE_MODE_WAIT_TOOL => Some(CodeModeStreamTool::Wait),
@@ -448,6 +454,8 @@ pub struct AcpUpdateTracker {
     /// Bounded private transport fragments used only to infer sanitized nested
     /// tool names. Visible entries never contain JavaScript or arguments.
     code_mode_streams: HashMap<u32, CodeModeStreamState>,
+    /// Insertion counter stamped into [`CodeModeStreamState::inserted_at`].
+    code_mode_stream_seq: u64,
     /// Pending ACP commands from the most recent `AvailableCommandsUpdate`.
     /// Consumed by the caller via `take_pending_acp_commands()`. The caller
     /// is responsible for copying to `AgentSession.available_commands` and
@@ -769,14 +777,17 @@ impl AcpUpdateTracker {
                 Some(tool) => {
                     if !self.code_mode_streams.contains_key(&tool_index)
                         && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
-                        && let Some(oldest) = self.code_mode_streams.keys().copied().min()
+                        && let Some(oldest) = self.oldest_code_mode_stream()
                     {
                         self.retire_code_mode_stream(scrollback, oldest);
                     }
-                    let state = self
-                        .code_mode_streams
-                        .entry(tool_index)
-                        .or_insert_with(|| CodeModeStreamState::new(tool));
+                    let state = match self.code_mode_streams.entry(tool_index) {
+                        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            self.code_mode_stream_seq += 1;
+                            slot.insert(CodeModeStreamState::new(tool, self.code_mode_stream_seq))
+                        }
+                    };
                     state.tool = tool;
                     state.payload.clear();
                     state.dropped_chars = 0;
@@ -801,7 +812,7 @@ impl AcpUpdateTracker {
             ),
             None => self.note_tool_call_arguments_delta(name, tool_index),
         };
-        retry_cleared | changed
+        retry_cleared || changed
     }
 
     /// A registered ordinary tool owns this index; retire any stale Code Mode
@@ -816,6 +827,17 @@ impl AcpUpdateTracker {
         self.note_tool_call_arguments_delta(name, tool_index) || retired
     }
 
+    /// The stream that entered the map first — `tool_index` restarts at 0 every
+    /// sample, so the smallest key is not the oldest entry.
+    fn oldest_code_mode_stream(&self) -> Option<u32> {
+        self.code_mode_streams
+            .iter()
+            .min_by_key(|(_, state)| state.inserted_at)
+            .map(|(tool_index, _)| *tool_index)
+    }
+
+    /// The caller guarantees `tool_index` is present: it either just inserted
+    /// the entry or read the tool out of it.
     fn append_code_mode_stream_delta(
         &mut self,
         scrollback: &mut ScrollbackState,
@@ -823,16 +845,9 @@ impl AcpUpdateTracker {
         tool: CodeModeStreamTool,
         delta: &str,
     ) -> bool {
-        if !self.code_mode_streams.contains_key(&tool_index)
-            && self.code_mode_streams.len() >= MAX_CODE_MODE_STREAMS
-            && let Some(oldest) = self.code_mode_streams.keys().copied().min()
-        {
-            self.retire_code_mode_stream(scrollback, oldest);
-        }
-        let state = self
-            .code_mode_streams
-            .entry(tool_index)
-            .or_insert_with(|| CodeModeStreamState::new(tool));
+        let Some(state) = self.code_mode_streams.get_mut(&tool_index) else {
+            return false;
+        };
         if !delta.is_empty() {
             state.payload.push_str(delta);
             let len = state.payload.chars().count();
@@ -855,14 +870,16 @@ impl AcpUpdateTracker {
         let entry_changed = match state.entry_id {
             Some(entry_id) => {
                 let unchanged = scrollback.get_by_id(entry_id).is_some_and(|entry| {
-                    matches!(&entry.block, RenderBlock::CodeModeStream(block) if block.payload() == visible_payload)
+                    matches!(&entry.block, RenderBlock::CodeModeStream(block)
+                        if block.payload() == visible_payload
+                            && block.dropped_chars() == state.dropped_chars)
                 });
                 if unchanged {
                     false
                 } else {
-                    scrollback.set_code_mode_stream_payload(
+                    scrollback.set_code_mode_stream_tools(
                         entry_id,
-                        &state.payload,
+                        &nested_tools,
                         state.dropped_chars,
                     )
                 }
@@ -903,7 +920,7 @@ impl AcpUpdateTracker {
             .fold(false, |changed, id| scrollback.remove_entry(id) || changed)
     }
 
-    pub fn finish_code_mode_streams(&mut self, scrollback: &mut ScrollbackState) -> bool {
+    fn finish_code_mode_streams(&mut self, scrollback: &mut ScrollbackState) -> bool {
         let changed = self.retire_code_mode_stream_entries(scrollback);
         self.code_mode_streams.clear();
         changed
@@ -1143,6 +1160,7 @@ impl AcpUpdateTracker {
         if self.retry_activity.is_some() {
             self.retry_activity = None;
         }
+        let mut code_mode_retired = false;
         if let Some(new_start) = meta.stream_start_ms {
             if self
                 .last_stream_start_ms
@@ -1164,7 +1182,7 @@ impl AcpUpdateTracker {
                 if let Some(agent_id) = self.current_agent_msg.take() {
                     scrollback.finish_running(agent_id);
                 }
-                self.finish_code_mode_streams(scrollback);
+                code_mode_retired = self.finish_code_mode_streams(scrollback);
                 if !meta.is_replay
                     && self.current_thinking.is_none()
                     && self.activity_known_blocking_wait().is_none()
@@ -1181,13 +1199,13 @@ impl AcpUpdateTracker {
                 | acp::SessionUpdate::ToolCall(_)
                 | acp::SessionUpdate::ToolCallUpdate(_)
         );
-        let mut code_mode_retired = false;
         if is_agent_output && !matches!(&update, acp::SessionUpdate::ToolCallUpdate(_)) {
             self.writing_tool_call = None;
             self.writing_tool_names.clear();
             // A canonical tool card or model output takes over from the
             // speculative transport preview.
-            code_mode_retired = self.retire_code_mode_stream_entries(scrollback);
+            code_mode_retired =
+                self.retire_code_mode_stream_entries(scrollback) || code_mode_retired;
         }
         let changed = match update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {

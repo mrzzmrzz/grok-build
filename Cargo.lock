@@ -13704,7 +13704,6 @@ dependencies = [
  "tracing",
  "v8",
  "xai-grok-code-mode-protocol",
- "xai-token-estimation",
 ]
 
 [[package]]

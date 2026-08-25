@@ -36,12 +36,18 @@ impl CodeModeStreamBlock {
             payload: String::new(),
             dropped_chars,
         };
-        block.set_payload(&payload.into(), dropped_chars);
+        block.set_nested_tools(
+            &Self::nested_tool_names(tool, &payload.into()),
+            dropped_chars,
+        );
         block
     }
 
-    pub fn set_payload(&mut self, payload: &str, dropped_chars: u64) {
-        self.payload = Self::nested_tool_names(self.tool, payload).join("\n");
+    /// Refresh from names already inferred with [`Self::nested_tool_names`] —
+    /// the tracker needs them for its activity label, so the block reuses that
+    /// parse instead of rescanning the transport buffer per delta.
+    pub fn set_nested_tools(&mut self, nested_tools: &[String], dropped_chars: u64) {
+        self.payload = nested_tools.join("\n");
         self.dropped_chars = dropped_chars;
     }
 
@@ -161,13 +167,29 @@ impl CodeModeStreamBlock {
         ))
     }
 
+    /// The transport buffer lost its oldest characters to the trim cap, so
+    /// nested tools called near the top of the source may be missing here.
+    fn trimmed_line(&self) -> Option<Line<'static>> {
+        (self.dropped_chars > 0).then(|| {
+            Line::from(Span::styled(
+                format!("… (+{} chars trimmed)", self.dropped_chars),
+                Theme::current().dim(),
+            ))
+        })
+    }
+
     fn body_lines(&self) -> Vec<Line<'static>> {
-        if self.payload.lines().count() <= 1 {
+        let trimmed = self.trimmed_line();
+        if self.payload.lines().count() <= 1 && trimmed.is_none() {
             return Vec::new();
         }
-        self.payload
-            .lines()
-            .map(|name| Line::from(nested_tool_label(name)))
+        trimmed
+            .into_iter()
+            .chain(
+                self.payload
+                    .lines()
+                    .map(|name| Line::from(nested_tool_label(name))),
+            )
             .collect()
     }
 }
@@ -343,6 +365,26 @@ mod tests {
             CodeModeStreamBlock::nested_tool_names(CodeModeStreamTool::Exec, source),
             ["read_file", "grep_files", "mcp__server__run"]
         );
+    }
+
+    #[test]
+    fn trimmed_transport_buffer_reports_the_elided_prefix() {
+        let block = CodeModeStreamBlock::new(
+            CodeModeStreamTool::Exec,
+            "await tools.read_file({}); await tools.grep_files({});",
+            1_234,
+        );
+        for mode in [DisplayMode::Truncated, DisplayMode::Expanded] {
+            let text = plain_text(&block.output(&ctx(mode, 120)));
+            assert!(text.contains("(+1234 chars trimmed)"), "{text:?}");
+        }
+        let untrimmed = CodeModeStreamBlock::new(
+            CodeModeStreamTool::Exec,
+            "await tools.read_file({}); await tools.grep_files({});",
+            0,
+        );
+        let text = plain_text(&untrimmed.output(&ctx(DisplayMode::Expanded, 120)));
+        assert!(!text.contains("trimmed"), "{text:?}");
     }
 
     #[test]

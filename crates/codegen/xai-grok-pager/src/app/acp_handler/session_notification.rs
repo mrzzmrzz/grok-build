@@ -266,7 +266,7 @@ pub(super) fn handle_session_notification_with_origin(
             } else {
                 let had_activity_before = agent.session.tracker.activity().is_some();
                 let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
-                    !matches!(name, "exec" | "wait")
+                    crate::acp::tracker::code_mode_transport_kind(name).is_none()
                         && agent
                             .session
                             .available_tools
@@ -1367,7 +1367,7 @@ pub(super) fn handle_child_session_notification(
                 return false;
             }
             let registered_ordinary_tool = name.as_deref().is_some_and(|name| {
-                !matches!(name, "exec" | "wait")
+                crate::acp::tracker::code_mode_transport_kind(name).is_none()
                     && child_view
                         .session
                         .available_tools

@@ -2861,6 +2861,28 @@ fn code_mode_stream_state_and_private_payload_are_bounded() {
     );
 }
 
+/// `tool_index` restarts at 0 on every turn boundary, so the smallest key can
+/// be the newest stream: eviction must follow insertion order instead.
+#[test]
+fn code_mode_stream_eviction_follows_insertion_order() {
+    let mut sb = ScrollbackState::new();
+    let mut tracker = AcpUpdateTracker::new();
+    for index in (0..MAX_CODE_MODE_STREAMS as u32).rev() {
+        tracker.handle_tool_call_delta(
+            &mut sb,
+            Some("exec"),
+            Some(&format!("tools.tool_{index}({{}})")),
+            index,
+        );
+    }
+    tracker.handle_tool_call_delta(&mut sb, Some("exec"), Some("tools.newest({})"), 99);
+
+    let oldest = MAX_CODE_MODE_STREAMS as u32 - 1;
+    assert!(!tracker.code_mode_streams.contains_key(&oldest));
+    assert!(tracker.code_mode_streams.contains_key(&0));
+    assert!(tracker.code_mode_streams.contains_key(&99));
+}
+
 /// The blocking bg-plumbing tools are kept out of scrollback but the turn
 /// IS blocked on them — `activity()` must name the wait instead of the old
 /// generic `None` (→ "Waiting…"). Task-output tools only advertise once

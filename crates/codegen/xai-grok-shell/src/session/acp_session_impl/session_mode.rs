@@ -34,16 +34,15 @@ pub(super) fn filter_cursor_tools_by_plan_mode(
 
 /// Map the registry's raw `server__tool` identity to Codex's model-visible
 /// MCP name while retaining the raw name used by the existing MCP handler.
-fn code_mode_tool_identity(registry_name: &str) -> (String, xai_grok_code_mode_protocol::ToolName) {
+/// Model-visible name, dispatch identity, and whether the tool is an MCP tool —
+/// one `parse_mcp_tool_name` per tool answers all three.
+fn code_mode_tool_identity(
+    registry_name: &str,
+) -> (String, xai_grok_code_mode_protocol::ToolName, bool) {
+    let tool_name = xai_grok_code_mode_protocol::ToolName::plain(registry_name);
     match crate::session::mcp_servers::parse_mcp_tool_name(registry_name) {
-        Some((server, tool)) => (
-            format!("mcp__{server}__{tool}"),
-            xai_grok_code_mode_protocol::ToolName::plain(registry_name),
-        ),
-        None => (
-            registry_name.to_string(),
-            xai_grok_code_mode_protocol::ToolName::plain(registry_name),
-        ),
+        Some((server, tool)) => (format!("mcp__{server}__{tool}"), tool_name, true),
+        None => (registry_name.to_string(), tool_name, false),
     }
 }
 
@@ -66,20 +65,28 @@ fn normalize_mcp_input_schema(mut schema: serde_json::Value) -> serde_json::Valu
 /// MCP calls resolve to the protocol `CallToolResult`, not directly to the
 /// server's `outputSchema`. Preserve that structured-content schema inside
 /// the same wrapper used by Codex CLI.
+///
+/// A server without an output schema gets no `structuredContent` property at
+/// all — an empty schema would advertise it as `any` in the generated TypeScript.
 fn mcp_call_tool_result_output_schema(
-    structured_content_schema: serde_json::Value,
+    structured_content_schema: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    let mut properties = serde_json::json!({
+        "content": {
+            "type": "array",
+            "items": {"type": "object"}
+        },
+        "isError": {"type": "boolean"},
+        "_meta": {"type": "object"}
+    });
+    if let Some(schema) = structured_content_schema
+        && let Some(properties) = properties.as_object_mut()
+    {
+        properties.insert("structuredContent".to_string(), schema);
+    }
     serde_json::json!({
         "type": "object",
-        "properties": {
-            "content": {
-                "type": "array",
-                "items": {"type": "object"}
-            },
-            "structuredContent": structured_content_schema,
-            "isError": {"type": "boolean"},
-            "_meta": {"type": "object"}
-        },
+        "properties": properties,
         "required": ["content"],
         "additionalProperties": false
     })
@@ -589,21 +596,14 @@ impl SessionActor {
             .filter(|d| xai_grok_code_mode_protocol::is_code_mode_nested_tool(&d.function.name))
             .map(|d| {
                 let registry_name = d.function.name.as_str();
-                let is_mcp =
-                    crate::session::mcp_servers::parse_mcp_tool_name(registry_name).is_some();
-                let (name, tool_name) = code_mode_tool_identity(registry_name);
+                let (name, tool_name, is_mcp) = code_mode_tool_identity(registry_name);
                 let input_schema = if is_mcp {
                     normalize_mcp_input_schema(d.function.parameters.clone())
                 } else {
                     d.function.parameters.clone()
                 };
                 let output_schema = is_mcp.then(|| {
-                    mcp_call_tool_result_output_schema(
-                        output_schemas
-                            .get(registry_name)
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
-                    )
+                    mcp_call_tool_result_output_schema(output_schemas.get(registry_name).cloned())
                 });
                 xai_grok_code_mode_protocol::ToolDefinition {
                     name,
@@ -733,7 +733,14 @@ impl SessionActor {
             .await
             .map_err(|e| format!("invalid input for `{wire_name}`: {e}"))?;
         Self::reject_lifecycle_nested_tool(&wire_name, &tool_input)?;
-        let ui_call_id = format!("codemode-{}-{}", call.cell_id, call.runtime_tool_call_id);
+        // The prefix travels with the call id into `ToolCallContext`: it is how
+        // MCP dispatch knows to retain the raw `CallToolResult` this path reads.
+        let ui_call_id = format!(
+            "{}{}-{}",
+            xai_grok_tools::types::output::CODE_MODE_NESTED_CALL_ID_PREFIX,
+            call.cell_id,
+            call.runtime_tool_call_id
+        );
         // PreToolUse hooks — same registry dispatcher and rewrite semantics
         // as prepare_tool_call.
         let mut resolved_tool_name = tool_input
@@ -1041,24 +1048,24 @@ impl SessionActor {
     /// shape where the tool has one, use a plain string only for genuinely
     /// textual outputs.
     ///
-    /// - MCP tools resolve with an MCP `CallToolResult`-shaped object
-    ///   (`{content: [...], isError, _meta}`), matching the
-    ///   `result.content[0]` contract in the exec description. Any images the
-    ///   tool layer captured out of the server's reply become `image` content
-    ///   blocks alongside the text block instead of being dropped, so
-    ///   `image(result.content[1])` forwarding works for MCP too.
+    /// - MCP tools resolve with the server's own `CallToolResult` when the
+    ///   dispatch retained it (`MCPOutput::call_tool_result`, populated for
+    ///   this path's `codemode-` call ids), so `structuredContent`, audio and
+    ///   resource blocks reach JavaScript verbatim.
+    /// - Without it — a replayed or reconstructed `MCPOutput` — the value is
+    ///   rebuilt in the same `{content: [...], isError, _meta}` shape from the
+    ///   already-rendered text (the runtime's renderer folds
+    ///   `structuredContent` into it), matching the `result.content[0]`
+    ///   contract in the exec description. Any images the tool layer captured
+    ///   out of the server's reply become `image` content blocks alongside the
+    ///   text block instead of being dropped, so `image(result.content[1])`
+    ///   forwarding works for MCP too, and the transport facts travel in
+    ///   `_meta`.
     /// - Image-producing reads resolve with `{content: [{type: "image",
     ///   data, mimeType}]}` so `image(result.content[0])` forwarding works.
     /// - Dynamic (runtime-registered) tools resolve with their JSON value
     ///   verbatim, so JS can read its fields.
     /// - Everything else resolves with the prompt-facing text.
-    ///
-    /// Not preserved, because this build never carries it: MCP
-    /// `structuredContent`, audio, and resource blocks. `MCPOutput` stores a
-    /// single already-rendered `OkayOutput(String)`/`Error(String)` (the
-    /// runtime's `CallToolResult` renderer folds `structuredContent` into that
-    /// text before the tool layer sees it), so there is nothing left to
-    /// forward; the transport facts that *are* retained travel in `_meta`.
     fn nested_result_value(run_result: &ToolRunResult) -> serde_json::Value {
         use xai_grok_tools::types::output::MCPOutputDetails;
         match &run_result.output {
@@ -1388,7 +1395,7 @@ mod code_mode_nested_tests {
         assert_eq!(projected[0].input_schema.as_ref(), Some(&params));
         assert_eq!(
             projected[0].output_schema,
-            Some(mcp_call_tool_result_output_schema(structured_content))
+            Some(mcp_call_tool_result_output_schema(Some(structured_content)))
         );
     }
 
@@ -1407,9 +1414,16 @@ mod code_mode_nested_tests {
             projected[0].input_schema.as_ref().unwrap()["properties"],
             serde_json::json!({})
         );
+        // No advertised output schema: `structuredContent` is omitted rather
+        // than published as an empty (i.e. `any`) schema.
         assert_eq!(
             projected[0].output_schema,
-            Some(mcp_call_tool_result_output_schema(serde_json::json!({})))
+            Some(mcp_call_tool_result_output_schema(None))
+        );
+        assert!(
+            projected[0].output_schema.as_ref().unwrap()["properties"]
+                .get("structuredContent")
+                .is_none()
         );
     }
 }
@@ -1426,6 +1440,11 @@ mod code_mode_session_tests {
 
     #[derive(Debug)]
     struct DirectMcpFixture;
+
+    /// The `ToolCallContext.call_id` the fixture was dispatched with — the
+    /// signal MCP dispatch keys raw `CallToolResult` retention off.
+    static DIRECT_MCP_FIXTURE_CALL_ID: std::sync::Mutex<Option<String>> =
+        std::sync::Mutex::new(None);
 
     impl xai_grok_tools::types::tool_metadata::ToolMetadata for DirectMcpFixture {
         fn kind(&self) -> xai_grok_tools::types::tool::ToolKind {
@@ -1458,9 +1477,10 @@ mod code_mode_session_tests {
 
         async fn run(
             &self,
-            _ctx: xai_tool_runtime::ToolCallContext,
+            ctx: xai_tool_runtime::ToolCallContext,
             args: serde_json::Value,
         ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
+            *DIRECT_MCP_FIXTURE_CALL_ID.lock().unwrap() = Some(ctx.call_id.as_str().to_string());
             Ok(xai_grok_tools::types::output::ToolOutput::MCP(
                 MCPOutput::okay_output(
                     "fixture__echo".to_string(),
@@ -1559,6 +1579,20 @@ mod code_mode_session_tests {
                     .await
                     .expect("direct MCP call succeeds");
                 assert_eq!(result["content"][0]["text"], "hello");
+                // MCP dispatch only retains the raw `CallToolResult` when the
+                // call id says the caller is Code Mode, so the prefix must
+                // survive the whole dispatch chain into `ToolCallContext`.
+                let dispatched_call_id = DIRECT_MCP_FIXTURE_CALL_ID
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("fixture ran");
+                assert!(
+                    dispatched_call_id.starts_with(
+                        xai_grok_tools::types::output::CODE_MODE_NESTED_CALL_ID_PREFIX
+                    ),
+                    "{dispatched_call_id}"
+                );
             })
             .await;
     }

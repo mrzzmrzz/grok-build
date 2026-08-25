@@ -1043,19 +1043,19 @@ impl ScrollbackState {
         false
     }
 
-    /// Refresh a sanitized nested-tool preview from a private transport
-    /// buffer. The block retains only inferred tool names, never source or
-    /// arguments.
-    pub fn set_code_mode_stream_payload(
+    /// Refresh a sanitized nested-tool preview with names the caller already
+    /// inferred from its private transport buffer. The block retains only
+    /// inferred tool names, never source or arguments.
+    pub fn set_code_mode_stream_tools(
         &mut self,
         id: EntryId,
-        payload: &str,
+        nested_tools: &[String],
         dropped_chars: u64,
     ) -> bool {
         if let Some(entry) = self.entries.get_mut(&id)
             && let RenderBlock::CodeModeStream(ref mut block) = entry.block
         {
-            block.set_payload(payload, dropped_chars);
+            block.set_nested_tools(nested_tools, dropped_chars);
             entry.invalidate_cache();
             self.dirty_heights.insert(id);
             self.bump_content_generation();

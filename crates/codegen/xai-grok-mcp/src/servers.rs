@@ -34,7 +34,7 @@ use rmcp::{
 use crate::oauth_config::McpOAuthConfig;
 
 use xai_grok_tools::types::{
-    output::{MCPOutput, MCPOutputDetails, ToolOutput},
+    output::{CODE_MODE_NESTED_CALL_ID_PREFIX, MCPOutput, MCPOutputDetails, ToolOutput},
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
@@ -1481,7 +1481,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
 
     async fn run(
         &self,
-        _ctx: xai_tool_runtime::ToolCallContext,
+        ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         let mcp_call_start = std::time::Instant::now();
@@ -1558,8 +1558,15 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let is_error = call_result.is_error.unwrap_or(false);
         // Keep the protocol result before the prompt renderer consumes its
         // content. Code Mode needs the real CallToolResult shape rather than
-        // a best-effort reconstruction from flattened text.
-        let raw_call_tool_result = serde_json::to_value(&call_result).ok();
+        // a best-effort reconstruction from flattened text — and it is the
+        // only consumer, so ordinary sessions skip the full deep copy (base64
+        // blobs included) that serializing it costs.
+        let raw_call_tool_result = ctx
+            .call_id
+            .as_str()
+            .starts_with(CODE_MODE_NESTED_CALL_ID_PREFIX)
+            .then(|| serde_json::to_value(&call_result).ok())
+            .flatten();
         let mut output = if is_error {
             let error_msg = call_result
                 .content

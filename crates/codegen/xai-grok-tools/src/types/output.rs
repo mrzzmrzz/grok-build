@@ -1209,9 +1209,19 @@ pub struct MCPOutput {
     /// Code Mode. The prompt-facing renderer still uses `output`, while this
     /// preserves structuredContent, typed content blocks, annotations and
     /// protocol metadata for JavaScript callers.
+    ///
+    /// Only populated for calls whose id carries
+    /// [`CODE_MODE_NESTED_CALL_ID_PREFIX`]: building it deep-copies the whole
+    /// reply (base64 blobs included) and nothing else reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_tool_result: Option<serde_json::Value>,
 }
+/// Tool-call-id prefix stamped on every Code Mode nested dispatch
+/// (`codemode-<cell>-<runtime call>`). It is the dispatch chain's only marker
+/// for "this call came from JavaScript", and MCP dispatch keys
+/// [`MCPOutput::call_tool_result`] off it so ordinary sessions never pay to
+/// serialize a result no one reads.
+pub const CODE_MODE_NESTED_CALL_ID_PREFIX: &str = "codemode-";
 impl MCPOutput {
     pub fn okay_output(tool_name: String, server_name: String, output: String) -> Self {
         Self {

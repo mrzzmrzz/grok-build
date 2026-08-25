@@ -18,24 +18,8 @@ use super::*;
 use crate::session_runtime::OutputItem;
 
 #[test]
-fn receive_budget_rejects_fragmented_zero_cost_output() {
-    let mut budget = CellOutputBudget::new(0);
-    let mut output = Vec::new();
-    for _ in 0..100_000 {
-        budget.push(
-            OutputItem::Text {
-                text: "abc".to_owned(),
-            },
-            &mut output,
-        );
-    }
-    assert!(output.is_empty(), "zero tokens must materialize no output");
-    assert!(budget.truncated);
-}
-
-#[test]
 fn receive_budget_caps_items_before_the_actor_vec_can_grow() {
-    let mut budget = CellOutputBudget::new(100_000);
+    let mut budget = CellOutputBudget::new();
     let mut output = Vec::new();
     for _ in 0..=MAX_MATERIALIZED_OUTPUT_ITEMS {
         budget.push(
@@ -49,6 +33,56 @@ fn receive_budget_caps_items_before_the_actor_vec_can_grow() {
     assert!(output.len() <= MAX_MATERIALIZED_OUTPUT_ITEMS + 1);
     assert!(matches!(output.last(), Some(OutputItem::Text { text })
         if text.contains("output truncated")));
+}
+
+fn image_item(bytes: usize) -> OutputItem {
+    OutputItem::Image {
+        image_url: format!("data:image/png;base64,{}", "A".repeat(bytes)),
+        detail: None,
+    }
+}
+
+/// Images cost their encoded bytes against the memory cap and nothing else —
+/// the model-facing image estimate belongs to the shell's formatter, so an
+/// image the model can afford is never dropped here.
+#[test]
+fn receive_budget_charges_images_bytes_only() {
+    let mut budget = CellOutputBudget::new();
+    let mut output = Vec::new();
+    let image = image_item(200 * 1024);
+    let image_bytes = CellOutputBudget::item_bytes(&image);
+    budget.push(image, &mut output);
+
+    assert_eq!(output.len(), 1, "a 200KiB image must reach the formatter");
+    assert!(!budget.truncated);
+    assert_eq!(budget.used_bytes, image_bytes);
+}
+
+#[test]
+fn receive_budget_caps_materialized_bytes() {
+    let mut budget = CellOutputBudget::new();
+    let mut output = Vec::new();
+    for _ in 0..16 {
+        budget.push(image_item(1024 * 1024), &mut output);
+    }
+
+    assert!(budget.truncated, "8MiB of images must stop materializing");
+    assert!(budget.used_bytes <= MAX_MATERIALIZED_OUTPUT_BYTES);
+    assert!(matches!(output.last(), Some(OutputItem::Text { text })
+        if text.contains("output truncated")));
+}
+
+#[test]
+fn receive_budget_restarts_for_each_delivered_response() {
+    let mut budget = CellOutputBudget::new();
+    let mut output = Vec::new();
+    for _ in 0..3 {
+        budget.push(image_item(3 * 1024 * 1024), &mut output);
+        assert!(!budget.truncated, "each response gets the full allowance");
+        assert_eq!(budget.take(&mut output).len(), 1);
+    }
+    assert_eq!(budget.used_bytes, 0);
+    assert_eq!(budget.items, 0);
 }
 
 struct TestHost;
@@ -186,7 +220,6 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             response_tx: initial_event_tx,
         },
         task_failure_handler,
-        xai_grok_code_mode_protocol::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
     ));
 
     CellActorHarness {
@@ -428,6 +461,54 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
             }],
         })
     );
+
+    let termination = harness.handle.terminate();
+    drop(harness.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new(),
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+/// The actor's allowance bounds one delivered response, not the cell's whole
+/// life: a long-running yielding cell must not go silent once its batches sum
+/// past the memory cap.
+#[tokio::test]
+async fn each_yielded_response_is_budgeted_independently() {
+    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
+    let batch = "x".repeat(3 * 1024 * 1024);
+    let delivered = Ok(CellEvent::Yielded {
+        content_items: vec![OutputItem::Text {
+            text: batch.clone(),
+        }],
+    });
+    let send_batch = || {
+        harness
+            .event_tx
+            .try_send(RuntimeEvent::ContentItem(
+                FunctionCallOutputContentItem::InputText {
+                    text: batch.clone(),
+                },
+            ))
+            .unwrap();
+        harness
+            .event_tx
+            .try_send(RuntimeEvent::YieldRequested)
+            .unwrap();
+    };
+
+    send_batch();
+    assert_eq!(harness.initial_event_rx.await.unwrap(), delivered);
+    for _ in 0..2 {
+        let observation = harness
+            .handle
+            .observe(ObserveMode::YieldAfter(Duration::from_secs(60)));
+        send_batch();
+        assert_eq!(observation.await, delivered);
+    }
 
     let termination = harness.handle.terminate();
     drop(harness.event_tx);
