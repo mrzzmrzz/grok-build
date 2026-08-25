@@ -458,6 +458,14 @@ impl ChatStateActor {
         self.state.last_turn_usage = Some(usage);
     }
 
+    fn usage_model_key(&self, model_id: Option<String>) -> String {
+        match model_id.as_deref() {
+            Some(id) if !id.is_empty() => id,
+            _ => self.state.sampling_config.model.as_str(),
+        }
+        .to_owned()
+    }
+
     pub(super) fn record_model_call_usage(
         &mut self,
         model_id: Option<String>,
@@ -465,16 +473,34 @@ impl ChatStateActor {
         api_duration_ms: Option<u64>,
         cost_usd_ticks: Option<i64>,
     ) {
-        let model_key = match model_id.as_deref() {
-            Some(id) if !id.is_empty() => id,
-            _ => self.state.sampling_config.model.as_str(),
-        }
-        .to_owned();
+        let model_key = self.usage_model_key(model_id);
         self.state
             .prompt_usage
             .get_or_insert_default()
             .record_main_loop_call(&model_key, usage, api_duration_ms, cost_usd_ticks);
         self.state.session_usage.record_main_loop_call(
+            &model_key,
+            usage,
+            api_duration_ms,
+            cost_usd_ticks,
+        );
+    }
+
+    /// Side call (compaction and other non-turn work): tokens and cost fold
+    /// into both ledgers, `main_loop_model_calls` stays put.
+    pub(super) fn record_side_call_usage(
+        &mut self,
+        model_id: Option<String>,
+        usage: &xai_grok_sampling_types::TokenUsage,
+        api_duration_ms: Option<u64>,
+        cost_usd_ticks: Option<i64>,
+    ) {
+        let model_key = self.usage_model_key(model_id);
+        self.state
+            .prompt_usage
+            .get_or_insert_default()
+            .record_side_call(&model_key, usage, api_duration_ms, cost_usd_ticks);
+        self.state.session_usage.record_side_call(
             &model_key,
             usage,
             api_duration_ms,

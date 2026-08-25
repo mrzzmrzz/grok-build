@@ -39,6 +39,49 @@ fn opaque_compaction_item() -> ConversationItem {
     })
 }
 
+/// Old sessions stored the auto-continue prompt as an untagged `User` item, so
+/// the text filter — not `synthetic_reason` — has to keep it out of the tail.
+#[test]
+fn remote_compaction_v2_history_drops_untagged_auto_continue_prompts() {
+    let prompt = vec![
+        ConversationItem::user("real question"),
+        ConversationItem::user(AUTO_CONTINUE_PROMPT),
+        ConversationItem::user("<user_query>__auto_continue__</user_query>"),
+    ];
+
+    let history = build_codex_remote_compaction_v2_history(&prompt, opaque_compaction_item());
+    assert_eq!(history.len(), 2, "got: {history:#?}");
+    assert_eq!(history[0].text_content(), "real question");
+    assert!(matches!(&history[1], ConversationItem::BackendToolCall(_)));
+}
+
+/// The opaque compaction item is a short placeholder in `text_summary()` but
+/// ships an encrypted blob the model still pays for: the estimate must track
+/// the blob, not the placeholder.
+#[test]
+fn opaque_compaction_item_is_estimated_from_its_encrypted_blob() {
+    let blob = "A".repeat(40_000);
+    let item = ConversationItem::BackendToolCall(BackendToolCallItem {
+        kind: BackendToolKind::CodexRawInput(xai_grok_sampling_types::CodexRawInputItem {
+            id: "codex-compaction:0".into(),
+            raw: serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": blob,
+            }),
+        }),
+    });
+
+    let estimate = estimate_item_tokens(&item);
+    assert!(
+        estimate > 7_000,
+        "blob-sized estimate expected, got {estimate}"
+    );
+    assert!(
+        estimate > estimate_item_tokens(&opaque_compaction_item()),
+        "a larger blob must cost more than a tiny one"
+    );
+}
+
 #[test]
 fn remote_compaction_v2_history_keeps_only_real_user_tail_and_opaque_item() {
     let prompt = vec![

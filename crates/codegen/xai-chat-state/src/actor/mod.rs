@@ -205,6 +205,14 @@ impl ChatStateActor {
             } => {
                 self.record_model_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
             }
+            ChatStateCommand::RecordSideCallUsage {
+                model_id,
+                usage,
+                api_duration_ms,
+                cost_usd_ticks,
+            } => {
+                self.record_side_call_usage(model_id, &usage, api_duration_ms, cost_usd_ticks);
+            }
             ChatStateCommand::RecordSubagentUsage {
                 by_model,
                 attribute_to_prompt,
@@ -355,6 +363,11 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetPromptIndex { reply } => {
                 let _ = reply.send(self.state.prompt_index);
+            }
+            ChatStateCommand::HasCodexCompactionItem { reply } => {
+                let _ = reply.send(crate::compaction_utils::contains_codex_compaction_item(
+                    &self.state.conversation,
+                ));
             }
             ChatStateCommand::GetLastCompactionPromptIndex { reply } => {
                 let _ = reply.send(self.state.last_compaction_prompt_index);

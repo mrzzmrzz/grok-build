@@ -229,7 +229,6 @@ async fn create_test_actor(
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
-        last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
         turn_report: Default::default(),
@@ -1675,7 +1674,7 @@ async fn test_model_switch_compaction_triggers_on_downgrade() {
             let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
             assert!(prev.context_window > cfg.context_window.get());
             let total = actor.chat_state_handle.get_estimated_total_tokens().await;
-            let trigger = actor.should_auto_compact(total, cfg.context_window);
+            let trigger = actor.should_auto_compact(total, cfg.context_window, None);
             assert!(trigger.is_some(), "86% > 85% threshold, should trigger");
             actor.compaction.previous_model.set(Some(
                 crate::session::compaction_config::PreviousModelInfo {

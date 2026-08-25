@@ -21,14 +21,6 @@ use xai_grok_compaction::reminder::{
     self, ActiveAgentReminderState, BackgroundTask, RunningSubagent, TodoItem, TodoStatus,
 };
 
-/// Legacy compatibility input for callers that still pass MCP dispatcher
-/// names. Codex exposes registered MCP tools directly, so compaction ignores
-/// these fields and emits no search/use guidance.
-pub struct McpToolNames {
-    pub search: String,
-    pub call: String,
-}
-
 /// Resolved model-facing tool names for the subagent reminder section.
 ///
 /// Both names are resolved at runtime via `TemplateRenderer` from
@@ -50,7 +42,6 @@ pub fn to_system_reminder_sync(
     discovered_agents_md: &[PathBuf],
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     subagent_tool_names: Option<&SubagentToolNames>,
-    mcp_tool_names: Option<&McpToolNames>,
     workflow_listing: Option<&str>,
 ) -> Option<String> {
     to_system_reminder_inner(
@@ -59,7 +50,6 @@ pub fn to_system_reminder_sync(
         skills,
         &[],
         subagent_tool_names,
-        mcp_tool_names,
         workflow_listing,
     )
 }
@@ -74,7 +64,6 @@ pub async fn to_system_reminder(
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     memory_backend: Option<&dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
     subagent_tool_names: Option<&SubagentToolNames>,
-    mcp_tool_names: Option<&McpToolNames>,
     workflow_listing: Option<&str>,
 ) -> Option<String> {
     // Fetch memory results first (async), then pass to sync inner method
@@ -97,7 +86,6 @@ pub async fn to_system_reminder(
         skills,
         &memory_results,
         subagent_tool_names,
-        mcp_tool_names,
         workflow_listing,
     )
 }
@@ -109,7 +97,6 @@ fn to_system_reminder_inner(
     skills: &[xai_grok_tools::implementations::skills::types::SkillInfo],
     memory_results: &[xai_grok_tools::types::memory_backend::MemorySearchResult],
     subagent_tool_names: Option<&SubagentToolNames>,
-    _mcp_tool_names: Option<&McpToolNames>,
     workflow_listing: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
@@ -260,7 +247,7 @@ mod tests {
             poll: "get_command_or_subagent_output".into(),
             cancel: "kill_command_or_subagent".into(),
         };
-        let result = to_system_reminder_sync(&ctx, &[], &[], Some(&names), None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], Some(&names), None);
         let text = result.expect("should produce a reminder");
         assert!(
             text.contains("Running Subagents"),
@@ -296,11 +283,7 @@ mod tests {
             running_subagents: vec![],
             todos: vec![],
         };
-        let legacy_dispatchers = McpToolNames {
-            search: "search_tool".to_string(),
-            call: "use_tool".to_string(),
-        };
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, Some(&legacy_dispatchers), None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
         let text = result.expect("should produce a reminder");
         let expected = "\
 <system-reminder>
@@ -309,8 +292,6 @@ mod tests {
 - linear (12 tools)
 </system-reminder>";
         assert_eq!(text, expected, "got:\n{text}");
-        assert!(!text.contains("search_tool"));
-        assert!(!text.contains("use_tool"));
     }
 
     /// Regression: task IDs in the post-compaction reminder must be rendered
@@ -336,8 +317,8 @@ mod tests {
             connected_mcp_servers: vec![],
             todos: vec![],
         };
-        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
-            .expect("should produce a reminder");
+        let text =
+            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
         assert!(
             text.contains("- \"019ea7f0-cb66-7aa2-9a09-488a3a795795\": `cargo test`"),
             "task ID must be quoted verbatim: {text}"
@@ -351,7 +332,7 @@ mod tests {
     #[test]
     fn system_reminder_skips_subagent_section_when_tool_names_none() {
         let ctx = ctx_with_running_subagents();
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
         if let Some(text) = result {
             assert!(
                 !text.contains("Running Subagents"),
@@ -393,8 +374,8 @@ mod tests {
             todo("3", TodoSummaryStatus::Completed, "read the code"),
             todo("4", TodoSummaryStatus::Cancelled, "abandoned idea"),
         ]);
-        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
-            .expect("should produce a reminder");
+        let text =
+            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
         assert!(
             text.contains("## TODO List"),
             "missing TODO section: {text}"
@@ -430,8 +411,8 @@ mod tests {
             status: "running".into(),
             tool_name: Some("run_terminal_command".into()),
         }];
-        let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
-            .expect("should produce a reminder");
+        let text =
+            to_system_reminder_sync(&ctx, &[], &[], None, None).expect("should produce a reminder");
         let tasks_pos = text
             .find("## Running Background Tasks")
             .expect("tasks section");
@@ -464,7 +445,7 @@ mod tests {
         }];
         let workflows =
             "The following workflows are available:\n\n- review-pr: Review a PR.\n  Source: user";
-        let text = to_system_reminder_sync(&ctx, &[], &skills, None, None, Some(workflows))
+        let text = to_system_reminder_sync(&ctx, &[], &skills, None, Some(workflows))
             .expect("should produce a reminder");
         let skills_at = text.find("## Available Skills").expect("skills section");
         let workflows_at = text
@@ -484,7 +465,7 @@ mod tests {
             todo("1", TodoSummaryStatus::Completed, "done"),
             todo("2", TodoSummaryStatus::Cancelled, "scrapped"),
         ]);
-        let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
+        let result = to_system_reminder_sync(&ctx, &[], &[], None, None);
         if let Some(text) = result {
             assert!(
                 !text.contains("## TODO List"),

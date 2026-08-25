@@ -40,18 +40,27 @@ const DEFAULT_PREFIRE_LEAD_PERCENT: u64 = 10;
 const CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+/// Replace tool outputs with a truncation marker until the span fits
+/// `input_budget`. Oldest first: the newest outputs are the ones the summary
+/// most depends on, so they are the last to go.
 fn rewrite_codex_tool_outputs_to_fit_context_window(
     items: &mut [ConversationItem],
     input_budget: u64,
 ) -> usize {
+    let marker_tokens =
+        xai_token_estimation::estimate_tokens(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+    let mut estimated = xai_chat_state::estimate_conversation_tokens(items);
     let mut rewritten = 0usize;
-    for index in (0..items.len()).rev() {
-        if xai_chat_state::estimate_conversation_tokens(items) <= input_budget {
+    for item in items.iter_mut() {
+        if estimated <= input_budget {
             break;
         }
-        let ConversationItem::ToolResult(output) = &mut items[index] else {
-            break;
+        let ConversationItem::ToolResult(output) = item else {
+            continue;
         };
+        estimated = estimated
+            .saturating_sub(xai_token_estimation::estimate_tokens(&output.content))
+            .saturating_add(marker_tokens);
         output.content = Arc::<str>::from(CODEX_CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
         output.images.clear();
         output.parts = vec![xai_grok_sampling_types::ContentPart::Text {
@@ -60,6 +69,20 @@ fn rewrite_codex_tool_outputs_to_fit_context_window(
         rewritten = rewritten.saturating_add(1);
     }
     rewritten
+}
+/// Token count at which auto-compact fires: the configured percentage of the
+/// context window, lowered to the catalog's hard `auto_compact_token_limit`
+/// when the live Codex model publishes one. `div_ceil` keeps the percentage
+/// arm bit-identical to [`xai_token_estimation::exceeds_threshold`].
+fn auto_compact_trigger_tokens(
+    context_window: u64,
+    threshold_percent: u8,
+    catalog_limit: Option<u64>,
+) -> u64 {
+    let threshold_tokens = context_window
+        .saturating_mul(u64::from(threshold_percent))
+        .div_ceil(100);
+    catalog_limit.map_or(threshold_tokens, |limit| threshold_tokens.min(limit))
 }
 fn prefire_lead_percent() -> u64 {
     std::env::var("GROK_PREFIRE_LEAD_PERCENT")
@@ -104,6 +127,34 @@ mod codex_compaction_reminder_tests {
             filter_mcp_server_summaries_for_compaction(false, servers).len(),
             1
         );
+    }
+
+    /// The catalog's hard limit only ever pulls the trigger point down; a limit
+    /// above the percentage threshold changes nothing.
+    #[test]
+    fn catalog_token_limit_lowers_but_never_raises_the_trigger_point() {
+        assert_eq!(auto_compact_trigger_tokens(400_000, 85, None), 340_000);
+        assert_eq!(
+            auto_compact_trigger_tokens(400_000, 85, Some(300_000)),
+            300_000
+        );
+        assert_eq!(
+            auto_compact_trigger_tokens(400_000, 85, Some(390_000)),
+            340_000
+        );
+    }
+
+    /// The percentage arm must stay bit-identical to the shared
+    /// `exceeds_threshold` predicate it replaced.
+    #[test]
+    fn percentage_trigger_point_matches_exceeds_threshold() {
+        for used in [83_999u64, 84_000, 84_001, 85_000] {
+            assert_eq!(
+                used >= auto_compact_trigger_tokens(99_999, 84, None),
+                xai_token_estimation::exceeds_threshold(used, 99_999, 84),
+                "mismatch at {used}"
+            );
+        }
     }
 }
 fn compaction_mode_label(
@@ -959,7 +1010,7 @@ impl SessionActor {
                         };
                         let api_duration_ms = u64::try_from(attempt_started.elapsed().as_millis())
                             .unwrap_or(u64::MAX);
-                        self.chat_state_handle.record_model_call_usage(
+                        self.chat_state_handle.record_side_call_usage(
                             request.model.clone(),
                             usage.clone(),
                             Some(api_duration_ms),
@@ -1035,6 +1086,7 @@ impl SessionActor {
         conversation_snapshot: &[ConversationItem],
         segment_messages: &[ConversationItem],
         tokens_before: u64,
+        context_window: u64,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         compact_source: &'static str,
         attempts: u32,
@@ -1097,18 +1149,55 @@ impl SessionActor {
             auto_continue,
             original_user_info,
         );
-        if self.startup_hints.inherited_prefix_len.is_some() {
-            self.compaction
-                .prefix_released
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::Span::current().record("compaction_prefix_released", true);
-        }
+        let prefix_len = if self
+            .compaction
+            .prefix_released
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0
+        } else {
+            self.startup_hints.inherited_prefix_len.unwrap_or(0)
+        };
+        let replacement = if prefix_len == 0 {
+            replacement
+        } else {
+            self.resolve_forked_compacted_history(
+                replacement,
+                prefix_len,
+                tokens_before,
+                context_window,
+            )
+            .await
+        };
         let new_len = replacement.len();
         self.chat_state_handle
             .replace_conversation_for_compaction(replacement);
-        self.compaction
-            .auto_compact_suppressed
-            .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        if self.startup_hints.inherited_prefix_len.is_some() {
+            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
+            if xai_token_estimation::exceeds_threshold(
+                post_replace_tokens,
+                context_window,
+                self.compaction.threshold_percent.get(),
+            ) {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    post_replace_tokens,
+                    context_window,
+                    "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
+                );
+            } else {
+                self.compaction
+                    .auto_compact_suppressed
+                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.compaction
+                .auto_compact_suppressed
+                .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        }
         self.last_idle_flush_conversation_len
             .store(new_len, std::sync::atomic::Ordering::Relaxed);
         self.memory
@@ -1270,7 +1359,6 @@ impl SessionActor {
             self.chat_state_handle.get_system_message(),
             self.chat_state_handle.get_conversation(),
         );
-        let provider_conversation = full_conversation.clone();
         let assembly_start = std::time::Instant::now();
         let segment_messages = if self.compaction.compaction_mode.writes_segments() {
             xai_chat_state::compaction_utils::prepare_conversation_for_segment(
@@ -1281,17 +1369,6 @@ impl SessionActor {
         };
         const SUMMARY_BUDGET_RESERVE_TOKENS: u64 = 32_768;
         let verbatim_input_enabled = self.compaction.verbatim_input && !lossy_input;
-        let mut simplified_messages = if verbatim_input_enabled {
-            xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
-                full_conversation,
-                summary_strips_reasoning,
-            )
-        } else {
-            xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
-                full_conversation,
-            )
-        };
-        let pre_compaction_ms = assembly_start.elapsed().as_millis() as u64;
         if conv_len == 0 {
             tracing::error!(
                 session_id = %self.session_info.id.0,
@@ -1313,28 +1390,6 @@ impl SessionActor {
                     .data("Compaction failed: no system message in conversation history"));
             }
         };
-        if simplified_messages.is_empty() {
-            tracing::error!(
-                session_id = %self.session_info.id.0,
-                conversation_len = conv_len,
-                "Compaction failed: simplified conversation is empty"
-            );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: simplified conversation is empty"));
-        }
-        if !simplified_messages
-            .iter()
-            .any(|msg| matches!(msg, ConversationItem::System(_)))
-        {
-            tracing::error!(
-                session_id = %self.session_info.id.0,
-                conversation_len = conv_len,
-                simplified_len = simplified_messages.len(),
-                "Compaction failed: no system message in simplified conversation"
-            );
-            return Err(acp::Error::internal_error()
-                .data("Compaction failed: no system message in simplified conversation"));
-        }
         let sampling_config = self.reconstruct_full_config().await;
         let sampling_client = self.prepare_chat_completion(false).await?;
         let backend_search_active = self.backend_search_active();
@@ -1357,18 +1412,18 @@ impl SessionActor {
             && sampling_config.api_backend == ApiBackend::Responses
             && self.agent.borrow().compaction_policy().remote_compaction_v2
         {
-            let base_instruction_count = provider_conversation
+            let base_instruction_count = full_conversation
                 .iter()
                 .take_while(|item| matches!(item, ConversationItem::System(_)))
                 .count();
-            let system_items = provider_conversation[..base_instruction_count].to_vec();
+            let system_items = full_conversation[..base_instruction_count].to_vec();
             let mut instructions = system_items
                 .iter()
                 .map(ConversationItem::text_content)
                 .filter(|text| !text.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let mut compact_input = provider_conversation[base_instruction_count..].to_vec();
+            let mut compact_input = full_conversation[base_instruction_count..].to_vec();
             if let Some(context) = user_context
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
@@ -1423,15 +1478,51 @@ impl SessionActor {
                 .install_codex_remote_compacted_history(
                     replacement,
                     system_items,
-                    &provider_conversation,
+                    &full_conversation,
                     &segment_messages,
                     tokens_before,
+                    context_window,
                     auto_continue,
                     compact_source,
                     attempts,
                     compaction,
                 )
                 .await;
+        }
+        // Below here is the summarizer path only: Codex remote compaction sends
+        // the conversation verbatim, so it never pays for this rewrite.
+        let mut simplified_messages = if verbatim_input_enabled {
+            xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
+                full_conversation,
+                summary_strips_reasoning,
+            )
+        } else {
+            xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
+                full_conversation,
+            )
+        };
+        let pre_compaction_ms = assembly_start.elapsed().as_millis() as u64;
+        if simplified_messages.is_empty() {
+            tracing::error!(
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
+                "Compaction failed: simplified conversation is empty"
+            );
+            return Err(acp::Error::internal_error()
+                .data("Compaction failed: simplified conversation is empty"));
+        }
+        if !simplified_messages
+            .iter()
+            .any(|msg| matches!(msg, ConversationItem::System(_)))
+        {
+            tracing::error!(
+                session_id = %self.session_info.id.0,
+                conversation_len = conv_len,
+                simplified_len = simplified_messages.len(),
+                "Compaction failed: no system message in simplified conversation"
+            );
+            return Err(acp::Error::internal_error()
+                .data("Compaction failed: no system message in simplified conversation"));
         }
         if lossy_input {
             simplified_messages = xai_chat_state::compaction_utils::fit_conversation_to_budget(
@@ -1918,7 +2009,6 @@ impl SessionActor {
                 &all_skills_for_compaction,
                 memory_ref,
                 subagent_tool_names.as_ref(),
-                None,
                 workflow_listing.as_deref(),
             )
             .await
@@ -2214,26 +2304,26 @@ impl SessionActor {
     }
     /// Check if auto-compact should be triggered based on context window usage.
     /// Returns Some(AutoCompactTriggerInfo) if threshold is reached, None otherwise.
+    /// With a resolved `model`, the live Codex catalog's hard
+    /// `auto_compact_token_limit` can pull the trigger point below the
+    /// percentage threshold.
     pub(crate) fn should_auto_compact(
         &self,
         total_tokens: u64,
         context_window: std::num::NonZeroU64,
+        model: Option<&str>,
     ) -> Option<AutoCompactTriggerInfo> {
         let cw = context_window.get();
-        if xai_token_estimation::exceeds_threshold(
-            total_tokens,
+        let trigger_at = auto_compact_trigger_tokens(
             cw,
             self.compaction.threshold_percent.get(),
-        ) {
-            let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
-            Some(AutoCompactTriggerInfo {
-                tokens_used: total_tokens,
-                context_window: cw,
-                percentage,
-            })
-        } else {
-            None
-        }
+            model.and_then(|model| self.codex_auto_compact_token_limit(model)),
+        );
+        (total_tokens >= trigger_at).then(|| AutoCompactTriggerInfo {
+            tokens_used: total_tokens,
+            context_window: cw,
+            percentage: xai_token_estimation::usage_percentage_u8(total_tokens, cw),
+        })
     }
     /// Returns true if the error response indicates tokens exceed the
     /// model's context window. Inspects only the model-metadata
@@ -2317,7 +2407,9 @@ impl SessionActor {
                 percentage,
             });
         }
-        if let Some(trigger_info) = self.should_auto_compact(estimated_total, context_window) {
+        if let Some(trigger_info) =
+            self.should_auto_compact(estimated_total, context_window, Some(&model))
+        {
             tracing::info!(
                 "Pre-sampling auto-compact trigger: model={model}, \
                  {}% full ({}/{} tokens)",
@@ -2377,11 +2469,14 @@ impl SessionActor {
             // Same slug, but the Codex compaction-compatibility hash rolled:
             // the server-side compaction format changed under us, so compact
             // proactively before the next turn rather than letting a stale
-            // opaque history hit the new format.
+            // opaque history hit the new format. A session that never got one
+            // of those opaque items has nothing to migrate, and compacting it
+            // would burn its history and cache prefix for nothing.
             if comp_hash_changed(
                 prev.comp_hash.as_deref(),
                 self.codex_comp_hash_for_model(&cfg.model).as_deref(),
             ) && !self.is_account_state_suppressed()
+                && self.chat_state_handle.has_codex_compaction_item().await
             {
                 let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
                 let trigger_info = AutoCompactTriggerInfo {
@@ -2415,7 +2510,9 @@ impl SessionActor {
             return Ok(());
         }
         let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
-        let Some(trigger_info) = self.should_auto_compact(total_tokens, cfg.context_window) else {
+        let Some(trigger_info) =
+            self.should_auto_compact(total_tokens, cfg.context_window, Some(&cfg.model))
+        else {
             return Ok(());
         };
         tracing::info!(
@@ -2458,6 +2555,13 @@ impl SessionActor {
         self.models_manager
             .codex_compaction_metadata(model)
             .and_then(|metadata| metadata.comp_hash)
+    }
+    /// Hard token count at which the live Codex catalog says the model
+    /// auto-compacts, independent of our percentage threshold.
+    fn codex_auto_compact_token_limit(&self, model: &str) -> Option<u64> {
+        self.models_manager
+            .codex_compaction_metadata(model)
+            .and_then(|metadata| metadata.auto_compact_token_limit)
     }
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
     /// Emits telemetry (`auto_compact_fired`) and UI notifications automatically.

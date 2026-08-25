@@ -426,9 +426,12 @@ fn codex_remote_compaction_v2_user(item: &ConversationItem) -> Option<Conversati
         .content
         .into_iter()
         .filter_map(|part| match part {
+            // Sessions written before auto-continue carried a `synthetic_reason`
+            // store the sentinel as a plain User item, so the text itself is the
+            // only signal that it was never typed by a human.
             ContentPart::Text { text } => {
                 let text = extract_user_query(&text);
-                (!text.is_empty()).then(|| ContentPart::Text {
+                (!is_synthetic_extracted_query(&text)).then(|| ContentPart::Text {
                     text: std::sync::Arc::<str>::from(text),
                 })
             }
@@ -485,8 +488,11 @@ fn truncate_codex_remote_compaction_v2_user(
                     remaining_text_tokens.saturating_mul(xai_token_estimation::BYTES_PER_TOKEN),
                 )
                 .unwrap_or(usize::MAX);
+                // Below ~16 tokens the truncation marker alone exceeds
+                // `available`, so `kept` is the marker with an empty prefix —
+                // this part is effectively all-or-nothing at that size.
                 let kept = truncate_text_to_bytes(&text, available)
-                    .unwrap_or_else(|| std::sync::Arc::clone(&text));
+                    .expect("text_tokens > remaining_text_tokens implies len > available");
                 remaining_text_tokens = 0;
                 if !kept.is_empty() {
                     retained.push(ContentPart::Text { text: kept });
@@ -545,6 +551,24 @@ pub fn build_codex_remote_compaction_v2_history(
     retained
 }
 
+/// Whether the conversation still carries an opaque Codex server-side
+/// compaction item. The provider owns that item's wire format, so it is the
+/// only thing a `comp_hash` roll can make stale.
+pub fn contains_codex_compaction_item(conversation: &[ConversationItem]) -> bool {
+    conversation.iter().any(|item| {
+        let ConversationItem::BackendToolCall(call) = item else {
+            return false;
+        };
+        let xai_grok_sampling_types::BackendToolKind::CodexRawInput(raw) = &call.kind else {
+            return false;
+        };
+        matches!(
+            raw.raw.get("type").and_then(serde_json::Value::as_str),
+            Some("compaction" | "context_compaction")
+        )
+    })
+}
+
 /// Return genuine user messages appended while compaction was in flight, but
 /// only when the request snapshot remains an exact prefix of live history.
 pub fn codex_remote_compaction_v2_interjections(
@@ -554,8 +578,14 @@ pub fn codex_remote_compaction_v2_interjections(
     if current.len() < snapshot.len() {
         return None;
     }
+    // `ConversationItem` has no `PartialEq`, so the shared prefix is compared by
+    // its serialization. A failure to serialize is not evidence the prefix is
+    // intact, so it refuses the replacement rather than comparing `None == None`.
     let unchanged = snapshot.iter().zip(current).all(|(expected, actual)| {
-        serde_json::to_value(expected).ok() == serde_json::to_value(actual).ok()
+        matches!(
+            (serde_json::to_string(expected), serde_json::to_string(actual)),
+            (Ok(expected), Ok(actual)) if expected == actual
+        )
     });
     if !unchanged {
         return None;

@@ -229,7 +229,6 @@ async fn create_test_actor(
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
-        last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
         turn_report: Default::default(),
@@ -283,8 +282,11 @@ async fn test_should_auto_compact_triggers_at_threshold() {
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(85_000, 100_000, 85, gateway_tx, persistence_tx).await;
-            let result =
-                actor.should_auto_compact(85_000, std::num::NonZeroU64::new(100_000).unwrap());
+            let result = actor.should_auto_compact(
+                85_000,
+                std::num::NonZeroU64::new(100_000).unwrap(),
+                None,
+            );
             assert!(result.is_some(), "Should trigger at exactly 85%");
             let info = result.unwrap();
             assert_eq!(info.tokens_used, 85_000);
@@ -303,8 +305,11 @@ async fn test_should_auto_compact_below_threshold() {
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(84_000, 100_000, 85, gateway_tx, persistence_tx).await;
-            let result =
-                actor.should_auto_compact(84_000, std::num::NonZeroU64::new(100_000).unwrap());
+            let result = actor.should_auto_compact(
+                84_000,
+                std::num::NonZeroU64::new(100_000).unwrap(),
+                None,
+            );
             assert!(result.is_none(), "Should NOT trigger at 84%");
         })
         .await;
@@ -716,7 +721,6 @@ async fn create_test_actor_with_memory(
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
-        last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
         turn_report: Default::default(),
@@ -1523,7 +1527,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
                 prefix_carries_fallback_date: std::cell::Cell::new(false),
-                last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
                 turn_report: Default::default(),

@@ -140,6 +140,20 @@ impl UsageLedger {
         self.fold_entry(model_id, &call);
     }
 
+    /// Fold one **side** model call — compaction and anything else that is not
+    /// a main-agent-loop round. Tokens, cost and `model_calls` count; the wire
+    /// `numTurns` (`main_loop_model_calls`) does not move.
+    pub fn record_side_call(
+        &mut self,
+        model_id: &str,
+        usage: &TokenUsage,
+        api_duration_ms: Option<u64>,
+        cost_usd_ticks: Option<i64>,
+    ) {
+        let call = UsageTotals::from_call(usage, api_duration_ms, cost_usd_ticks);
+        self.fold_entry(model_id, &call);
+    }
+
     /// Fold subagent usage without incrementing `main_loop_model_calls`.
     pub fn record_subagent(&mut self, by_model: &[(String, UsageTotals)], incomplete: bool) {
         for (model_id, totals) in by_model {
@@ -209,6 +223,22 @@ mod tests {
 
         ledger.record_subagent(&[], true);
         assert!(ledger.incomplete);
+    }
+
+    /// Compaction spend must show up in the bill without inflating `numTurns`.
+    #[test]
+    fn side_call_folds_tokens_without_bumping_main_loop_calls() {
+        let mut ledger = UsageLedger::default();
+        ledger.record_main_loop_call("m", &tu(100, 10), Some(100), Some(50));
+        ledger.record_side_call("m", &tu(2_000, 200), Some(400), Some(70));
+
+        assert_eq!(ledger.main_loop_model_calls, 1);
+        assert_eq!(ledger.totals.model_calls, 2);
+        assert_eq!(ledger.totals.input_tokens, 2_100);
+        assert_eq!(ledger.totals.output_tokens, 210);
+        assert_eq!(ledger.totals.api_duration_ms, 500);
+        assert_eq!(ledger.totals.cost_usd_ticks, Some(120));
+        assert_eq!(ledger.by_model["m"].input_tokens, 2_100);
     }
 
     #[test]

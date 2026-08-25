@@ -167,6 +167,24 @@ impl ChatStateHandle {
         });
     }
 
+    /// Record a non-turn model call (compaction). Unlike
+    /// [`Self::record_model_call_usage`] this leaves `main_loop_model_calls`
+    /// — the wire `numTurns` — untouched.
+    pub fn record_side_call_usage(
+        &self,
+        model_id: Option<String>,
+        usage: TokenUsage,
+        api_duration_ms: Option<u64>,
+        cost_usd_ticks: Option<i64>,
+    ) {
+        let _ = self.cmd_tx.send(ChatStateCommand::RecordSideCallUsage {
+            model_id,
+            usage,
+            api_duration_ms,
+            cost_usd_ticks,
+        });
+    }
+
     /// Apply subagent usage; returns false if the actor did not acknowledge.
     pub async fn record_subagent_usage(
         &self,
@@ -426,6 +444,16 @@ impl ChatStateHandle {
         })
         .await
         .unwrap_or(0)
+    }
+
+    /// Whether history still holds an opaque Codex server-side compaction item
+    /// — the only item a `comp_hash` roll can strand.
+    pub async fn has_codex_compaction_item(&self) -> bool {
+        self.query("HasCodexCompactionItem", |reply| {
+            ChatStateCommand::HasCodexCompactionItem { reply }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Get the prompt index at which the last compaction occurred.

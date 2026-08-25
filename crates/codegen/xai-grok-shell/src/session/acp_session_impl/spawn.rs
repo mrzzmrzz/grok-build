@@ -1690,15 +1690,15 @@ pub(crate) async fn spawn_session_actor(
         attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(
             startup_hints.non_interactive,
         )),
-        startup_hints,
-        forked_tool_override,
+        // Taken before `startup_hints` moves into the struct, so the resume-time
+        // comp_hash-rollover guard has the last turn's model to compare against.
         compaction: super::compaction_config::CompactionConfig {
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
             force_compact: force_compact.clone(),
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-            previous_model: std::cell::Cell::new(None),
+            previous_model: std::cell::Cell::new(startup_hints.previous_turn_model.clone()),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
             tool_choice: compaction_tool_choice,
@@ -1706,6 +1706,8 @@ pub(crate) async fn spawn_session_actor(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
+        startup_hints,
+        forked_tool_override,
         memory: super::memory_state::SessionMemory {
             flush_config: memory_config.as_ref().map_or_else(
                 || crate::config::MemoryFlushConfig {
@@ -1842,7 +1844,6 @@ pub(crate) async fn spawn_session_actor(
         extension_registry: session_extension_registry(weak.clone()),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(initial_prefix_carries_fallback_date),
-        last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(built_hook_registry),
         turn_report: Default::default(),

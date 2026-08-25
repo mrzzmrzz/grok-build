@@ -83,8 +83,10 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
             (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
         ConversationItem::ToolResult(tr) => xai_token_estimation::estimate_tokens(&tr.content),
+        // Not `text_summary()`: an opaque Codex compaction item renders as a
+        // short placeholder but ships an encrypted blob the model still pays for.
         ConversationItem::BackendToolCall(b) => {
-            xai_token_estimation::estimate_tokens(&b.text_summary())
+            (b.estimated_content_len() as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
         ConversationItem::Reasoning(r) => {
             // Summary + content text follow the standard bytes-per-token

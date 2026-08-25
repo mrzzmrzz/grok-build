@@ -105,6 +105,15 @@ pub enum ChatStateCommand {
         cost_usd_ticks: Option<i64>,
     },
 
+    /// Usage from a non-turn model call (compaction). Folds tokens and cost
+    /// without advancing the wire `numTurns`.
+    RecordSideCallUsage {
+        model_id: Option<String>,
+        usage: TokenUsage,
+        api_duration_ms: Option<u64>,
+        cost_usd_ticks: Option<i64>,
+    },
+
     /// Subagent usage into session (and prompt when attributable). Replies when applied.
     RecordSubagentUsage {
         by_model: Vec<(String, crate::usage::UsageTotals)>,
@@ -237,6 +246,9 @@ pub enum ChatStateCommand {
 
     /// Get current prompt index.
     GetPromptIndex { reply: oneshot::Sender<usize> },
+
+    /// Whether history still holds an opaque Codex compaction item.
+    HasCodexCompactionItem { reply: oneshot::Sender<bool> },
 
     /// Get the prompt index at which the last compaction occurred.
     /// `Some` means the context currently holds a compaction summary.

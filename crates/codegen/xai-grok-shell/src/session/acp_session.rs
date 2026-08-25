@@ -1002,8 +1002,6 @@ pub(crate) struct SessionActor {
     /// True when the render-failure fallback stamped a date into a date-free template's prefix, so
     /// [`SessionActor::maybe_inject_date_rollover_reminder`] still rolls it over.
     pub(crate) prefix_carries_fallback_date: std::cell::Cell<bool>,
-    /// Prompt index when search_tool last ran. -1 = never. Used for turns_since_last_search.
-    pub(crate) last_search_prompt_index: std::sync::atomic::AtomicI64,
     /// Timestamp (millis since epoch) of the last successful API request.
     /// Used to detect session resume after idle and proactively refresh model metadata.
     pub(crate) last_api_request_at: std::sync::atomic::AtomicI64,
