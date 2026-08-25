@@ -8,22 +8,6 @@ use super::*;
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
 const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-fn retired_mcp_meta_tool_error(tool_name: &str) -> Option<xai_tool_runtime::ToolError> {
-    matches!(
-        tool_name,
-        xai_grok_tools::SEARCH_TOOL_NAME | xai_grok_tools::USE_TOOL_NAME
-    )
-    .then(|| {
-        xai_tool_runtime::ToolError::not_found(
-            xai_tool_protocol::ToolId::new(tool_name.to_owned())
-                .expect("retired MCP meta-tool names are valid tool ids"),
-            format!(
-                "Tool `{tool_name}` is not available. Call the registered MCP tool directly by its qualified name."
-            ),
-        )
-    })
-}
-
 /// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
 ///
 /// Agent sessions always use local workspace ops (in-process toolset).
@@ -32,12 +16,6 @@ pub(super) async fn dispatch_tool(
     prepared: &PreparedToolCall,
     session_id: &str,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
-    // Defense in depth for replayed/stale histories: these implementations
-    // are removed from presets and AgentBuilder, but an already-built bridge
-    // or old tool call must not revive Grok's meta-dispatch semantics.
-    if let Some(error) = retired_mcp_meta_tool_error(&prepared.tool_name) {
-        return Err(error);
-    }
     tracing::debug!(
         tool = %prepared.tool_name,
         call_id = %prepared.tool_call_id.0,
@@ -53,25 +31,6 @@ pub(super) async fn dispatch_tool(
             Some(session_id),
         )
         .await
-}
-
-#[cfg(test)]
-mod retired_mcp_meta_tool_tests {
-    use super::retired_mcp_meta_tool_error;
-
-    #[test]
-    fn stale_grok_mcp_dispatchers_fail_closed() {
-        for name in [
-            xai_grok_tools::SEARCH_TOOL_NAME,
-            xai_grok_tools::USE_TOOL_NAME,
-        ] {
-            let error = retired_mcp_meta_tool_error(name)
-                .expect("retired dispatcher must be rejected before workspace dispatch");
-            assert_eq!(error.kind, xai_tool_runtime::ToolErrorKind::NotFound);
-            assert!(error.detail.contains("qualified name"), "{}", error.detail);
-        }
-        assert!(retired_mcp_meta_tool_error("github__create_issue").is_none());
-    }
 }
 
 /// First string-valued argument among `keys`, in priority order.

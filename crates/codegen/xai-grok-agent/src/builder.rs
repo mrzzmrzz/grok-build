@@ -1042,16 +1042,24 @@ impl AgentBuilder {
                 }
             }
         }
-        // Codex addresses MCP tools by their registered qualified names.
-        // Remove Grok's legacy BM25/meta-dispatch pair even when a custom or
-        // externally registered preset still includes it; keeping a hidden
-        // implementation alive would let stale history dispatch it.
+        // The BM25/meta-dispatch pair is retired for every provider, not just
+        // Codex: MCP tools are addressed by their registered qualified names.
+        // The removal deliberately reaches custom and externally registered
+        // toolsets too — keeping a hidden implementation alive anywhere would
+        // let stale history dispatch it.
+        let before = tool_config.tools.len();
         tool_config.tools.retain(|tool| {
             !matches!(
                 short_tool_name(&tool.id),
                 xai_grok_tools::SEARCH_TOOL_NAME | xai_grok_tools::USE_TOOL_NAME
             )
         });
+        if tool_config.tools.len() != before {
+            tracing::debug!(
+                stripped = before - tool_config.tools.len(),
+                "removed retired BM25 dispatcher tools from the toolset"
+            );
+        }
         let use_backend_search = self.backend_search;
         let web_search_enabled = self.web_search_config.is_enabled();
         let tool_bridge = ToolBridge::finalize_builder(
@@ -2418,9 +2426,9 @@ mod tests {
             "no full-toolset fallback — unlisted tools must be excluded; got: {names:?}"
         );
     }
-    /// `Read` and `Skill` both map to `ToolKind::Read`, but the allowlist phase
-    /// `read_file` without falling back to the full
-    /// single base `read_file` entry is kept exactly once, never double-registered.
+    /// `Read` and `Skill` both map to `ToolKind::Read`, so an allowlist naming
+    /// both resolves the same base tool twice. The allowlist phase must still
+    /// register `read_file` exactly once, never double-registered.
     #[tokio::test]
     async fn read_and_skill_allowlist_keeps_single_read_file() {
         let agent = build_with_tools(vec!["Read".into(), "Skill".into()], vec![]).await;

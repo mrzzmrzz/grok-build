@@ -60,13 +60,33 @@ fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bo
     input_tokens <= context_window.saturating_sub(CLASSIFIER_REQUEST_TOKEN_RESERVE)
 }
 
-/// Build the Codex-visible tool surface from the live registry.
+/// Whether a turn must block on MCP initialization before it resolves its tool
+/// manifest.
 ///
-/// MCP tools are registered under their real qualified names and therefore
-/// travel with their own input schemas. The Grok-only BM25 dispatcher pair is
-/// intentionally hidden: Codex either uses native deferred discovery or, in
-/// this shell, the correct fallback of calling the real tools directly.
-fn codex_visible_tool_definitions(mut defs: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+/// `Blocking` always waits. A Codex session waits under `Progressive` too:
+/// the Responses API caches on the request prefix — instructions plus the
+/// tools array — so a first turn that ships builtins only and a second turn
+/// that has gained the MCP definitions changes the prefix and misses the
+/// cache for the rest of the session. Native Codex initializes MCP before the
+/// first prompt; this matches it. xAI sessions keep Progressive's
+/// non-blocking first turn, where MCP tools arrive mid-session through the
+/// connecting-reminder path.
+fn mcp_wait_required(
+    strategy: McpInitStrategy,
+    provider: xai_grok_sampling_types::ModelProvider,
+) -> bool {
+    match strategy {
+        McpInitStrategy::Blocking => true,
+        McpInitStrategy::Progressive => provider == xai_grok_sampling_types::ModelProvider::Codex,
+    }
+}
+
+/// Drop the retired BM25 dispatcher pair (`search_tool` / `use_tool`) from a
+/// tool surface. Applies to every provider, not just Codex: the dispatchers
+/// are retired shell-wide, and MCP tools are registered under their real
+/// qualified names and travel with their own input schemas, so a model either
+/// uses native deferred discovery or calls the real tools directly.
+fn strip_retired_dispatcher_tools(mut defs: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
     defs.retain(|definition| {
         definition.function.name != xai_grok_tools::SEARCH_TOOL_NAME
             && definition.function.name != xai_grok_tools::USE_TOOL_NAME
@@ -180,17 +200,15 @@ where
 }
 impl SessionActor {
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
+        let strategy = self.mcp_strategy.get();
+        let must_wait = mcp_wait_required(strategy, self.session_model_provider().await);
         let mcp_wait_start = std::time::Instant::now();
-        match self.mcp_strategy.get() {
-            McpInitStrategy::Blocking => {
-                if !self.mcp_state.lock().await.is_initialized() {
-                    tracing::info!(
-                        "Blocking strategy: waiting for MCP initialization before first prompt..."
-                    );
-                    self.wait_for_mcp_initialized().await;
-                }
-            }
-            McpInitStrategy::Progressive => {}
+        if must_wait && !self.mcp_state.lock().await.is_initialized() {
+            tracing::info!(
+                ?strategy,
+                "waiting for MCP initialization before resolving the turn's tool manifest..."
+            );
+            self.wait_for_mcp_initialized().await;
         }
         let mcp_wait_ms = mcp_wait_start.elapsed().as_millis() as u64;
         let defs = self.prepare_tool_definitions_inner().await;
@@ -304,7 +322,7 @@ impl SessionActor {
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let defs = codex_visible_tool_definitions(bridge.tool_definitions().await);
+        let defs = strip_retired_dispatcher_tools(bridge.tool_definitions().await);
         let plan_active = self.plan_mode.lock().is_active();
         let mut defs = filter_cursor_tools_by_plan_mode(defs, plan_active);
         // Provider isolation (spec §12.2): the single place every consumer of
@@ -319,6 +337,18 @@ impl SessionActor {
     }
     pub(super) fn model_auth_facts(&self, model_id: &str) -> crate::agent::config::ModelAuthFacts {
         self.model_auth_state(model_id).0
+    }
+    /// The session's LIVE provider, resolved from the model chat state is
+    /// currently configured with — the same derivation `turn.rs` uses for
+    /// `request_provider`, so a mid-session model switch is reflected at once.
+    pub(super) async fn session_model_provider(&self) -> xai_grok_sampling_types::ModelProvider {
+        let model = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .map(|cfg| cfg.model)
+            .unwrap_or_default();
+        self.model_auth_facts(&model).model_provider
     }
     pub(super) fn model_auth_provider(
         &self,

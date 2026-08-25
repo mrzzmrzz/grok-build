@@ -51,16 +51,24 @@ pub(crate) fn subagent_template() -> Zeroizing<String> {
     decrypt(SUBAGENT_PROMPT_ENC, PROMPT_SEEDS[2])
 }
 
+/// Identity line the Codex subagent prompt swaps in for the shared one.
+const CODEX_SUBAGENT_FIRST_LINE: &str = "You are a Codex coding subagent running in Grok Build — a focused worker delegated a specific task.";
+
 /// The Codex provider keeps the compact subagent contract while identifying
 /// the runtime accurately instead of inheriting the primary-session prompt.
+///
+/// Built into a fresh, pre-sized buffer rather than `replace_range`d in place:
+/// a replacement longer than the original first line would reallocate the
+/// source's heap buffer, freeing the decrypted plaintext without zeroing it.
 pub(crate) fn codex_subagent_template() -> Zeroizing<String> {
-    let mut template = subagent_template();
-    let first_line_end = template.find('\n').unwrap_or(template.len());
-    template.replace_range(
-        ..first_line_end,
-        "You are a Codex coding subagent running in Grok Build — a focused worker delegated a specific task.",
-    );
-    template
+    let template = subagent_template();
+    let rest = template.find('\n').map_or("", |i| &template[i..]);
+    let mut out = Zeroizing::new(String::with_capacity(
+        CODEX_SUBAGENT_FIRST_LINE.len() + rest.len(),
+    ));
+    out.push_str(CODEX_SUBAGENT_FIRST_LINE);
+    out.push_str(rest);
+    out
 }
 
 /// The compact system prompt used after conversation compaction.
@@ -526,6 +534,16 @@ mod tests {
         assert!(template.starts_with("You are a Codex coding subagent running in Grok Build"));
         assert!(!template.contains("released by xAI"));
         assert!(template.len() < apply_patch_template().len());
+    }
+
+    /// The zeroize-safe rebuild must stay byte-identical to the in-place
+    /// first-line swap it replaced.
+    #[test]
+    fn codex_subagent_template_matches_in_place_first_line_swap() {
+        let mut expected = subagent_template();
+        let first_line_end = expected.find('\n').unwrap_or(expected.len());
+        expected.replace_range(..first_line_end, CODEX_SUBAGENT_FIRST_LINE);
+        assert_eq!(*codex_subagent_template(), *expected);
     }
 
     #[test]

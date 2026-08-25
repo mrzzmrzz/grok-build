@@ -1,8 +1,8 @@
 use xai_grok_sampling_types::{SearchDateBound, ToolOverrides, WebSearchOptions, XSearchOptions};
 
 use super::{
-    CLASSIFIER_REQUEST_TOKEN_RESERVE, classifier_request_fits_context,
-    codex_visible_tool_definitions, resolve_configured_cutoff,
+    CLASSIFIER_REQUEST_TOKEN_RESERVE, McpInitStrategy, classifier_request_fits_context,
+    mcp_wait_required, resolve_configured_cutoff, strip_retired_dispatcher_tools,
 };
 
 fn tool_definition(
@@ -13,8 +13,8 @@ fn tool_definition(
 }
 
 #[test]
-fn codex_tool_surface_hides_grok_dispatchers_when_mcp_is_empty() {
-    let defs = codex_visible_tool_definitions(vec![
+fn tool_surface_hides_retired_dispatchers_when_mcp_is_empty() {
+    let defs = strip_retired_dispatcher_tools(vec![
         tool_definition("read_file", serde_json::json!({"type": "object"})),
         tool_definition(xai_grok_tools::SEARCH_TOOL_NAME, serde_json::json!({})),
         tool_definition(xai_grok_tools::USE_TOOL_NAME, serde_json::json!({})),
@@ -24,14 +24,14 @@ fn codex_tool_surface_hides_grok_dispatchers_when_mcp_is_empty() {
 }
 
 #[test]
-fn codex_tool_surface_exposes_real_mcp_name_and_input_schema() {
+fn tool_surface_exposes_real_mcp_name_and_input_schema() {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {"issue_id": {"type": "string"}},
         "required": ["issue_id"],
         "additionalProperties": false
     });
-    let defs = codex_visible_tool_definitions(vec![
+    let defs = strip_retired_dispatcher_tools(vec![
         tool_definition(xai_grok_tools::SEARCH_TOOL_NAME, serde_json::json!({})),
         tool_definition(xai_grok_tools::USE_TOOL_NAME, serde_json::json!({})),
         tool_definition("linear__get_issue", schema.clone()),
@@ -39,6 +39,28 @@ fn codex_tool_surface_exposes_real_mcp_name_and_input_schema() {
     assert_eq!(defs.len(), 1);
     assert_eq!(defs[0].function.name, "linear__get_issue");
     assert_eq!(defs[0].function.parameters, schema);
+}
+
+/// A Codex session must have its MCP definitions in the turn-1 tools array:
+/// gaining them on turn 2 rewrites the cached prompt prefix. xAI sessions
+/// keep Progressive's non-blocking first turn.
+#[test]
+fn progressive_blocks_on_mcp_init_only_for_codex() {
+    use xai_grok_sampling_types::ModelProvider;
+    for provider in [ModelProvider::Xai, ModelProvider::Codex] {
+        assert!(
+            mcp_wait_required(McpInitStrategy::Blocking, provider),
+            "Blocking always waits ({provider:?})"
+        );
+    }
+    assert!(mcp_wait_required(
+        McpInitStrategy::Progressive,
+        ModelProvider::Codex
+    ));
+    assert!(!mcp_wait_required(
+        McpInitStrategy::Progressive,
+        ModelProvider::Xai
+    ));
 }
 
 fn x_cut(to: &str) -> XSearchOptions {

@@ -108,10 +108,18 @@ impl SessionActor {
             .unwrap_or(&qualified_name)
             .to_string();
         mcp_state.record_tool_icons(qualified_name.clone(), reg.icons.clone());
-        if let Some(output_schema) = reg.output_schema.as_ref() {
-            mcp_state
-                .mcp_tool_output_schemas
-                .insert(qualified_name.clone(), output_schema.clone());
+        // A re-registration is authoritative: a server that dropped a tool's
+        // outputSchema must not keep publishing the stale one into Code Mode's
+        // TS declarations.
+        match reg.output_schema.as_ref() {
+            Some(output_schema) => {
+                mcp_state
+                    .mcp_tool_output_schemas
+                    .insert(qualified_name.clone(), output_schema.clone());
+            }
+            None => {
+                mcp_state.mcp_tool_output_schemas.remove(&qualified_name);
+            }
         }
         if let Some(meta) = reg.meta.as_ref() {
             mcp_state
