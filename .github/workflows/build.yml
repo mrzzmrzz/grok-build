@@ -111,6 +111,78 @@ jobs:
       - name: Rename to grok
         run: cp target/release/xai-grok-pager target/release/grok
 
+      - name: Configure Apple code signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE_BASE64" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo "::error::Apple code-signing secrets are not configured. See .github/APPLE_CODE_SIGNING.md."
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/apple-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/apple-code-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+
+          echo "APPLE_CERTIFICATE_PATH=$certificate_path" >> "$GITHUB_ENV"
+          echo "APPLE_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          if ! security find-identity -v -p codesigning "$keychain_path" | grep -F -- "$APPLE_SIGNING_IDENTITY"; then
+            echo "::error::APPLE_SIGNING_IDENTITY does not match the imported certificate."
+            exit 1
+          fi
+
+          rm -f "$certificate_path"
+
+      - name: Sign macOS binary
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+
+          codesign \
+            --force \
+            --keychain "$APPLE_KEYCHAIN_PATH" \
+            --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --timestamp \
+            target/release/grok
+          codesign --verify --strict --verbose=2 target/release/grok
+
+          signature_details="$RUNNER_TEMP/grok.codesign.txt"
+          codesign -dvv target/release/grok 2>&1 | tee "$signature_details"
+          grep -Fq "Authority=$APPLE_SIGNING_IDENTITY" "$signature_details"
+          grep -Fq 'TeamIdentifier=6F8LHK4H5P' "$signature_details"
+
+      - name: Remove Apple code-signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [[ -n "${APPLE_CERTIFICATE_PATH:-}" ]]; then
+            rm -f "$APPLE_CERTIFICATE_PATH"
+          fi
+          if [[ -n "${APPLE_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$APPLE_KEYCHAIN_PATH" || true
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: grok-${{ matrix.name }}
