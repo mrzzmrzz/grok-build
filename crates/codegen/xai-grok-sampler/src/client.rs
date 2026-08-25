@@ -97,6 +97,29 @@ impl GrokRequestHeaders<'_> {
 /// here (ordinary turns): the beta header rides only an explicit
 /// remote-compaction request — see
 /// [`SamplingClient::codex_remote_compaction_v2_headers`].
+/// Attach codex-rs's session-affinity headers (`session-id`, `thread-id`,
+/// `x-client-request-id`, all derived from the stable thread id) to a
+/// Responses request. The backend requires one of these session identity
+/// headers before it serves the per-conversation prompt cache keyed by
+/// `prompt_cache_key`, so main turns and remote compaction both send them.
+/// Codex-profile only: an xAI request never carries them.
+fn apply_codex_session_affinity(
+    builder: reqwest::RequestBuilder,
+    profile: ProviderProfile,
+    affinity_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if profile.provider != ModelProvider::Codex {
+        return builder;
+    }
+    match affinity_id.filter(|s| !s.is_empty()) {
+        Some(id) => builder
+            .header("session-id", id)
+            .header("thread-id", id)
+            .header("x-client-request-id", id),
+        None => builder,
+    }
+}
+
 fn apply_codex_turn_state(
     builder: reqwest::RequestBuilder,
     profile: ProviderProfile,
@@ -1431,7 +1454,11 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(endpoint.clone());
         let http_request = apply_codex_turn_state(
-            builder,
+            apply_codex_session_affinity(
+                builder,
+                self.defaults.provider_profile,
+                request.session_affinity_id.as_deref(),
+            ),
             self.defaults.provider_profile,
             request.turn_state.as_deref(),
         )
@@ -1549,6 +1576,55 @@ impl SamplingClient {
     }
 
     /// Log all headers from a request at debug level (redacting sensitive values).
+    /// Prompt-cache wire diagnostics: with `GROK_CODEX_WIRE_CAPTURE=<dir>`,
+    /// dump each outgoing Codex request (non-sensitive headers + the exact
+    /// body bytes) so consecutive loops can be byte-diffed for prefix
+    /// stability. Debug-only escape hatch; does nothing unless the variable
+    /// is set and the profile is Codex.
+    fn capture_codex_wire(&self, request: &reqwest::Request) {
+        if self.defaults.provider_profile.provider != ModelProvider::Codex {
+            return;
+        }
+        let Ok(dir) = std::env::var("GROK_CODEX_WIRE_CAPTURE") else {
+            return;
+        };
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let headers: std::collections::BTreeMap<String, String> = request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                let value = if Self::is_sensitive_header(name.as_str()) {
+                    "[REDACTED]".to_owned()
+                } else {
+                    value.to_str().unwrap_or("[non-utf8]").to_owned()
+                };
+                (name.as_str().to_owned(), value)
+            })
+            .collect();
+        let body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .unwrap_or_default();
+        let record = serde_json::json!({
+            "seq": seq,
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "url": request.url().as_str(),
+            "headers": headers,
+            "body_len": body.len(),
+            "body_utf8": String::from_utf8_lossy(body),
+        });
+        let path = std::path::Path::new(&dir).join(format!("codex-wire-{seq:04}.json"));
+        if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&record).unwrap_or_default(),
+            )
+        }) {
+            tracing::warn!(%error, path = %path.display(), "codex wire capture failed");
+        }
+    }
+
     fn log_request_headers(request: &reqwest::Request, endpoint_name: &str) {
         for (name, value) in request.headers().iter() {
             let value_str = if Self::is_sensitive_header(name.as_str()) {
@@ -1965,7 +2041,11 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("responses"));
         let http_request = apply_codex_turn_state(
-            grok_headers.apply(builder, self.defaults.provider_profile),
+            apply_codex_session_affinity(
+                grok_headers.apply(builder, self.defaults.provider_profile),
+                self.defaults.provider_profile,
+                request.session_affinity_id.as_deref(),
+            ),
             self.defaults.provider_profile,
             request.turn_state.as_deref(),
         )
@@ -2121,7 +2201,11 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("responses"));
         let mut http_request = apply_codex_turn_state(
-            grok_headers.apply(builder, self.defaults.provider_profile),
+            apply_codex_session_affinity(
+                grok_headers.apply(builder, self.defaults.provider_profile),
+                self.defaults.provider_profile,
+                request.session_affinity_id.as_deref(),
+            ),
             self.defaults.provider_profile,
             request.turn_state.as_deref(),
         )
@@ -2148,6 +2232,7 @@ impl SamplingClient {
             "Sending responses API stream request"
         );
         Self::log_request_headers(&built_request, "responses");
+        self.capture_codex_wire(&built_request);
 
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -2675,6 +2760,7 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let turn_state = request.turn_state.clone();
+        let session_affinity_id = request.session_affinity_id.clone();
         let raw_input_replacements = request.raw_codex_input_replacements();
 
         // The hosted tools travel as raw JSON, spliced in after serialization by
@@ -2697,6 +2783,7 @@ impl SamplingClient {
         wrapper.extra_tool_entries = extra_tools;
         wrapper.raw_input_replacements = raw_input_replacements;
         wrapper.turn_state = turn_state;
+        wrapper.session_affinity_id = session_affinity_id;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2721,6 +2808,7 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
         let turn_state = request.turn_state.clone();
+        let session_affinity_id = request.session_affinity_id.clone();
         let raw_input_replacements = request.raw_codex_input_replacements();
 
         // The hosted tools travel as raw JSON, spliced in by `create_response` through
@@ -2743,6 +2831,7 @@ impl SamplingClient {
         wrapper.extra_tool_entries = extra_tools;
         wrapper.raw_input_replacements = raw_input_replacements;
         wrapper.turn_state = turn_state;
+        wrapper.session_affinity_id = session_affinity_id;
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2886,6 +2975,30 @@ mod tests {
     use tokio::sync::oneshot;
     use xai_grok_sampling_types::ApiErrorCode;
     use xai_grok_sampling_types::types::ChatRequestMessage;
+
+    /// The Codex backend serves the per-conversation prompt cache only when
+    /// a session identity header accompanies `prompt_cache_key`.
+    #[test]
+    fn codex_session_affinity_headers_ride_codex_requests_only() {
+        let http = reqwest::Client::new();
+        let build = |profile, affinity: Option<&str>| {
+            apply_codex_session_affinity(http.post("https://example.com"), profile, affinity)
+                .build()
+                .unwrap()
+        };
+        let codex = build(ProviderProfile::CODEX, Some("sess-1"));
+        for header in ["session-id", "thread-id", "x-client-request-id"] {
+            assert_eq!(
+                codex.headers().get(header).and_then(|v| v.to_str().ok()),
+                Some("sess-1"),
+                "{header}"
+            );
+        }
+        let xai = build(ProviderProfile::XAI, Some("sess-1"));
+        assert!(xai.headers().get("session-id").is_none());
+        let unbound = build(ProviderProfile::CODEX, None);
+        assert!(unbound.headers().get("session-id").is_none());
+    }
 
     #[test]
     fn splice_extra_tool_entries_extends_existing_tools_array() {

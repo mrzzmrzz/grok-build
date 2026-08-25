@@ -107,6 +107,7 @@ impl ChatStateActor {
             x_grok_user_id: None,
             trace,
             prompt_cache_key: None,
+            session_affinity_id: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
             // Stamped by the shell's turn loop (turn affinity), not here:

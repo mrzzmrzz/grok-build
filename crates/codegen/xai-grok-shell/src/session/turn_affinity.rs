@@ -50,6 +50,10 @@ pub(crate) fn apply_turn_affinity(
         ModelProvider::Codex => {
             request.turn_state = turn_state.filter(|s| !s.is_empty());
             request.prompt_cache_key = Some(derive_prompt_cache_key(provider, affinity_id));
+            // The backend serves the per-conversation prompt cache only when a
+            // session identity header accompanies `prompt_cache_key`; the
+            // sampler maps this onto codex-rs's session-affinity headers.
+            request.session_affinity_id = Some(affinity_id.to_owned());
         }
         ModelProvider::Xai => {
             request.turn_state = None;

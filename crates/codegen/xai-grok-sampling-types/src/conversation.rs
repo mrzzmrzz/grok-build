@@ -872,6 +872,13 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Stable session identity for Codex session-affinity headers
+    /// (`session-id` / `thread-id` / `x-client-request-id`). The Codex
+    /// backend only serves the per-conversation prompt cache keyed by
+    /// `prompt_cache_key` when a session identity header is present, so the
+    /// shell stamps the same fork-inheritable affinity id used to derive the
+    /// cache key. Never serialized into the request body.
+    pub session_affinity_id: Option<String>,
     /// Opaque Codex turn-state token to echo back as the
     /// `x-codex-turn-state` request header. Captured from a Codex
     /// response header by the shell and bound to the current logical

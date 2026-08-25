@@ -1216,6 +1216,11 @@ pub struct CreateResponseWrapper {
     /// Opaque Codex turn-state token, sent as the `x-codex-turn-state`
     /// request header — only under the Codex provider profile.
     pub turn_state: Option<String>,
+
+    /// Stable session identity for the Codex session-affinity headers
+    /// (`session-id` / `thread-id` / `x-client-request-id`) — only under
+    /// the Codex provider profile.
+    pub session_affinity_id: Option<String>,
 }
 
 impl CreateResponseWrapper {
@@ -1234,6 +1239,7 @@ impl CreateResponseWrapper {
             extra_tool_entries: vec![],
             raw_input_replacements: vec![],
             turn_state: None,
+            session_affinity_id: None,
         }
     }
 
