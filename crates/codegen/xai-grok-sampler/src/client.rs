@@ -405,11 +405,23 @@ fn splice_extra_tool_entries(
     }
 }
 
+/// Splice opaque Codex history items back over their typed placeholders. An
+/// xAI body never carries a Codex item, so on any other provider the
+/// placeholders travel as their lossy text summary instead.
 fn patch_raw_input_replacements(
     request_body: &mut serde_json::Value,
     replacements: &[xai_grok_sampling_types::RawInputItemReplacement],
+    provider: ModelProvider,
 ) -> Result<()> {
     if replacements.is_empty() {
+        return Ok(());
+    }
+    if provider != ModelProvider::Codex {
+        tracing::warn!(
+            count = replacements.len(),
+            provider = ?provider,
+            "Codex raw input items degraded to text summaries on a non-Codex request"
+        );
         return Ok(());
     }
     let input = request_body
@@ -591,45 +603,50 @@ struct CodexRemoteCompactionV2Collector {
     compaction_items: Vec<serde_json::Value>,
     completed_response_id: Option<String>,
     completed_usage: Option<rs::ResponseUsage>,
-    saw_completed: bool,
 }
 
 impl CodexRemoteCompactionV2Collector {
     fn absorb(&mut self, event_name: &str, data: &str) -> Result<()> {
-        if let Some(error) = try_parse_stream_error(data) {
+        // Unknown or non-JSON frames are provider growth, not a stream failure:
+        // the main Responses path skips them too
+        // (`is_unknown_response_event_kind`).
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
+            return Ok(());
+        };
+        // Both envelopes `try_parse_stream_error` knows are keyed on a
+        // top-level `error`; the lookup keeps delta frames off the parse path.
+        if value.get("error").is_some()
+            && let Some(error) = try_parse_stream_error(data)
+        {
             return Err(error);
         }
-        let value = serde_json::from_str::<serde_json::Value>(data)
-            .map_err(SamplingError::Serialization)?;
         let event_type = value
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(event_name);
-        match event_type {
+            .unwrap_or(event_name)
+            .to_owned();
+        match event_type.as_str() {
             "response.output_item.done" => {
                 self.output_item_count = self.output_item_count.saturating_add(1);
                 let item = value
-                    .get("item")
-                    .and_then(serde_json::Value::as_object)
+                    .get_mut("item")
+                    .map(serde_json::Value::take)
+                    .filter(|item| !item.is_null())
                     .ok_or_else(|| {
                         SamplingError::serialization_message(
                             "Codex remote compaction v2 output_item.done contained no item",
                         )
                     })?;
                 if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
-                    self.compaction_items
-                        .push(serde_json::Value::Object(item.clone()));
+                    self.compaction_items.push(item);
                 }
             }
             "response.completed" => {
-                let response = value
-                    .get("response")
-                    .and_then(serde_json::Value::as_object)
-                    .ok_or_else(|| {
-                        SamplingError::serialization_message(
-                            "Codex remote compaction v2 response.completed contained no response",
-                        )
-                    })?;
+                let response = value.get_mut("response").ok_or_else(|| {
+                    SamplingError::serialization_message(
+                        "Codex remote compaction v2 response.completed contained no response",
+                    )
+                })?;
                 let response_id = response
                     .get("id")
                     .and_then(serde_json::Value::as_str)
@@ -638,15 +655,50 @@ impl CodexRemoteCompactionV2Collector {
                         SamplingError::serialization_message(
                             "Codex remote compaction v2 response.completed contained no response id",
                         )
-                    })?;
-                self.completed_response_id = Some(response_id.to_owned());
+                    })?
+                    .to_owned();
                 self.completed_usage = response
-                    .get("usage")
+                    .get_mut("usage")
+                    .map(serde_json::Value::take)
                     .filter(|usage| !usage.is_null())
-                    .cloned()
                     .map(normalize_codex_remote_compaction_usage)
                     .transpose()?;
-                self.saw_completed = true;
+                self.completed_response_id = Some(response_id);
+            }
+            // Terminal failure. The provider's own error is the only useful
+            // diagnosis, and re-sending the same near-context-window prompt
+            // cannot clear it — surface it as non-retryable so the caller's
+            // retry loop stops here.
+            "response.failed" | "response.incomplete" => {
+                let error = value.pointer("/response/error");
+                let error_field = |key: &str| {
+                    error
+                        .and_then(|error| error.get(key))
+                        .and_then(serde_json::Value::as_str)
+                };
+                // The collector is dropped with this error, so tokens the
+                // failed attempt still billed survive only in this log line.
+                if let Some(usage) = value
+                    .pointer("/response/usage")
+                    .filter(|usage| !usage.is_null())
+                {
+                    tracing::warn!(
+                        %usage,
+                        "Codex remote compaction v2 billed usage on a failed response"
+                    );
+                }
+                let message = error_field("message")
+                    .unwrap_or("Codex remote compaction v2 failed without a provider message");
+                return Err(SamplingError::Api {
+                    // Not a wire status: 400 is what keeps `is_retryable` false.
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    message: format!("{event_type}: {message}"),
+                    model_metadata: None,
+                    retry_after_secs: None,
+                    should_retry: Some(false),
+                    error_code: error_field("code")
+                        .map(xai_grok_sampling_types::ApiErrorCode::parse),
+                });
             }
             _ => {}
         }
@@ -654,11 +706,11 @@ impl CodexRemoteCompactionV2Collector {
     }
 
     fn finish(self, turn_state: Option<String>) -> Result<CodexRemoteCompactionV2Result> {
-        if !self.saw_completed {
+        let Some(response_id) = self.completed_response_id else {
             return Err(SamplingError::EventStreamError(
                 "Codex remote compaction v2 stream closed before response.completed".to_owned(),
             ));
-        }
+        };
         if self.compaction_items.len() != 1 {
             return Err(SamplingError::serialization_message(format!(
                 "Codex remote compaction v2 expected exactly one compaction output item, got {} from {} output items",
@@ -666,79 +718,49 @@ impl CodexRemoteCompactionV2Collector {
                 self.output_item_count,
             )));
         }
-        let mut items = xai_grok_sampling_types::codex_compact_output_to_conversation_items(
+        let compaction_item = xai_grok_sampling_types::codex_compact_output_to_conversation_items(
             self.compaction_items,
         )
-        .map_err(SamplingError::serialization_message)?;
-        let compaction_item = items.pop().ok_or_else(|| {
-            SamplingError::serialization_message(
-                "Codex remote compaction v2 produced no replayable compaction item",
-            )
-        })?;
+        .map_err(SamplingError::serialization_message)?
+        .remove(0);
         Ok(CodexRemoteCompactionV2Result {
             compaction_item,
-            response_id: self.completed_response_id.ok_or_else(|| {
-                SamplingError::serialization_message(
-                    "Codex remote compaction v2 completed without a response id",
-                )
-            })?,
+            response_id,
             usage: self.completed_usage,
             turn_state,
         })
     }
 }
 
+/// `rs::ResponseUsage` requires the full Responses usage shape, but the
+/// compaction stream's `response.completed` carries only the two token counts.
 fn normalize_codex_remote_compaction_usage(usage: serde_json::Value) -> Result<rs::ResponseUsage> {
-    fn insert_default(
-        object: &mut serde_json::Map<String, serde_json::Value>,
-        key: &str,
-        default: serde_json::Value,
-    ) {
-        if object.get(key).is_none_or(serde_json::Value::is_null) {
-            object.insert(key.to_owned(), default);
+    let mut usage = match usage {
+        serde_json::Value::Object(usage) => usage,
+        _ => {
+            return Err(SamplingError::serialization_message(
+                "Responses usage is not an object",
+            ));
         }
-    }
-
-    let mut usage = usage
-        .as_object()
-        .cloned()
-        .ok_or_else(|| SamplingError::serialization_message("Responses usage is not an object"))?;
-    insert_default(&mut usage, "input_tokens", serde_json::json!(0));
-    insert_default(&mut usage, "output_tokens", serde_json::json!(0));
-    let total_tokens = usage
-        .get("input_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default()
-        .saturating_add(
-            usage
-                .get("output_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-        )
+    };
+    let tokens = |key: &str| {
+        usage
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    };
+    let total_tokens = tokens("input_tokens")
+        .saturating_add(tokens("output_tokens"))
         .min(u64::from(u32::MAX));
-    insert_default(&mut usage, "total_tokens", serde_json::json!(total_tokens));
-    insert_default(
-        &mut usage,
-        "input_tokens_details",
-        serde_json::json!({"cached_tokens": 0}),
-    );
-    insert_default(
-        &mut usage,
-        "output_tokens_details",
-        serde_json::json!({"reasoning_tokens": 0}),
-    );
-    if let Some(details) = usage
-        .get_mut("input_tokens_details")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        insert_default(details, "cached_tokens", serde_json::json!(0));
-    }
-    if let Some(details) = usage
-        .get_mut("output_tokens_details")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        insert_default(details, "reasoning_tokens", serde_json::json!(0));
-    }
+    usage
+        .entry("total_tokens")
+        .or_insert_with(|| serde_json::json!(total_tokens));
+    usage
+        .entry("input_tokens_details")
+        .or_insert_with(|| serde_json::json!({"cached_tokens": 0}));
+    usage
+        .entry("output_tokens_details")
+        .or_insert_with(|| serde_json::json!({"reasoning_tokens": 0}));
     serde_json::from_value(serde_json::Value::Object(usage)).map_err(SamplingError::Serialization)
 }
 
@@ -1360,23 +1382,17 @@ impl SamplingClient {
         instructions: &str,
         capability_declared: bool,
     ) -> Result<CodexRemoteCompactionV2Result> {
-        if self.defaults.provider_profile.provider != ModelProvider::Codex
-            || !matches!(self.defaults.api_backend, ApiBackend::Responses)
-        {
-            return Err(SamplingError::InvalidConfiguration(
-                "remote compaction v2 requires the Codex provider profile over the Responses backend",
-            ));
-        }
-        if request.items.is_empty() {
-            return Err(SamplingError::InvalidConfiguration(
-                "remote compaction v2 requires non-empty conversation input",
-            ));
-        }
+        // Also the provider/backend gate for this request.
         let beta_headers = self
             .codex_remote_compaction_v2_headers(capability_declared)?
             .ok_or(SamplingError::InvalidConfiguration(
                 "remote compaction v2 was not declared by the live Codex model catalog",
             ))?;
+        if request.items.is_empty() {
+            return Err(SamplingError::InvalidConfiguration(
+                "remote compaction v2 requires non-empty conversation input",
+            ));
+        }
 
         self.apply_conversation_defaults(&mut request)?;
         request.trace.take();
@@ -1391,13 +1407,19 @@ impl SamplingClient {
             SamplingError::Serialization(error)
         })?;
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
-        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        patch_raw_input_replacements(
+            &mut request_body,
+            &raw_input_replacements,
+            self.defaults.provider_profile.provider,
+        )?;
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         patch_codex_instruction_roles(&mut request_body);
         shape_codex_remote_compaction_v2_body(&mut request_body, instructions);
 
         let endpoint = self.endpoint("responses");
+        // Compaction has no per-frame idle watchdog, so the idle timeout is
+        // deliberately repurposed as a whole-request ceiling.
         let timeout_secs = self
             .defaults
             .idle_timeout_secs
@@ -1471,7 +1493,7 @@ impl SamplingClient {
                 break;
             }
             collector.absorb(&event.event, &event.data)?;
-            if collector.saw_completed {
+            if collector.completed_response_id.is_some() {
                 break;
             }
         }
@@ -1924,7 +1946,11 @@ impl SamplingClient {
             SamplingError::Serialization(e)
         })?;
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
-        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        patch_raw_input_replacements(
+            &mut request_body,
+            &raw_input_replacements,
+            self.defaults.provider_profile.provider,
+        )?;
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         // async-openai's ReasoningTextContent struct omits the `type`
         // discriminator that the Responses API requires on input. Patch
@@ -2074,7 +2100,11 @@ impl SamplingClient {
             request_body["stream_tool_calls"] = serde_json::json!(true);
         }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
-        patch_raw_input_replacements(&mut request_body, &raw_input_replacements)?;
+        patch_raw_input_replacements(
+            &mut request_body,
+            &raw_input_replacements,
+            self.defaults.provider_profile.provider,
+        )?;
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         if self.defaults.provider_profile.provider == ModelProvider::Codex {
@@ -3453,6 +3483,60 @@ mod tests {
         let replay = request.raw_codex_input_replacements();
         assert_eq!(replay[0].value["encrypted_content"], "opaque");
         assert!(replay[0].value.get("id").is_none());
+    }
+
+    #[test]
+    fn remote_compaction_v2_response_failed_is_terminal_and_non_retryable() {
+        for event in ["response.failed", "response.incomplete"] {
+            let mut collector = CodexRemoteCompactionV2Collector::default();
+            let error = collector
+                .absorb(
+                    event,
+                    &serde_json::json!({
+                        "type": event,
+                        "response": {
+                            "id": "resp_failed",
+                            "usage": {"input_tokens": 190_000, "output_tokens": 0},
+                            "error": {
+                                "code": "context_length_exceeded",
+                                "message": "input exceeds the maximum context length",
+                            }
+                        }
+                    })
+                    .to_string(),
+                )
+                .unwrap_err();
+            assert!(!error.is_retryable(), "{event} must not be retried");
+            assert!(
+                error
+                    .to_string()
+                    .contains("input exceeds the maximum context length"),
+                "{event} must carry the provider message, got {error}"
+            );
+            assert!(error.is_context_length_error());
+        }
+    }
+
+    #[test]
+    fn remote_compaction_v2_collector_ignores_unparseable_frames() {
+        let mut collector = CodexRemoteCompactionV2Collector::default();
+        collector
+            .absorb("response.output_text.delta", "not json")
+            .unwrap();
+        collector
+            .absorb(
+                "response.completed",
+                &serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_completed"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            collector.completed_response_id.as_deref(),
+            Some("resp_completed")
+        );
     }
 
     #[test]

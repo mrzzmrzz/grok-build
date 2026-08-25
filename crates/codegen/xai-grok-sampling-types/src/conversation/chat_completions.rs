@@ -183,15 +183,18 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
         // Backend tool calls have no Chat Completions equivalent.
         // Emit a synthetic assistant message so the model sees context
         // about what was searched, without breaking the message sequence.
-        ConversationItem::BackendToolCall(b) => ChatRequestMessage {
-            role: Role::Assistant,
-            content: MessageContent::Text(b.text_summary()),
-            name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            model_id: None,
-            reasoning_content: None,
-        },
+        ConversationItem::BackendToolCall(b) => {
+            b.warn_if_lossy("chat_completions");
+            ChatRequestMessage {
+                role: Role::Assistant,
+                content: MessageContent::Text(b.text_summary()),
+                name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                model_id: None,
+                reasoning_content: None,
+            }
+        }
         // The only caller folds `Reasoning` into the following assistant.
         ConversationItem::Reasoning(_) => unreachable!(
             "conversation_to_chat_messages folds Reasoning siblings; \

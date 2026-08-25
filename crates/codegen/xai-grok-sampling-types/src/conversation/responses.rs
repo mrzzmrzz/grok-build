@@ -358,8 +358,15 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
                 // Typed placeholder replaced with the exact raw item by the
-                // sampler after `CreateResponse` serialization.
+                // sampler after `CreateResponse` serialization; a non-Codex
+                // request keeps this lossy summary, which the sampler warns
+                // about where it skips the patch. Debug here because the
+                // Codex path overwrites it on every request.
                 BackendToolKind::CodexRawInput(raw) => {
+                    tracing::debug!(
+                        item_kind = raw.raw.get("type").and_then(serde_json::Value::as_str),
+                        "Codex raw input item rendered as its text summary"
+                    );
                     rs::InputItem::EasyMessage(rs::EasyInputMessage {
                         r#type: rs::MessageType::Message,
                         role: rs::Role::Assistant,
@@ -371,8 +378,20 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
     }
 }
 
+/// How many Responses input items [`conversation_item_to_input_items`] emits
+/// for `item`, without building them. Only an assistant turn is variable
+/// (optional text message + one item per tool call);
+/// `conversation_item_wire_len_matches_the_responses_conversion` pins this to
+/// the real conversion.
 pub(super) fn conversation_item_wire_len(item: &ConversationItem) -> usize {
-    conversation_item_to_input_items(item).len()
+    match item {
+        ConversationItem::Assistant(a) => usize::from(!a.content.is_empty()) + a.tool_calls.len(),
+        ConversationItem::System(_)
+        | ConversationItem::User(_)
+        | ConversationItem::Reasoning(_)
+        | ConversationItem::ToolResult(_)
+        | ConversationItem::BackendToolCall(_) => 1,
+    }
 }
 
 /// Ordered `InputContent` for a tool result: `parts` verbatim when present,

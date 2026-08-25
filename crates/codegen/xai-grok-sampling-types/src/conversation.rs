@@ -398,6 +398,18 @@ impl BackendToolCallItem {
         }
     }
 
+    /// A Codex raw item replays intact only through the Responses splice;
+    /// every other wire keeps the summary and loses the provider's context.
+    pub(crate) fn warn_if_lossy(&self, wire: &str) {
+        if let BackendToolKind::CodexRawInput(item) = &self.kind {
+            tracing::warn!(
+                wire,
+                item_kind = item.raw.get("type").and_then(serde_json::Value::as_str),
+                "Codex raw input item degraded to its text summary"
+            );
+        }
+    }
+
     /// Approximate serialized content size for context accounting. Opaque
     /// Codex compaction payloads are intentionally hidden from user-visible
     /// text, but their encrypted bytes still consume model context.
@@ -416,8 +428,10 @@ impl BackendToolCallItem {
 /// does not yet model a newer item variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexRawInputItem {
-    /// Stable local identity for persistence and deduplication. Some provider
-    /// compaction items legitimately omit their wire `id`.
+    /// Local identity for persistence and deduplication. The provider's wire
+    /// `id` when it sent one; otherwise a positional fallback that is unique
+    /// only within the response it was generated from — it repeats across
+    /// turns, so it is not a cross-response key.
     pub id: String,
     /// Exact provider item to splice back into the next Responses input.
     pub raw: serde_json::Value,
@@ -434,9 +448,12 @@ impl CodexRawInputItem {
             .get("encrypted_content")
             .and_then(serde_json::Value::as_str)
         {
+            // `* 3 / 4` undoes base64 to the encrypted byte count; the 650 is a
+            // calibrated allowance for the encryption envelope around the
+            // payload, which costs no model context.
             return (encoded.len().saturating_mul(3) / 4).saturating_sub(650);
         }
-        self.raw.to_string().len()
+        json_serialized_len(&self.raw)
     }
 
     fn text_summary(&self) -> String {
@@ -462,6 +479,28 @@ impl CodexRawInputItem {
             format!("[OpenAI retained {item_type} context]")
         }
     }
+}
+
+/// Serialized byte length of `value` without materializing the JSON.
+fn json_serialized_len(value: &serde_json::Value) -> usize {
+    #[derive(Default)]
+    struct CountingSink(usize);
+
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut sink = CountingSink::default();
+    // A `Value` tree always serializes.
+    serde_json::to_writer(&mut sink, value).expect("serde_json::Value always serializes");
+    sink.0
 }
 
 fn compact_message_text(value: &serde_json::Value) -> String {
@@ -856,9 +895,20 @@ impl ConversationRequest {
     }
 
     /// Locate opaque Codex-native history items in the flattened Responses
-    /// input. Counting through the same conversion as the serializer keeps
+    /// input. Counting through the same wire arithmetic as the serializer keeps
     /// indexes stable when an assistant expands to multiple wire items.
     pub fn raw_codex_input_replacements(&self) -> Vec<RawInputItemReplacement> {
+        let has_raw_input = self.items.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::BackendToolCall(BackendToolCallItem {
+                    kind: BackendToolKind::CodexRawInput(_),
+                })
+            )
+        });
+        if !has_raw_input {
+            return Vec::new();
+        }
         let mut replacements = Vec::new();
         let mut input_item_index = 0usize;
         for item in &self.items {
@@ -887,17 +937,13 @@ pub fn codex_compact_output_to_conversation_items(
 ) -> std::result::Result<Vec<ConversationItem>, String> {
     let mut retained = Vec::new();
     for (index, raw) in output.into_iter().enumerate() {
-        let object = raw
-            .as_object()
-            .ok_or_else(|| format!("compact output item {index} is not an object"))?;
-        let item_type = object
+        let item_type = raw
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("compact output item {index} has no type"))?;
+            .unwrap_or_default();
         let keep = match item_type {
             "message" => matches!(
-                object.get("role").and_then(serde_json::Value::as_str),
+                raw.get("role").and_then(serde_json::Value::as_str),
                 Some("user" | "assistant")
             ),
             "agent_message" | "compaction" | "context_compaction" => true,
@@ -906,12 +952,16 @@ pub fn codex_compact_output_to_conversation_items(
         if !keep {
             continue;
         }
-        let provider_id = object
+        // Compaction items reach here with the empty-string `id` sentinel that
+        // decoding inserts, so an empty id counts as absent.
+        let provider_id = raw
             .get("id")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("codex_compact_{index}_{item_type}"));
+            .map_or_else(
+                || format!("codex_compact_{index}_{item_type}"),
+                str::to_owned,
+            );
         retained.push(ConversationItem::BackendToolCall(BackendToolCallItem {
             kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
                 id: provider_id,
@@ -1075,17 +1125,6 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Prompt-cache hit rate in percent, or `None` when the prompt is empty.
-    /// Responses reports `prompt_tokens` as the full input denominator.
-    pub fn cache_hit_rate(&self) -> Option<f64> {
-        (self.prompt_tokens != 0)
-            .then(|| f64::from(self.cached_prompt_tokens) / f64::from(self.prompt_tokens) * 100.0)
-    }
-
-    pub fn cache_hit_rate_pct(&self) -> f64 {
-        self.cache_hit_rate().unwrap_or(0.0)
-    }
-
     pub fn record_on_span(&self, span: &tracing::Span) {
         span.record("prompt_tokens", self.prompt_tokens);
         span.record("completion_tokens", self.completion_tokens);
@@ -6351,5 +6390,81 @@ mod tests {
         // The placeholder sentinel from the pre-refactor world must not appear.
         let body_str = serde_json::to_string(&input).unwrap();
         assert!(!body_str.contains("__RAW_OUTPUT_PLACEHOLDER_"));
+    }
+
+    fn codex_raw_item(id: &str) -> ConversationItem {
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::CodexRawInput(CodexRawInputItem {
+                id: id.to_owned(),
+                raw: serde_json::json!({"type": "compaction", "encrypted_content": "blob"}),
+            }),
+        })
+    }
+
+    /// `conversation_item_wire_len` counts Responses input items
+    /// arithmetically instead of building them, so it has to be pinned to the
+    /// conversion it stands in for — one case per item shape.
+    #[test]
+    fn conversation_item_wire_len_matches_the_responses_conversion() {
+        let items = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("hi"),
+            reasoning_sibling("r1", "thinking", Some("enc")),
+            ConversationItem::assistant("plain text"),
+            assistant_with_calls(&[("call_1", "read_file"), ("call_2", "write_file")]),
+            ConversationItem::Assistant(AssistantItem {
+                content: "text and a call".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call_3".into(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".into(),
+                }],
+                model_id: None,
+                model_fingerprint: None,
+                reasoning_effort: None,
+            }),
+            ConversationItem::tool_result("call_1", "ok"),
+            codex_raw_item("c0"),
+        ];
+
+        for item in &items {
+            let single = ConversationRequest::from_items(vec![item.clone()]);
+            assert_eq!(
+                super::responses::conversation_item_wire_len(item),
+                input_items_json(&single).len(),
+                "wire length mismatch for {item:?}"
+            );
+        }
+        let whole = ConversationRequest::from_items(items.clone());
+        assert_eq!(
+            input_items_json(&whole).len(),
+            items
+                .iter()
+                .map(super::responses::conversation_item_wire_len)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn raw_codex_input_replacements_index_by_wire_position() {
+        assert!(
+            ConversationRequest::from_items(vec![
+                ConversationItem::system("sys"),
+                assistant_with_calls(&[("call_1", "read_file")]),
+            ])
+            .raw_codex_input_replacements()
+            .is_empty()
+        );
+
+        let request = ConversationRequest::from_items(vec![
+            ConversationItem::system("sys"),
+            assistant_with_calls(&[("call_1", "read_file"), ("call_2", "write_file")]),
+            codex_raw_item("c0"),
+        ]);
+        let replacements = request.raw_codex_input_replacements();
+        assert_eq!(replacements.len(), 1);
+        // sys(1) + a two-call assistant with no text(2).
+        assert_eq!(replacements[0].input_item_index, 3);
+        assert_eq!(replacements[0].value["encrypted_content"], "blob");
     }
 }

@@ -254,6 +254,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
             }
             // No native equivalent, so emit synthetic text to retain context.
             ConversationItem::BackendToolCall(b) => {
+                b.warn_if_lossy("messages");
                 flush_tool_results(&mut pending_tool_results, &mut messages);
                 pending_assistant.push(ContentBlock::Text {
                     text: b.text_summary(),
