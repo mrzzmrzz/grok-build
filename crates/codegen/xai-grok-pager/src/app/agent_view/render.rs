@@ -1541,7 +1541,6 @@ impl AgentView {
             task_counts,
             &theme,
             self.hit_bg_status.hovered,
-            self.tasks.tick_count(),
         ) {
             status.push("bg_tasks", line);
         }
