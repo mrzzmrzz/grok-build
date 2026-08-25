@@ -1141,7 +1141,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect();
         assert!(
-            text.iter().any(|l| l.contains("Couldn't load usage: billing down")),
+            text.iter()
+                .any(|l| l.contains("Couldn't load usage: billing down")),
             "{text:?}"
         );
         assert!(
@@ -1150,7 +1151,10 @@ mod tests {
             "{text:?}"
         );
         assert!(text.iter().any(|l| l == "OpenAI Codex usage:"), "{text:?}");
-        assert!(text.iter().any(|l| l.contains("Plan:     plus")), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("Plan:     plus")),
+            "{text:?}"
+        );
 
         // Reverse: Codex failed, xAI session usage loaded — both still shown.
         state.billing_error = None;

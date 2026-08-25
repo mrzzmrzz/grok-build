@@ -1880,7 +1880,9 @@ mod tests {
         set_oauth_identity_anchor(&mut headers, Some(&credentials));
         assert!(has_oauth_identity_anchor(&headers));
         assert!(
-            !headers.keys().any(|k| k.eq_ignore_ascii_case("chatgpt-account-id")),
+            !headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("chatgpt-account-id")),
             "model-supplied reserved auth headers are stripped"
         );
         let resolver = CodexBearerResolver::from_headers(&headers);
@@ -1940,7 +1942,9 @@ mod tests {
     async fn logout_removes_models_cache_alongside_auth_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CODEX_AUTH_FILE_NAME);
-        let cache_path = dir.path().join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
+        let cache_path = dir
+            .path()
+            .join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
         // A tokenless store keeps logout offline: nothing to revoke.
         let store = CodexAuthStore {
             auth_mode: Some("chatgpt".to_owned()),
@@ -1983,7 +1987,9 @@ mod tests {
     async fn logout_without_auth_store_still_removes_models_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CODEX_AUTH_FILE_NAME);
-        let cache_path = dir.path().join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
+        let cache_path = dir
+            .path()
+            .join(crate::codex_models::CODEX_MODELS_CACHE_FILE);
         std::fs::write(&cache_path, b"{\"models\": []}").unwrap();
 
         let removed = logout_at(&path, &CodexEndpoints::default()).await.unwrap();
@@ -2194,7 +2200,9 @@ mod tests {
         let fence = capture_login_fence(&path);
         // Logout completes while the callback is still pending (no store on
         // disk, so no revocation traffic leaves the machine).
-        let removed = logout_at(&path, &endpoints("http://127.0.0.1:9")).await.unwrap();
+        let removed = logout_at(&path, &endpoints("http://127.0.0.1:9"))
+            .await
+            .unwrap();
         assert!(!removed);
         assert!(
             logout_generation() > fence.generation,

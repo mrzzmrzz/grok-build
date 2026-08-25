@@ -2399,7 +2399,10 @@ mod tests {
                 let reasoning = reasoning_siblings(response);
                 assert_eq!(reasoning.len(), 1);
                 assert_eq!(reasoning[0].id, "rs_1");
-                assert_eq!(reasoning[0].encrypted_content.as_deref(), Some("enc-blob-1"));
+                assert_eq!(
+                    reasoning[0].encrypted_content.as_deref(),
+                    Some("enc-blob-1")
+                );
                 assert_eq!(summary_texts(reasoning[0]), vec!["thought summary"]);
                 assert_eq!(response.assistant_text(), "the answer");
             }
@@ -2678,12 +2681,7 @@ mod tests {
         let text_of = |r: &rs_types::ReasoningItem| {
             r.content
                 .as_ref()
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .map(|p| p.text.as_str())
-                        .collect::<String>()
-                })
+                .map(|parts| parts.iter().map(|p| p.text.as_str()).collect::<String>())
                 .unwrap_or_default()
         };
         assert_eq!(reasoning[0].id, "rs_a");

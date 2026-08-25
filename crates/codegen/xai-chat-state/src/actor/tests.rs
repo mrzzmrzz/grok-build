@@ -3962,10 +3962,8 @@ async fn prune_retained_clears_ordered_parts_in_persisted_state_and_wire_json() 
         .build_request(vec![], None, false, None, "c".into(), "r".into())
         .await
         .unwrap();
-    let wire = serde_json::to_string(
-        &async_openai::types::responses::CreateResponse::from(&req),
-    )
-    .unwrap();
+    let wire =
+        serde_json::to_string(&async_openai::types::responses::CreateResponse::from(&req)).unwrap();
     assert!(
         !wire.contains(OLD_SECRET),
         "wire request must not replay cleared tool-result content"
@@ -5176,7 +5174,10 @@ async fn repair_history_command_refused_while_turn_active() {
 #[tokio::test]
 async fn ever_used_codex_is_monotonic_across_snapshot_restore() {
     let h = TestHarness::new();
-    assert!(!h.handle.ever_used_codex().await, "fresh session is unmarked");
+    assert!(
+        !h.handle.ever_used_codex().await,
+        "fresh session is unmarked"
+    );
 
     // Snapshot before the mark, then mark.
     let pre_mark_snapshot = h.handle.snapshot().await.unwrap();

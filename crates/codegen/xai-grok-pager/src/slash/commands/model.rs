@@ -135,8 +135,7 @@ fn model_context_window(info: &acp::ModelInfo) -> Option<u64> {
 
 fn format_context_window(tokens: u64) -> String {
     fn compact(tokens: u64, divisor: u64, suffix: &str) -> String {
-        let tenths = ((tokens as u128 * 10 + u128::from(divisor / 2))
-            / u128::from(divisor)) as u64;
+        let tenths = ((tokens as u128 * 10 + u128::from(divisor / 2)) / u128::from(divisor)) as u64;
         if tenths.is_multiple_of(10) {
             format!("{}{suffix} context", tenths / 10)
         } else {

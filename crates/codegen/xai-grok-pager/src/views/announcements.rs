@@ -566,10 +566,7 @@ mod tests {
         let keys = session_announcement_hide_keys_at(&list, now);
         assert_eq!(
             keys,
-            vec![
-                "crit-1".to_string(),
-                "content:T\u{1f}two".to_string(),
-            ],
+            vec!["crit-1".to_string(), "content:T\u{1f}two".to_string(),],
             "expired keys and passive promo keys must not be cleared by show"
         );
     }
@@ -629,7 +626,10 @@ mod tests {
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .filter_map(|pos| buf.cell(pos).map(|cell| cell.symbol().to_string()))
             .collect();
-        assert!(!rendered.contains("Upgrade"), "passive promo leaked: {rendered:?}");
+        assert!(
+            !rendered.contains("Upgrade"),
+            "passive promo leaked: {rendered:?}"
+        );
     }
 
     /// The shared visibility predicate gates the random pick in `event_loop`,

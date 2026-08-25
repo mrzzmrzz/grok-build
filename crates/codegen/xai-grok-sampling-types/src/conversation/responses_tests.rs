@@ -171,7 +171,10 @@ fn x_search_serializes_to_the_tool_entry() {
         bare
     );
     assert_eq!(
-        extra_tool_entries(&[HostedTool::XSearch { options: None }], ProviderProfile::XAI),
+        extra_tool_entries(
+            &[HostedTool::XSearch { options: None }],
+            ProviderProfile::XAI
+        ),
         bare
     );
 }
@@ -1962,8 +1965,12 @@ fn tool_result_image_only_parts_serialize_in_order() {
         ConversationItem::tool_result_with_parts(
             "call_1",
             vec![
-                ContentPart::Image { url: "img-1".into() },
-                ContentPart::Image { url: "img-2".into() },
+                ContentPart::Image {
+                    url: "img-1".into(),
+                },
+                ContentPart::Image {
+                    url: "img-2".into(),
+                },
             ],
         ),
     ]);
@@ -2083,7 +2090,10 @@ fn reasoning_item_round_trips_lossless_from_response_to_request() {
             _ => None,
         })
         .expect("reasoning sibling in history");
-    assert_eq!(stored, &wire_reasoning, "history stores the wire item as-is");
+    assert_eq!(
+        stored, &wire_reasoning,
+        "history stores the wire item as-is"
+    );
 
     // History → next request: replayed verbatim minus the output-only
     // `status`.

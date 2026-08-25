@@ -512,9 +512,7 @@ fn upgrade_legacy_reasoning_singular_anthropic_no_id() {
 
 // ── Tool result ordered parts ──────────────────────────────────────────────
 
-fn tool_result_blocks(
-    req: &ConversationRequest,
-) -> (String, crate::messages::ToolResultContent) {
+fn tool_result_blocks(req: &ConversationRequest) -> (String, crate::messages::ToolResultContent) {
     let messages_req = build_messages_request(req);
     for msg in &messages_req.messages {
         if let crate::messages::MessageContent::Blocks(blocks) = &msg.content {

@@ -3875,9 +3875,7 @@ async fn drain_and_process(
                 // immediately instead of waiting out the appearance
                 // watcher's polling interval.
                 let appearance = match mode {
-                    crossterm::event::ThemeMode::Dark => {
-                        system_appearance::SystemAppearance::Dark
-                    }
+                    crossterm::event::ThemeMode::Dark => system_appearance::SystemAppearance::Dark,
                     crossterm::event::ThemeMode::Light => {
                         system_appearance::SystemAppearance::Light
                     }

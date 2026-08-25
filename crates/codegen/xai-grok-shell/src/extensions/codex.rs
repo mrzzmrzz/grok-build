@@ -126,9 +126,7 @@ async fn handle_login(agent: &MvpAgent) -> ExtResult {
             agent.models_manager.on_codex_auth_changed();
             // Keep the OAuth bearer fresh for long-running sessions; the
             // loop is a process-wide singleton, so a re-login is a no-op.
-            crate::codex_auth::start_proactive_refresh(
-                tokio_util::sync::CancellationToken::new(),
-            );
+            crate::codex_auth::start_proactive_refresh(tokio_util::sync::CancellationToken::new());
             notify_models_updated(agent);
             agent.models_manager.spawn_background_refresh();
             to_raw_response(&CodexAuthActionResponse {
@@ -225,12 +223,14 @@ async fn handle_usage() -> ExtResult {
 fn notify_models_updated(agent: &MvpAgent) {
     let available = agent.models_manager.available();
     let current = agent.models_manager.current_model_id();
-    let model_state =
-        acp::SessionModelState::new(current, available.values().cloned().collect());
+    let model_state = acp::SessionModelState::new(current, available.values().cloned().collect());
     if let Ok(params) = serde_json::value::to_raw_value(&model_state) {
         agent
             .gateway
-            .forward_fire_and_forget(acp::ExtNotification::new("x.ai/models/update", params.into()));
+            .forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/models/update",
+                params.into(),
+            ));
     }
 }
 
@@ -322,7 +322,11 @@ mod tests {
             .expect("queued login B must be invalidated by logout C");
         assert!(!response.ok);
         assert!(
-            response.error.as_deref().unwrap_or_default().contains("superseded"),
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("superseded"),
             "{response:?}"
         );
         assert!(

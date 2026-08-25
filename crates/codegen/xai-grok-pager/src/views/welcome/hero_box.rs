@@ -839,5 +839,4 @@ managed devices and accounts. Report security incidents";
         // Nothing drawn past the area's last row.
         assert_eq!(extract_text(&buf, 0, area.height, area.width), "");
     }
-
 }

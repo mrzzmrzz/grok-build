@@ -632,7 +632,10 @@ fn v2_custom_call_id_passes_through_chat_completions_unchanged() {
 
     let assistant = &messages[0];
     assert_eq!(assistant.tool_calls.len(), 1);
-    assert_eq!(assistant.tool_calls[0].id.as_deref(), Some(encoded_id.as_str()));
+    assert_eq!(
+        assistant.tool_calls[0].id.as_deref(),
+        Some(encoded_id.as_str())
+    );
 
     let result = &messages[1];
     assert_eq!(result.tool_call_id.as_deref(), Some(encoded_id.as_str()));

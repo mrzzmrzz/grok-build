@@ -15,12 +15,12 @@ mod use_tool;
 mod web_fetch;
 mod web_search;
 
+pub use code_mode::CodeModeExecToolCallBlock;
 pub use edit::{
     DiffLineOutput, DiffRenderConfig, EDIT_HL_MAX_BYTES, EDIT_HL_MAX_LINES, EditHighlightPhase,
     EditLineStyles, EditToolCallBlock, compute_file_scoped_styles, file_text_within_hl_caps,
     render_diff_hunk_highlighted, render_diff_hunks_highlighted, render_diff_hunks_with_styles,
 };
-pub use code_mode::CodeModeExecToolCallBlock;
 pub use execute::ExecuteToolCallBlock;
 pub use hook::{HookPhase, HookRunEntry, HookRunStatus, ToolCallHookData};
 pub use lifecycle::LifecycleEventBlock;

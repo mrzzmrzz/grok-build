@@ -1878,7 +1878,10 @@ fn codex_and_session_usage_fail_independently_in_modal() {
         }),
         &mut app,
     );
-    dispatch(Action::TaskComplete(codex_usage_result(nonce, None)), &mut app);
+    dispatch(
+        Action::TaskComplete(codex_usage_result(nonce, None)),
+        &mut app,
+    );
     {
         let state = usage_modal_state(&app);
         let session = state.session_usage_text.as_deref().unwrap();
@@ -1900,8 +1903,18 @@ fn codex_and_session_usage_fail_independently_in_modal() {
             .unwrap()
             .contains("Couldn't load Codex usage: codex boom")
     );
-    assert!(state.session_usage_text.as_deref().unwrap().contains("xai boom"));
-    assert_eq!(agent_scrollback_len(&app), before, "modal mode: no scrollback");
+    assert!(
+        state
+            .session_usage_text
+            .as_deref()
+            .unwrap()
+            .contains("xai boom")
+    );
+    assert_eq!(
+        agent_scrollback_len(&app),
+        before,
+        "modal mode: no scrollback"
+    );
 }
 
 #[test]

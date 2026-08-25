@@ -3507,13 +3507,7 @@ fn render_header_suppresses_zero_count_chips() {
     let mut state = DashboardState::new();
     // Only one Idle row — no awaiting/working/done/failed chips.
     let rows = vec![header_test_row(1, RowState::Idle, "x")];
-    render_header(
-        &mut buf,
-        Rect::new(0, 0, 120, 1),
-        &theme,
-        &rows,
-        &mut state,
-    );
+    render_header(&mut buf, Rect::new(0, 0, 120, 1), &theme, &rows, &mut state);
     let content = buf_to_text(&buf);
     assert!(
         content.contains("1 idle"),
@@ -3538,13 +3532,7 @@ fn render_header_has_no_inactive_chip() {
         header_test_row(1, RowState::Inactive, "a"),
         header_test_row(2, RowState::Idle, "b"),
     ];
-    render_header(
-        &mut buf,
-        Rect::new(0, 0, 120, 1),
-        &theme,
-        &rows,
-        &mut state,
-    );
+    render_header(&mut buf, Rect::new(0, 0, 120, 1), &theme, &rows, &mut state);
     let content = buf_to_text(&buf);
     assert!(
         content.contains("1 idle"),
@@ -4652,13 +4640,7 @@ fn render_header_counts_top_level_rows_only() {
         ..header_test_row(11, RowState::Completed, "child")
     };
     let rows = vec![parent, sub_completed];
-    render_header(
-        &mut buf,
-        Rect::new(0, 0, 160, 1),
-        &theme,
-        &rows,
-        &mut state,
-    );
+    render_header(&mut buf, Rect::new(0, 0, 160, 1), &theme, &rows, &mut state);
     let content = buf_to_text(&buf);
     // Only the top-level parent counts: its Working chip shows.
     assert!(

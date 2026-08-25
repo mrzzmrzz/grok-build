@@ -315,15 +315,13 @@ impl WelcomeLayout {
                     .width
                     .saturating_sub(prompt::prompt_inset(prompt_compact) * 2);
                 let width = stacked_info_width(avail, content_area.height, MENU_MIN_WIDTH);
-                hero_box::announcement_desired_rows(ann, width, expanded).min(
-                    stacked_info_budget(
-                        content_area,
-                        error_height,
-                        menu_height,
-                        tip_height,
-                        compact,
-                    ),
-                )
+                hero_box::announcement_desired_rows(ann, width, expanded).min(stacked_info_budget(
+                    content_area,
+                    error_height,
+                    menu_height,
+                    tip_height,
+                    compact,
+                ))
             }
             None => changelog_height,
         };
@@ -1664,8 +1662,14 @@ fn render_announcement_section(
         return (None, false);
     }
 
-    let truncated =
-        hero_box::render_announcement_block(buf, theme, centered, announcement, expanded, mouse_pos);
+    let truncated = hero_box::render_announcement_block(
+        buf,
+        theme,
+        centered,
+        announcement,
+        expanded,
+        mouse_pos,
+    );
     (Some(centered), truncated)
 }
 

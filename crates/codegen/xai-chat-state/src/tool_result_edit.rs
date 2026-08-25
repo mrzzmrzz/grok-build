@@ -258,9 +258,10 @@ mod tests {
         ) else {
             unreachable!()
         };
-        let removed = retain_tool_result_images(&mut t, |p| {
-            !matches!(p, ContentPart::Image { url } if url.as_ref() == "bad")
-        });
+        let removed = retain_tool_result_images(
+            &mut t,
+            |p| !matches!(p, ContentPart::Image { url } if url.as_ref() == "bad"),
+        );
         assert_eq!(removed, 1);
         assert_eq!(t.images.len(), 1);
         assert_eq!(t.parts.len(), 2);

@@ -341,10 +341,7 @@ impl SessionActor {
         // Match on the resolved target (in the envelope) so a client deny matcher
         // keyed on the real MCP tool gates a meta-dispatch call, matching the
         // observe path (`notify_client_hooks`). Equals `function.name` otherwise.
-        let tool_name = envelope
-            .payload
-            .match_value()
-            .unwrap_or(fallback_tool_name);
+        let tool_name = envelope.payload.match_value().unwrap_or(fallback_tool_name);
 
         let mut pending = self.client_gate_responses(&groups, Some(tool_name), envelope);
         while let Some((callback_id, response, _elapsed, _outcome)) = pending.next().await {

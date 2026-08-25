@@ -91,7 +91,11 @@ impl CodeModeExecToolCallBlock {
 
     /// Header: **exec** [`cell N`] [status]
     fn header_line(&self, theme: &Theme, muted: bool, max_width: Option<usize>) -> Line<'static> {
-        let text_style = if muted { theme.muted() } else { theme.primary() };
+        let text_style = if muted {
+            theme.muted()
+        } else {
+            theme.primary()
+        };
         let bold_style = text_style.add_modifier(Modifier::BOLD);
         let mut spans = vec![Span::styled("exec", bold_style)];
         let mut suffix = String::new();
@@ -116,7 +120,11 @@ impl CodeModeExecToolCallBlock {
             };
             spans.push(Span::styled(
                 display,
-                if muted { theme.muted() } else { theme.fg(theme.command) },
+                if muted {
+                    theme.muted()
+                } else {
+                    theme.fg(theme.command)
+                },
             ));
         }
         Line::from(spans)
@@ -331,7 +339,10 @@ mod tests {
         let expanded = rendered_text(&block, DisplayMode::Expanded);
         assert!(expanded.contains("exec"), "{expanded}");
         assert!(expanded.contains("cell 3"), "{expanded}");
-        assert!(expanded.contains("const a = await tools.read_file"), "{expanded}");
+        assert!(
+            expanded.contains("const a = await tools.read_file"),
+            "{expanded}"
+        );
         assert!(expanded.contains("partial output"), "{expanded}");
     }
 
