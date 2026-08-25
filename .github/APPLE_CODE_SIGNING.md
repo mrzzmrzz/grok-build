@@ -44,5 +44,6 @@ missing; Linux builds never receive these secrets.
 The workflow applies a secure timestamp and the hardened runtime, then runs
 `codesign --verify`. It submits a temporary ZIP containing the signed binary,
 waits for an `Accepted` result, prints the notarization log, and verifies the
-published binary with `spctl`. Standalone executables cannot carry a stapled
-ticket, so Gatekeeper retrieves their notarization ticket from Apple.
+published binary with `codesign --check-notarization`. Standalone executables
+cannot carry a stapled ticket, so Gatekeeper retrieves their notarization
+ticket from Apple.

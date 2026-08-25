@@ -231,7 +231,11 @@ jobs:
             exit 1
           fi
 
-          spctl --assess --type execute --verbose=2 target/release/grok
+          codesign --verify \
+            --strict \
+            --verbose=2 \
+            --check-notarization \
+            target/release/grok
 
       - name: Remove Apple signing credentials
         if: always() && runner.os == 'macOS'
